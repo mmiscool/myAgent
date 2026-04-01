@@ -1,0 +1,32 @@
+{
+  "name": "myagent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Vanilla JS Codex app-server client with Vite HMR",
+  "main": "server.js",
+  "type": "commonjs",
+  "packageManager": "pnpm@10.18.3",
+  "scripts": {
+    "dev": "node dev.js",
+    "dev:client": "vite",
+    "dev:server": "node server.js",
+    "dev:clean": "node scripts/kill-ports.js 3210 3211",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "node server.js",
+    "test": "vitest run",
+    "setupVirtualDesktops": "node scripts/setup-virtual-desktops.js"
+  },
+  "devDependencies": {
+    "jsdom": "^29.0.1",
+    "vite": "^7.1.5",
+    "vitest": "^4.1.2"
+  },
+  "dependencies": {
+    "jpeg-js": "^0.4.4",
+    "marked": "^17.0.5",
+    "pngjs": "^7.0.0",
+    "ws": "^8.20.0",
+    "x11": "^2.3.0"
+  }
+}

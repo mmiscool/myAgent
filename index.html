@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Codex Project Desk</title>
+  </head>
+  <body>
+    <div class="shell">
+      <main class="layout" id="appLayout">
+        <aside class="panel panel-sidebar">
+          <div class="sidebar-brand">
+            <div class="sidebar-brand-copy">
+              <p class="brand-kicker">Code</p>
+              <h1>Project Desk</h1>
+            </div>
+            <div class="sidebar-brand-actions">
+              <a class="sidebar-link" href="/x-session.html">X Session</a>
+            </div>
+          </div>
+
+          <div class="sidebar-section-head sidebar-projects-head">
+            <span class="sidebar-label">Projects</span>
+            <div class="toolbar sidebar-toolbar">
+              <button
+                data-action="toggle-archived"
+                class="ghost-button small sidebar-filter-button"
+                id="archivedToggle"
+                type="button"
+                aria-pressed="false"
+              >Active</button>
+              <button data-action="refresh-all-projects" class="icon-button" title="Refresh">↻</button>
+              <button data-action="toggle-project-adder" class="icon-button" title="Add project">+</button>
+            </div>
+          </div>
+
+          <form id="projectQuickAddForm" class="sidebar-adder hidden">
+            <input type="text" id="projectPathInput" name="cwd" placeholder="/path/to/project">
+            <button type="submit" class="ghost-button">Add Project</button>
+          </form>
+
+          <div id="projectList" class="project-tree"></div>
+        </aside>
+
+        <div
+          id="sidebarResizeHandle"
+          class="sidebar-resize-handle"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          tabindex="0"
+        ></div>
+
+        <section class="panel panel-conversation">
+          <div id="threadHeader" class="thread-header"></div>
+          <div id="conversation" class="conversation"></div>
+          <section id="threadDesktop" class="thread-desktop hidden" aria-hidden="true">
+            <div class="thread-desktop-bar">
+              <div id="threadDesktopStatus" class="thread-desktop-status">Select a conversation and open Virtual Desktop.</div>
+              <div class="thread-desktop-actions">
+                <label class="thread-desktop-rate">
+                  <span>FPS</span>
+                  <select id="threadDesktopFrameRate">
+                    <option value="5">5</option>
+                    <option value="10">10</option>
+                    <option value="15">15</option>
+                    <option value="24">24</option>
+                    <option value="30" selected>30</option>
+                  </select>
+                </label>
+                <label class="thread-desktop-scale">
+                  <span>Scale</span>
+                  <select id="threadDesktopScale">
+                    <option value="0.75" selected>0.75x</option>
+                    <option value="1">1.0x</option>
+                    <option value="1.25">1.25x</option>
+                    <option value="1.5">1.5x</option>
+                    <option value="2">2.0x</option>
+                  </select>
+                </label>
+                <button id="threadDesktopScreenshot" type="button" class="ghost-button">Screenshot</button>
+                <button id="threadDesktopStop" type="button" class="danger-button">Stop Desktop</button>
+              </div>
+            </div>
+            <div class="thread-desktop-surface">
+              <canvas id="threadDesktopCanvas" class="thread-desktop-canvas"></canvas>
+            </div>
+          </section>
+          <form id="composerForm" class="composer">
+            <div id="composerAttachments" class="composer-attachments hidden"></div>
+            <textarea id="promptInput" name="text" rows="5" placeholder="Ask Codex to inspect, edit, review, search, run commands, or delegate inside the selected project."></textarea>
+            <div class="composer-row composer-footer">
+              <button type="submit" class="primary-button">Send</button>
+              <div class="composer-controls" aria-label="Composer settings">
+                <div class="composer-picker">
+                  <button id="composerModelButton" type="button" class="composer-picker-trigger" data-action="toggle-composer-menu" data-menu="model" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="composer-picker-icon" aria-hidden="true">◎</span>
+                    <span id="composerModelLabel" class="composer-picker-label">Model</span>
+                  </button>
+                  <div id="composerModelMenu" class="composer-picker-menu hidden" role="listbox" aria-label="Model"></div>
+                </div>
+                <div class="composer-picker">
+                  <button id="composerEffortButton" type="button" class="composer-picker-trigger" data-action="toggle-composer-menu" data-menu="effort" aria-haspopup="listbox" aria-expanded="false">
+                    <span id="composerEffortLabel" class="composer-picker-label">Reasoning</span>
+                  </button>
+                  <div id="composerEffortMenu" class="composer-picker-menu hidden" role="listbox" aria-label="Reasoning"></div>
+                </div>
+                <button id="composerModeButton" type="button" class="composer-mode-button" data-action="toggle-composer-mode" aria-pressed="false">Chat</button>
+                <label class="composer-toggle composer-toggle-inline">
+                  <input id="autoscrollToggle" type="checkbox" checked>
+                  <span>Autoscroll</span>
+                </label>
+              </div>
+            </div>
+          </form>
+        </section>
+
+      </main>
+    </div>
+
+    <div id="imageEditorModal" class="image-editor-modal hidden" aria-hidden="true">
+      <div class="image-editor-shell">
+        <div class="image-editor-toolbar">
+          <div class="image-editor-tools">
+            <button type="button" class="image-tool-button" data-action="editor-tool" data-tool="select">Select</button>
+            <button type="button" class="image-tool-button" data-action="editor-tool" data-tool="crop">Crop</button>
+            <button type="button" class="image-tool-button" data-action="editor-tool" data-tool="rect">Rect</button>
+            <button type="button" class="image-tool-button" data-action="editor-tool" data-tool="line">Line</button>
+            <button type="button" class="image-tool-button" data-action="editor-tool" data-tool="arrow">Arrow</button>
+            <label class="image-color-control">
+              <span>Color</span>
+              <input id="imageEditorColor" type="color" value="#d100ff">
+            </label>
+          </div>
+          <div class="image-editor-actions">
+            <button type="button" class="ghost-button" data-action="close-image-editor">Cancel</button>
+            <button type="button" class="primary-button" data-action="apply-image-editor">Apply</button>
+          </div>
+        </div>
+        <div class="image-editor-stage">
+          <div id="imageEditorCanvasWrap" class="image-editor-canvas-wrap">
+            <img id="imageEditorPreviewImage" class="image-editor-preview-image" alt="Attachment preview">
+            <canvas id="imageEditorOverlayCanvas" class="image-editor-canvas image-editor-overlay"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/app.js"></script>
+  </body>
+</html>

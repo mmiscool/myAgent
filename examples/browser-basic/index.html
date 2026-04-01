@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Remote X Browser</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="panel">
+        <header class="panel-header">
+          <h1>Remote X</h1>
+          <p>Direct host-to-browser Xvfb session</p>
+        </header>
+        <form id="connectForm" class="controls">
+          <label>
+            Host
+            <input id="url" value="ws://localhost:8080" />
+          </label>
+          <label>
+            Token
+            <input id="token" value="dev-token" />
+          </label>
+          <button type="submit">Connect</button>
+        </form>
+        <pre id="status" class="status">idle</pre>
+      </section>
+      <section class="screen-shell">
+        <canvas id="screen"></canvas>
+      </section>
+    </main>
+    <script type="module" src="./index.mjs"></script>
+  </body>
+  </html>

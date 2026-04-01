@@ -1,0 +1,17 @@
+[
+  {
+    "id": "workspace",
+    "name": "Current Workspace",
+    "description": "Default project rooted at this repository.",
+    "cwd": "/home/user/projects/myAgent",
+    "defaultModel": "",
+    "defaultEffort": "medium",
+    "defaultSummary": "auto",
+    "defaultPersonality": "pragmatic",
+    "approvalPolicy": "on-request",
+    "sandboxMode": "workspace-write",
+    "networkAccess": true,
+    "createdAt": 1774929088973,
+    "updatedAt": 1774929088973
+  }
+]
