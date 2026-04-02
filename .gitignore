@@ -22,3 +22,6 @@ Thumbs.db
 *.swo
 
 .codex
+.codex-schema-json/
+.codex-schema-ts/
+log.txt

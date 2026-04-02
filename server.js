@@ -7,6 +7,10 @@ const { EventEmitter } = require("events");
 const { spawn } = require("child_process");
 const { WebSocketServer } = require("ws");
 const { XSessionManager } = require("./x-session-manager");
+const { buildDesktopSessionConfig } = require("./desktop-session-config");
+const { analyzeDesktopScreenshot, DEFAULT_DESKTOP_VISION_MODEL } = require("./desktop-vision");
+const { ServerRequestTracker } = require("./server-request-tracker");
+const { dedupeProjectsByPath, projectPathKey } = require("./project-store-utils");
 
 const ROOT_DIR = __dirname;
 const DIST_DIR = path.join(ROOT_DIR, "dist");
@@ -45,8 +49,148 @@ const MOD_META = 1 << 3;
 
 const DESKTOP_TOOL_SPECS = [
   {
+    name: "virtual_desktop_analyze",
+    description: `Preferred low-token path: use local Phi vision via Ollama (${DEFAULT_DESKTOP_VISION_MODEL}) to inspect the current desktop and return structured clickable targets without sending a raw screenshot into the Codex runtime. Use this before virtual_desktop_snapshot unless local vision is insufficient or you need exact pixels.`,
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        goal: {
+          type: "string",
+          minLength: 1,
+          description: "Optional task or target to prioritize, such as 'find the Save button' or 'locate the browser address bar'.",
+        },
+        maxTargets: {
+          type: "integer",
+          minimum: 1,
+          maximum: 20,
+          description: "Maximum number of clickable targets to return. Defaults to 12.",
+        },
+        delayMs: {
+          type: "integer",
+          minimum: 0,
+          maximum: 5000,
+          description: "Optional delay before capturing the screenshot for local vision analysis.",
+        },
+      },
+    },
+  },
+  {
+    name: "virtual_desktop_click_target",
+    description: "Preferred low-token path: click one of the targets returned by virtual_desktop_analyze, then optionally re-analyze the updated screen locally without sending a raw screenshot into the Codex runtime. Prefer this over virtual_desktop_click when coordinates are not already known.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["targetId"],
+      properties: {
+        targetId: {
+          type: "string",
+          minLength: 1,
+          description: "Target id returned by virtual_desktop_analyze, for example target-1.",
+        },
+        analysisId: {
+          type: "string",
+          minLength: 1,
+          description: "Optional analysis id returned by virtual_desktop_analyze. Defaults to the most recent analysis for this thread.",
+        },
+        goal: {
+          type: "string",
+          minLength: 1,
+          description: "Optional follow-up goal for the post-click local vision pass.",
+        },
+        maxTargets: {
+          type: "integer",
+          minimum: 1,
+          maximum: 20,
+          description: "Maximum number of clickable targets to return from the post-click local vision pass. Defaults to 12.",
+        },
+        reanalyze: {
+          type: "boolean",
+          description: "If false, skip the post-click local vision pass and only report the click.",
+        },
+        button: {
+          type: "string",
+          enum: ["left", "middle", "right"],
+          description: "Mouse button to click. Defaults to left.",
+        },
+        clicks: {
+          type: "integer",
+          minimum: 1,
+          maximum: 3,
+          description: "Number of clicks to perform. Defaults to 1.",
+        },
+        delayMs: {
+          type: "integer",
+          minimum: 0,
+          maximum: 5000,
+          description: "Optional delay after the click before the post-click local vision pass.",
+        },
+      },
+    },
+  },
+  {
+    name: "virtual_desktop_list_windows",
+    description: "List the current top-level windows in the virtual desktop session.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "virtual_desktop_focus_window",
+    description: "Focus a specific virtual desktop window and optionally maximize it, then return an updated screenshot.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["windowId"],
+      properties: {
+        windowId: {
+          type: "string",
+          minLength: 1,
+          description: "X11 window id from virtual_desktop_list_windows, for example 0xa00007.",
+        },
+        maximize: {
+          type: "boolean",
+          description: "If true, request maximized state for the selected window before focusing it.",
+        },
+        delayMs: {
+          type: "integer",
+          minimum: 0,
+          maximum: 5000,
+          description: "Optional delay after changing focus before capturing the next screenshot.",
+        },
+      },
+    },
+  },
+  {
+    name: "virtual_desktop_launch",
+    description: "Launch an additional application in the current virtual desktop session and return an updated screenshot.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["command"],
+      properties: {
+        command: {
+          type: "string",
+          minLength: 1,
+          description: "Shell command to launch inside the current virtual desktop session.",
+        },
+        maximize: {
+          type: "boolean",
+          description: "If true, attempt to maximize the launched window after it appears.",
+        },
+        delayMs: {
+          type: "integer",
+          minimum: 0,
+          maximum: 5000,
+          description: "Optional delay after launching before capturing the next screenshot.",
+        },
+      },
+    },
+  },
+  {
     name: "virtual_desktop_snapshot",
-    description: "Capture the current virtual desktop screenshot for this conversation.",
+    description: "Fallback higher-token path: capture the current virtual desktop screenshot for this conversation. Prefer virtual_desktop_analyze for local screen understanding and clickable-target discovery when possible.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -62,7 +206,7 @@ const DESKTOP_TOOL_SPECS = [
   },
   {
     name: "virtual_desktop_click",
-    description: "Click at a screen position on the virtual desktop and return an updated screenshot.",
+    description: "Fallback coordinate click: click at a screen position on the virtual desktop and return an updated screenshot. Prefer virtual_desktop_click_target after virtual_desktop_analyze when coordinates are not already known.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -171,6 +315,26 @@ const DESKTOP_TOOL_SPECS = [
 
 const eventSocketClients = new Set();
 const xSessionManager = new XSessionManager();
+const desktopVisionAnalysisById = new Map();
+const latestDesktopVisionAnalysisByThreadId = new Map();
+const MAX_DESKTOP_VISION_ANALYSES = 100;
+
+function formatBridgePayload(value) {
+  try {
+    return JSON.stringify(value);
+  } catch (error) {
+    return JSON.stringify({
+      unserializable: true,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function logBridgeTraffic(direction, payload) {
+  closeConsoleResponseStream();
+  const label = direction === "out" ? "-> codex" : "<- codex";
+  console.log(`[sdk ${label}] ${formatBridgePayload(payload)}`);
+}
 
 class CodexBridge extends EventEmitter {
   constructor() {
@@ -181,6 +345,7 @@ class CodexBridge extends EventEmitter {
     this.nextRequestId = 1;
     this.pending = new Map();
     this.pendingServerRequests = new Map();
+    this.serverRequestTracker = new ServerRequestTracker();
     this.stdoutBuffer = "";
     this.stderrBuffer = "";
   }
@@ -206,7 +371,7 @@ class CodexBridge extends EventEmitter {
   async start() {
     await assertCodexInstalled();
 
-    this.child = spawn(CODEX_BIN, ["app-server", "--listen", "stdio://", "--session-source", "appServer"], {
+    this.child = spawn(CODEX_BIN, ["app-server", "--listen", "stdio://"], {
       cwd: ROOT_DIR,
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -292,13 +457,18 @@ class CodexBridge extends EventEmitter {
   }
 
   handleMessage(message) {
+    logBridgeTraffic("in", message);
+
     if (message && typeof message === "object" && "method" in message && "id" in message) {
-      this.pendingServerRequests.set(String(message.id), { ...message, receivedAt: Date.now() });
-      this.emit("event", { type: "server-request", request: message });
+      const normalizedRequest = this.serverRequestTracker.normalizeRequest(message);
+      this.pendingServerRequests.set(String(message.id), { ...normalizedRequest, receivedAt: Date.now() });
+      this.emit("event", { type: "server-request", request: normalizedRequest });
       return;
     }
 
     if (message && typeof message === "object" && "method" in message) {
+      this.serverRequestTracker.observeNotification(message);
+
       if (message.method === "serverRequest/resolved" && message.params?.requestId != null) {
         this.pendingServerRequests.delete(String(message.params.requestId));
       }
@@ -331,6 +501,7 @@ class CodexBridge extends EventEmitter {
       throw new Error("Codex app-server is not running");
     }
 
+    logBridgeTraffic("out", message);
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
@@ -451,6 +622,11 @@ function normalizeStoredProject(project) {
   };
 }
 
+async function canonicalizeProjectCwd(cwd) {
+  const resolved = path.resolve(cleanString(cwd) || ROOT_DIR);
+  return fsp.realpath(resolved).catch(() => resolved);
+}
+
 async function ensureProjectStore() {
   await fsp.mkdir(DATA_DIR, { recursive: true });
 
@@ -476,9 +652,15 @@ async function ensureProjectStore() {
     parsed = [buildDefaultProject()];
   }
 
-  const projects = Array.isArray(parsed) && parsed.length > 0
+  const normalizedProjects = Array.isArray(parsed) && parsed.length > 0
     ? parsed.map(normalizeStoredProject)
     : [buildDefaultProject()];
+  const projects = dedupeProjectsByPath(await Promise.all(
+    normalizedProjects.map(async (project) => ({
+      ...project,
+      cwd: await canonicalizeProjectCwd(project.cwd),
+    })),
+  ));
 
   const normalized = JSON.stringify(projects, null, 2) + "\n";
 
@@ -500,8 +682,9 @@ async function listProjects() {
 
 async function saveProject(input) {
   const projects = await listProjects();
-  const existing = projects.find((project) => project.id === input.id);
-  const cwd = path.resolve(cleanString(input.cwd) || ROOT_DIR);
+  const cwd = await canonicalizeProjectCwd(input.cwd);
+  const existing = projects.find((project) => project.id === input.id)
+    || projects.find((project) => projectPathKey(project.cwd) === projectPathKey(cwd));
   const stats = await fsp.stat(cwd).catch(() => null);
 
   if (!stats || !stats.isDirectory()) {
@@ -522,7 +705,7 @@ async function saveProject(input) {
     ? projects.map((project) => (project.id === existing.id ? record : project))
     : [record, ...projects];
 
-  await writeProjects(nextProjects);
+  await writeProjects(dedupeProjectsByPath(nextProjects));
   return record;
 }
 
@@ -544,9 +727,9 @@ async function requireProject(projectId) {
 }
 
 async function findProjectByCwd(cwd) {
-  const target = path.resolve(cleanString(cwd) || ROOT_DIR);
+  const target = await canonicalizeProjectCwd(cwd);
   const projects = await listProjects();
-  return projects.find((project) => path.resolve(project.cwd) === target) || null;
+  return projects.find((project) => projectPathKey(project.cwd) === projectPathKey(target)) || null;
 }
 
 function cleanString(value) {
@@ -1087,17 +1270,13 @@ async function ensureThreadDesktopSession(threadId, requestHost = "", options = 
     throw new Error("Unable to resolve project for thread desktop");
   }
 
-  return xSessionManager.createSession({
+  return xSessionManager.createSession(buildDesktopSessionConfig(project, {
     threadId,
-    command: cleanString(options.command) || "xterm",
-    windowManagerCommand: cleanString(options.windowManagerCommand) || "openbox",
-    xServerBackend: cleanString(options.xServerBackend) || "xvfb",
-    useBubblewrap: options.useBubblewrap !== false,
-    workingDirectory: project.cwd,
-    writableMounts: [
-      { hostPath: project.cwd, guestPath: project.cwd },
-    ],
-  }, requestHost);
+    command: options.command,
+    windowManagerCommand: options.windowManagerCommand,
+    xServerBackend: options.xServerBackend,
+    useBubblewrap: typeof options.useBubblewrap === "boolean" ? options.useBubblewrap : undefined,
+  }), requestHost);
 }
 
 async function captureThreadDesktop(threadId, requestHost = "", delayMs = 0) {
@@ -1108,11 +1287,154 @@ async function captureThreadDesktop(threadId, requestHost = "", delayMs = 0) {
   return xSessionManager.captureThreadScreenshot(threadId);
 }
 
+function buildDesktopScreenshotHash(screenshot) {
+  return crypto.createHash("sha256").update(screenshot.png).digest("hex").slice(0, 16);
+}
+
+function pruneDesktopVisionAnalyses() {
+  while (desktopVisionAnalysisById.size > MAX_DESKTOP_VISION_ANALYSES) {
+    const oldestKey = desktopVisionAnalysisById.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+
+    const record = desktopVisionAnalysisById.get(oldestKey);
+    desktopVisionAnalysisById.delete(oldestKey);
+
+    if (record && latestDesktopVisionAnalysisByThreadId.get(record.threadId) === oldestKey) {
+      latestDesktopVisionAnalysisByThreadId.delete(record.threadId);
+    }
+  }
+}
+
+function storeDesktopVisionAnalysis(threadId, screenshot, analysis) {
+  const analysisId = `analysis-${crypto.randomUUID().slice(0, 8)}`;
+  const record = {
+    analysisId,
+    createdAt: Date.now(),
+    threadId,
+    model: analysis.model,
+    pulledModel: Boolean(analysis.pulledModel),
+    goal: cleanString(analysis.goal),
+    summary: cleanString(analysis.summary),
+    uncertainty: cleanString(analysis.uncertainty),
+    width: screenshot.width,
+    height: screenshot.height,
+    screenHash: buildDesktopScreenshotHash(screenshot),
+    targets: Array.isArray(analysis.targets) ? analysis.targets : [],
+    usage: analysis.usage || {},
+  };
+
+  desktopVisionAnalysisById.set(analysisId, record);
+  latestDesktopVisionAnalysisByThreadId.set(threadId, analysisId);
+  pruneDesktopVisionAnalyses();
+  return record;
+}
+
+function serializeDesktopVisionAnalysis(record) {
+  return {
+    analysisId: record.analysisId,
+    createdAt: record.createdAt,
+    threadId: record.threadId,
+    model: record.model,
+    pulledModel: Boolean(record.pulledModel),
+    goal: record.goal || "",
+    summary: record.summary || "",
+    uncertainty: record.uncertainty || "",
+    width: record.width,
+    height: record.height,
+    screenHash: record.screenHash,
+    targets: Array.isArray(record.targets) ? record.targets : [],
+    usage: record.usage || {},
+  };
+}
+
+function getDesktopVisionAnalysis(threadId, analysisId) {
+  const resolvedAnalysisId = cleanString(analysisId) || latestDesktopVisionAnalysisByThreadId.get(threadId);
+
+  if (!resolvedAnalysisId) {
+    throw new Error("No desktop vision analysis is available yet. Call virtual_desktop_analyze first.");
+  }
+
+  const record = desktopVisionAnalysisById.get(resolvedAnalysisId);
+  if (!record || record.threadId !== threadId) {
+    throw new Error(`Desktop vision analysis ${JSON.stringify(resolvedAnalysisId)} was not found for this thread`);
+  }
+
+  return record;
+}
+
+function formatDesktopVisionTargetSummary(target, index) {
+  return [
+    `${index + 1}. ${target.targetId}`,
+    target.kind || "control",
+    target.label || "(unlabeled)",
+    `conf ${target.confidence.toFixed(2)}`,
+    `bounds ${target.bounds.width}x${target.bounds.height}+${target.bounds.x}+${target.bounds.y}`,
+    `center (${target.center.x}, ${target.center.y})`,
+    cleanString(target.description),
+  ].filter(Boolean).join(" | ");
+}
+
+async function analyzeThreadDesktop(threadId, requestHost = "", options = {}) {
+  const delayMs = normalizeDelayMs(options.delayMs, 0);
+  const maxTargets = clamp(toInteger(options.maxTargets, 12), 1, 20);
+  const screenshot = await captureThreadDesktop(threadId, requestHost, delayMs);
+  const analysis = await analyzeDesktopScreenshot(screenshot, {
+    goal: cleanString(options.goal),
+    maxTargets,
+  });
+  return storeDesktopVisionAnalysis(threadId, screenshot, analysis);
+}
+
+function buildDesktopVisionResponse(threadId, toolName, analysis, note) {
+  const lines = [
+    `Tool: ${toolName}`,
+    `Thread: ${threadId}`,
+    "Mode: preferred local vision analysis",
+    `Vision model: ${analysis.model}`,
+    `Analysis id: ${analysis.analysisId}`,
+    `Screen: ${analysis.width}x${analysis.height}`,
+    `Screen hash: ${analysis.screenHash}`,
+    "No raw screenshot was sent to the Codex runtime.",
+    "Fallback: use virtual_desktop_snapshot only if local vision is insufficient or you need exact pixels.",
+  ];
+
+  if (analysis.goal) {
+    lines.push(`Goal: ${analysis.goal}`);
+  }
+
+  if (note) {
+    lines.push(note);
+  }
+
+  if (analysis.summary) {
+    lines.push(`Summary: ${analysis.summary}`);
+  }
+
+  if (analysis.uncertainty) {
+    lines.push(`Uncertainty: ${analysis.uncertainty}`);
+  }
+
+  lines.push(`Clickable targets: ${analysis.targets.length}`);
+
+  if (analysis.targets.length === 0) {
+    lines.push("No confident clickable targets were identified.");
+  } else {
+    lines.push(...analysis.targets.map(formatDesktopVisionTargetSummary));
+    lines.push("Use virtual_desktop_click_target with a targetId from this analysis to click one of these targets.");
+  }
+
+  return buildDesktopToolTextResponse(lines.join("\n"));
+}
+
 function buildDesktopToolResponse(threadId, toolName, screenshot, note) {
   const lines = [
     `Tool: ${toolName}`,
     `Thread: ${threadId}`,
     `Screen: ${screenshot.width}x${screenshot.height}`,
+    "Mode: raw screenshot fallback attached.",
+    "Preferred low-token path: use virtual_desktop_analyze and virtual_desktop_click_target for local screen understanding and target-based clicking.",
   ];
 
   if (note) {
@@ -1128,13 +1450,44 @@ function buildDesktopToolResponse(threadId, toolName, screenshot, note) {
   };
 }
 
+function buildDesktopToolTextResponse(text) {
+  return {
+    success: true,
+    contentItems: [
+      { type: "inputText", text },
+    ],
+  };
+}
+
+function formatDesktopWindowSummary(window, index) {
+  const flags = [
+    window.active ? "active" : "",
+    window.maximized ? "maximized" : "",
+  ].filter(Boolean).join(", ");
+
+  return [
+    `${index + 1}. ${window.id}`,
+    flags || "window",
+    `${window.width}x${window.height}+${window.x}+${window.y}`,
+    window.wmClass || "unknown",
+    window.title || "(untitled)",
+  ].join(" | ");
+}
+
 function buildDesktopToolErrorResponse(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const lines = [`Virtual desktop tool failed: ${message}`];
+
+  if (/ollama|vision/i.test(message)) {
+    lines.push("Fallback: use virtual_desktop_snapshot or the existing coordinate-based desktop tools while local vision is unavailable.");
+  }
+
   return {
     success: false,
     contentItems: [
       {
         type: "inputText",
-        text: `Virtual desktop tool failed: ${error instanceof Error ? error.message : String(error)}`,
+        text: lines.join("\n"),
       },
     ],
   };
@@ -1149,9 +1502,134 @@ async function executeDesktopToolCall(params, requestHost = "") {
     throw new Error("threadId is required for desktop tool calls");
   }
 
+  if (toolName === "virtual_desktop_analyze") {
+    const analysis = await analyzeThreadDesktop(threadId, requestHost, {
+      goal: args.goal,
+      maxTargets: args.maxTargets,
+      delayMs: args.delayMs,
+    });
+    const note = analysis.pulledModel
+      ? "The local vision model was pulled into Ollama automatically for this analysis."
+      : "";
+    return buildDesktopVisionResponse(threadId, toolName, analysis, note);
+  }
+
+  if (toolName === "virtual_desktop_click_target") {
+    const targetId = cleanString(args.targetId);
+    if (!targetId) {
+      throw new Error("targetId is required");
+    }
+
+    await ensureThreadDesktopSession(threadId, requestHost);
+
+    const analysis = getDesktopVisionAnalysis(threadId, args.analysisId);
+    const target = analysis.targets.find((entry) => entry.targetId === targetId);
+
+    if (!target) {
+      throw new Error(`Target ${JSON.stringify(targetId)} was not found in analysis ${analysis.analysisId}`);
+    }
+
+    const buttonName = cleanString(args.button) || "left";
+    const button = buttonNameToIndex(buttonName);
+    const clicks = clamp(toInteger(args.clicks, 1), 1, 3);
+    const x = target.center.x;
+    const y = target.center.y;
+    const events = [];
+
+    for (let index = 0; index < clicks; index += 1) {
+      events.push({ kind: "pointerDown", x, y, button, buttons: 0, modifiers: 0 });
+      events.push({ kind: "pointerUp", x, y, button, buttons: 0, modifiers: 0 });
+    }
+
+    await xSessionManager.injectThreadEvents(threadId, events, {
+      delayMs: normalizeDelayMs(args.delayMs),
+    });
+
+    const clickNote = `Clicked ${target.targetId} (${target.label || target.kind}) at (${x}, ${y}) using ${buttonName}${clicks > 1 ? ` x${clicks}` : ""}.`;
+
+    if (args.reanalyze === false) {
+      return buildDesktopToolTextResponse([
+        `Tool: ${toolName}`,
+        `Thread: ${threadId}`,
+        "Mode: preferred local target-based click",
+        clickNote,
+        "No raw screenshot was sent to the Codex runtime.",
+        "Post-click local vision was skipped. Call virtual_desktop_analyze if you need updated targets without using the screenshot fallback path.",
+      ].join("\n"));
+    }
+
+    const nextAnalysis = await analyzeThreadDesktop(threadId, requestHost, {
+      goal: cleanString(args.goal) || analysis.goal,
+      maxTargets: args.maxTargets,
+      delayMs: 0,
+    });
+    const note = [
+      clickNote,
+      nextAnalysis.pulledModel ? "The local vision model was pulled into Ollama automatically for this analysis." : "",
+    ].filter(Boolean).join(" ");
+    return buildDesktopVisionResponse(threadId, toolName, nextAnalysis, note);
+  }
+
   if (toolName === "virtual_desktop_snapshot") {
     const screenshot = await captureThreadDesktop(threadId, requestHost, normalizeDelayMs(args.delayMs, 0));
     return buildDesktopToolResponse(threadId, toolName, screenshot, "Captured the current desktop.");
+  }
+
+  if (toolName === "virtual_desktop_list_windows") {
+    await ensureThreadDesktopSession(threadId, requestHost);
+    const windows = await xSessionManager.listThreadWindows(threadId);
+    const lines = [
+      `Tool: ${toolName}`,
+      `Thread: ${threadId}`,
+      `Windows: ${windows.length}`,
+    ];
+
+    if (windows.length === 0) {
+      lines.push("No managed windows found.");
+    } else {
+      lines.push(...windows.map(formatDesktopWindowSummary));
+    }
+
+    return buildDesktopToolTextResponse(lines.join("\n"));
+  }
+
+  if (toolName === "virtual_desktop_focus_window") {
+    const windowId = cleanString(args.windowId);
+    if (!windowId) {
+      throw new Error("windowId is required");
+    }
+
+    await ensureThreadDesktopSession(threadId, requestHost);
+    const window = await xSessionManager.focusThreadWindow(threadId, windowId, {
+      maximize: Boolean(args.maximize),
+    });
+    const screenshot = await captureThreadDesktop(threadId, requestHost, normalizeDelayMs(args.delayMs, 500));
+    const label = window.title || window.wmClass || window.id;
+    return buildDesktopToolResponse(
+      threadId,
+      toolName,
+      screenshot,
+      `Focused ${window.id} (${label})${args.maximize ? " and requested maximize" : ""}.`,
+    );
+  }
+
+  if (toolName === "virtual_desktop_launch") {
+    const command = cleanString(args.command);
+    if (!command) {
+      throw new Error("command is required");
+    }
+
+    await ensureThreadDesktopSession(threadId, requestHost);
+    const launched = await xSessionManager.launchThreadCommands(threadId, command, {
+      maximize: Boolean(args.maximize),
+    });
+    const screenshot = await captureThreadDesktop(threadId, requestHost, normalizeDelayMs(args.delayMs, 1000));
+    const preview = command.length > 80 ? `${command.slice(0, 77)}...` : command;
+    const note = [
+      `Launched ${JSON.stringify(preview)}${args.maximize ? " with maximize requested" : ""}.`,
+      launched.length > 1 ? `Processes started: ${launched.length}.` : "",
+    ].filter(Boolean).join(" ");
+    return buildDesktopToolResponse(threadId, toolName, screenshot, note);
   }
 
   await ensureThreadDesktopSession(threadId, requestHost);
@@ -1558,20 +2036,13 @@ async function handleApi(request, response, url) {
 
     if (projectId) {
       const project = await requireProject(projectId);
-      session = await xSessionManager.createSession({
+      session = await xSessionManager.createSession(buildDesktopSessionConfig(project, {
         threadId,
-        command: cleanString(body.command) || "xterm",
-        windowManagerCommand: cleanString(body.windowManagerCommand) || "openbox",
-        xServerBackend: cleanString(body.xServerBackend) || "xvfb",
-        useBubblewrap: body.useBubblewrap !== false,
-        workingDirectory: project.cwd,
-        writableMounts: [
-          {
-            hostPath: project.cwd,
-            guestPath: project.cwd,
-          },
-        ],
-      }, requestHost);
+        command: body.command,
+        windowManagerCommand: body.windowManagerCommand,
+        xServerBackend: body.xServerBackend,
+        useBubblewrap: typeof body.useBubblewrap === "boolean" ? body.useBubblewrap : undefined,
+      }), requestHost);
     } else {
       session = await ensureThreadDesktopSession(threadId, requestHost, {
         command: body.command,
@@ -1604,6 +2075,83 @@ async function handleApi(request, response, url) {
     }
     const updated = await xSessionManager.updateSessionFrameRate(session.id, body.frameRate);
     sendJson(response, 200, { ok: true, data: xSessionManager.serializeSession(updated, requestHost) });
+    return;
+  }
+
+  if (request.method === "POST" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "analyze" && parts.length === 5) {
+    const threadId = decodeURIComponent(parts[2]);
+    const body = await readJsonBody(request);
+    const analysis = await analyzeThreadDesktop(threadId, requestHost, {
+      goal: body.goal,
+      maxTargets: body.maxTargets,
+      delayMs: body.delayMs,
+    });
+    sendJson(response, 200, { ok: true, data: serializeDesktopVisionAnalysis(analysis) });
+    return;
+  }
+
+  if (request.method === "POST" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "type" && parts.length === 5) {
+    const threadId = decodeURIComponent(parts[2]);
+    const body = await readJsonBody(request);
+    const text = String(body.text || "");
+
+    if (!text) {
+      throw new Error("text is required");
+    }
+
+    await ensureThreadDesktopSession(threadId, requestHost);
+    await xSessionManager.injectThreadEvents(threadId, createTypeEvents(text, Boolean(body.submit)));
+    sendJson(response, 200, { ok: true, data: { typed: text.length } });
+    return;
+  }
+
+  if (request.method === "POST" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "launch" && parts.length === 5) {
+    const threadId = decodeURIComponent(parts[2]);
+    const body = await readJsonBody(request);
+    const command = cleanString(body.command);
+
+    if (!command) {
+      throw new Error("command is required");
+    }
+
+    await ensureThreadDesktopSession(threadId, requestHost);
+    const launched = await xSessionManager.launchThreadCommands(threadId, command, {
+      maximize: Boolean(body.maximize),
+    });
+    sendJson(response, 200, { ok: true, data: { launched } });
+    return;
+  }
+
+  if (request.method === "GET" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "windows" && parts.length === 5) {
+    const threadId = decodeURIComponent(parts[2]);
+    await ensureThreadDesktopSession(threadId, requestHost);
+    const windows = await xSessionManager.listThreadWindows(threadId);
+    sendJson(response, 200, { ok: true, data: { windows } });
+    return;
+  }
+
+  if (request.method === "POST" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "focus-window" && parts.length === 5) {
+    const threadId = decodeURIComponent(parts[2]);
+    const body = await readJsonBody(request);
+    const windowId = cleanString(body.windowId);
+
+    if (!windowId) {
+      throw new Error("windowId is required");
+    }
+
+    await ensureThreadDesktopSession(threadId, requestHost);
+    const window = await xSessionManager.focusThreadWindow(threadId, windowId, {
+      maximize: Boolean(body.maximize),
+    });
+    sendJson(response, 200, { ok: true, data: { window } });
+    return;
+  }
+
+  if (request.method === "GET" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "clipboard" && parts.length === 5) {
+    const threadId = decodeURIComponent(parts[2]);
+    await ensureThreadDesktopSession(threadId, requestHost);
+    const text = await xSessionManager.readThreadClipboard(threadId);
+    sendJson(response, 200, { ok: true, data: { text } });
     return;
   }
 

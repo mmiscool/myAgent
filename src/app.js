@@ -1,6 +1,8 @@
 import "./styles.css";
 import { marked } from "marked";
 import { RemoteXBrowserClient } from "../packages/browser-client/index.mjs";
+import { buildAutoApprovalResult, composerApprovalPolicyOverride } from "./approval-utils.mjs";
+import { sortProjectsByRecentConversationActivity } from "./project-activity-utils.mjs";
 
 marked.setOptions({
   gfm: true,
@@ -17,19 +19,26 @@ const state = {
   selectedThreadId: localStorage.getItem("selectedThreadId") || "",
   selectedThread: null,
   archived: false,
+  collapsedProjectIds: new Set(),
   expandedProjectIds: new Set(),
   currentTurnId: "",
   activeThreadTab: localStorage.getItem("activeThreadTab") || "chat",
   threadActionMenuOpen: false,
   composerMenuOpen: "",
+  sidebarCollapsed: localStorage.getItem("sidebarCollapsed") === "true",
   autoscroll: localStorage.getItem("autoscroll") !== "false",
   sidebarWidth: Number(localStorage.getItem("sidebarWidth")) || 305,
   composerModel: localStorage.getItem("composerModel") || "",
   composerEffort: localStorage.getItem("composerEffort") || "",
   composerServiceTier: localStorage.getItem("composerServiceTier") || "flex",
   composerMode: localStorage.getItem("composerMode") || "default",
+  composerApproveAllDangerous: localStorage.getItem("composerApproveAllDangerous") === "true",
   composerAttachments: [],
+  pendingServerRequests: [],
+  autoApprovalInFlight: new Set(),
   desktopSessionByThreadId: {},
+  desktopAnalysisByThreadId: {},
+  desktopAnalysisInFlightThreadId: "",
   desktopClient: null,
   desktopConnectInFlight: false,
   imageEditor: createImageEditorState(),
@@ -37,7 +46,10 @@ const state = {
 
 const elements = {
   layout: document.getElementById("appLayout"),
+  sidebarPanel: document.getElementById("sidebarPanel"),
   sidebarResizeHandle: document.getElementById("sidebarResizeHandle"),
+  sidebarToggleButton: document.getElementById("sidebarToggleButton"),
+  sidebarRailToggle: document.getElementById("sidebarRailToggle"),
   projectList: document.getElementById("projectList"),
   projectQuickAddForm: document.getElementById("projectQuickAddForm"),
   projectPathInput: document.getElementById("projectPathInput"),
@@ -48,11 +60,16 @@ const elements = {
   threadDesktopStatus: document.getElementById("threadDesktopStatus"),
   threadDesktopFrameRate: document.getElementById("threadDesktopFrameRate"),
   threadDesktopScale: document.getElementById("threadDesktopScale"),
+  threadDesktopPasteText: document.getElementById("threadDesktopPasteText"),
+  threadDesktopCopyClipboard: document.getElementById("threadDesktopCopyClipboard"),
+  threadDesktopAnalyze: document.getElementById("threadDesktopAnalyze"),
   threadDesktopScreenshot: document.getElementById("threadDesktopScreenshot"),
   threadDesktopStop: document.getElementById("threadDesktopStop"),
+  threadDesktopAnalysis: document.getElementById("threadDesktopAnalysis"),
   threadDesktopCanvas: document.getElementById("threadDesktopCanvas"),
   composerForm: document.getElementById("composerForm"),
   autoscrollToggle: document.getElementById("autoscrollToggle"),
+  approveAllDangerousToggle: document.getElementById("approveAllDangerousToggle"),
   composerAttachments: document.getElementById("composerAttachments"),
   promptInput: document.getElementById("promptInput"),
   composerModelButton: document.getElementById("composerModelButton"),
@@ -72,7 +89,6 @@ const elements = {
 const EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
 const SUMMARIES = ["auto", "concise", "detailed", "none"];
 const PERSONALITIES = ["none", "friendly", "pragmatic"];
-const APPROVALS = ["untrusted", "on-failure", "on-request", "never"];
 const SANDBOXES = ["read-only", "workspace-write", "danger-full-access"];
 const MIN_SIDEBAR_WIDTH = 240;
 const MAX_SIDEBAR_WIDTH = 560;
@@ -88,10 +104,11 @@ let sidebarResizeState = null;
 boot().catch(showFatalError);
 
 async function boot() {
-  applySidebarWidth();
+  applySidebarLayout();
   await loadBoot();
   normalizeComposerSettings();
   elements.autoscrollToggle.checked = state.autoscroll;
+  elements.approveAllDangerousToggle.checked = state.composerApproveAllDangerous;
   restoreComposerDraft();
   renderComposerControls();
   renderProjects();
@@ -100,6 +117,7 @@ async function boot() {
   renderThreadPane();
 
   connectEvents();
+  void maybeAutoApprovePendingRequests();
 
   await loadAllProjectThreads();
   renderProjects();
@@ -133,6 +151,7 @@ async function loadBoot() {
   state.app = payload.app;
   state.projects = payload.projects;
   state.models = payload.models?.data || [];
+  state.pendingServerRequests = Array.isArray(payload.pendingRequests) ? payload.pendingRequests : [];
   if (!state.selectedProjectId || !state.projects.some((project) => project.id === state.selectedProjectId)) {
     state.selectedProjectId = state.projects[0]?.id || "";
     persistSelection();
@@ -144,6 +163,7 @@ function persistComposerSettings() {
   localStorage.setItem("composerEffort", state.composerEffort || "");
   localStorage.setItem("composerServiceTier", state.composerServiceTier || "flex");
   localStorage.setItem("composerMode", state.composerMode || "default");
+  localStorage.setItem("composerApproveAllDangerous", String(state.composerApproveAllDangerous));
 }
 
 function currentComposerModel() {
@@ -290,11 +310,16 @@ function renderComposerControls() {
   elements.composerModeButton.textContent = state.composerMode === "plan" ? "Plan" : "Chat";
   elements.composerModeButton.classList.toggle("plan", state.composerMode === "plan");
   elements.composerModeButton.setAttribute("aria-pressed", state.composerMode === "plan" ? "true" : "false");
+  elements.approveAllDangerousToggle.checked = state.composerApproveAllDangerous;
 }
 
 function composerRequestOverrides() {
   const model = currentComposerModel() || fallbackComposerModel();
   const overrides = {
+    approvalPolicy: composerApprovalPolicyOverride(
+      selectedProject()?.approvalPolicy,
+      state.composerApproveAllDangerous,
+    ),
     model: model?.id || undefined,
     effort: state.composerEffort || undefined,
     serviceTier: state.composerServiceTier || undefined,
@@ -472,6 +497,85 @@ function appendIndexedDelta(target, key, index, delta) {
   target[key] = values;
 }
 
+function upsertPendingServerRequest(request) {
+  if (!request?.id) {
+    return;
+  }
+
+  const requestId = String(request.id);
+  const existingIndex = state.pendingServerRequests.findIndex((entry) => String(entry?.id) === requestId);
+
+  if (existingIndex === -1) {
+    state.pendingServerRequests = state.pendingServerRequests.concat(request);
+    return;
+  }
+
+  state.pendingServerRequests = state.pendingServerRequests.map((entry, index) => (index === existingIndex ? request : entry));
+}
+
+function removePendingServerRequest(requestId) {
+  const normalizedId = String(requestId || "");
+  if (!normalizedId) {
+    return;
+  }
+
+  state.pendingServerRequests = state.pendingServerRequests.filter((entry) => String(entry?.id) !== normalizedId);
+}
+
+async function respondToPendingServerRequest(request, result) {
+  const requestId = String(request?.id || "");
+
+  if (!requestId) {
+    return;
+  }
+
+  await api(`/api/server-requests/${encodeURIComponent(requestId)}/respond`, {
+    method: "POST",
+    body: { result },
+  });
+
+  removePendingServerRequest(requestId);
+
+  if (request?.params?.threadId === state.selectedThreadId) {
+    renderSelectedThread();
+  }
+}
+
+async function maybeAutoApprovePendingRequests(requests = state.pendingServerRequests) {
+  if (!state.composerApproveAllDangerous || !Array.isArray(requests) || requests.length === 0) {
+    return;
+  }
+
+  const tasks = requests.map(async (request) => {
+    const requestId = String(request?.id || "");
+    const result = buildAutoApprovalResult(request);
+
+    if (!requestId || !result || state.autoApprovalInFlight.has(requestId)) {
+      return;
+    }
+
+    state.autoApprovalInFlight.add(requestId);
+
+    try {
+      await respondToPendingServerRequest(request, result);
+    } catch (error) {
+      console.error("Failed to auto-approve pending request", error);
+    } finally {
+      state.autoApprovalInFlight.delete(requestId);
+    }
+  });
+
+  await Promise.all(tasks);
+}
+
+function pendingServerRequestsForThread(threadId) {
+  if (!threadId) {
+    return [];
+  }
+
+  return state.pendingServerRequests.filter((request) => request?.params?.threadId === threadId);
+}
+
 function latestAgentMessageText(thread) {
   const turns = thread?.turns || [];
 
@@ -487,6 +591,296 @@ function latestAgentMessageText(thread) {
   }
 
   return "";
+}
+
+function isCollapsibleItem(item) {
+  return [
+    "userMessage",
+    "agentMessage",
+    "plan",
+    "reasoning",
+    "commandExecution",
+    "fileChange",
+    "mcpToolCall",
+    "dynamicToolCall",
+    "collabAgentToolCall",
+  ].includes(item?.type);
+}
+
+function findLatestCollapsibleItemId(thread) {
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+
+  for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    const turn = turns[turnIndex];
+    const items = Array.isArray(turns[turnIndex]?.items) ? turns[turnIndex].items : [];
+
+    if (!isLiveStatus(turn?.status)) {
+      for (let itemIndex = items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+        const item = items[itemIndex];
+        if (item?.type === "agentMessage" && item?.id) {
+          return item.id;
+        }
+      }
+    }
+
+    for (let itemIndex = items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+      const item = items[itemIndex];
+      if (isCollapsibleItem(item) && item?.id) {
+        return item.id;
+      }
+    }
+  }
+
+  return "";
+}
+
+function shouldExpandConversationItem(itemId, latestCollapsibleItemId = "") {
+  if (!itemId) {
+    return false;
+  }
+
+  return itemId === latestCollapsibleItemId;
+}
+
+function findConversationItemElement(itemId) {
+  if (!itemId) {
+    return null;
+  }
+
+  const escapedItemId = typeof CSS !== "undefined" && typeof CSS.escape === "function"
+    ? CSS.escape(String(itemId))
+    : String(itemId).replace(/["\\]/g, "\\$&");
+
+  return elements.conversation.querySelector(`article[data-item-id="${escapedItemId}"]`);
+}
+
+function collapseConversationItemsExcept(itemId) {
+  const detailsList = elements.conversation.querySelectorAll(".collapsed-item details[data-item-id]");
+
+  detailsList.forEach((details) => {
+    details.open = details.dataset.itemId === itemId;
+  });
+}
+
+function keepLatestCollapsibleItemExpanded() {
+  const latestCollapsibleItemId = findLatestCollapsibleItemId(state.selectedThread);
+
+  if (!latestCollapsibleItemId) {
+    collapseConversationItemsExcept("");
+    return;
+  }
+
+  collapseConversationItemsExcept(latestCollapsibleItemId);
+
+  const article = findConversationItemElement(latestCollapsibleItemId);
+  const details = article?.querySelector("details[data-item-id]");
+
+  if (details && !details.open) {
+    details.open = true;
+  }
+}
+
+function getPlanDisplay(item) {
+  return {
+    title: "Plan",
+    summary: oneLine(item.text || "Plan update"),
+    body: item.text || "",
+  };
+}
+
+function getReasoningDisplay(item) {
+  const summary = oneLine((item.summary || []).join(" ")) || oneLine((item.content || []).join(" ")) || "Reasoning";
+  const body = [
+    (item.summary || []).length ? `Summary\n${(item.summary || []).join("\n")}` : "",
+    (item.content || []).length ? `\nContent\n${(item.content || []).join("\n")}` : "",
+  ].filter(Boolean).join("\n") || summary;
+
+  return {
+    title: "Reasoning",
+    summary,
+    body,
+  };
+}
+
+function getCommandExecutionDisplay(item) {
+  const summary = oneLine(item.command || "Command");
+  const meta = `${formatStatus(item.status)}${item.exitCode != null ? ` · exit ${item.exitCode}` : ""}`;
+
+  return {
+    title: "Command",
+    summary,
+    body: [item.command || "", meta, item.aggregatedOutput || ""].filter(Boolean).join("\n"),
+    meta,
+  };
+}
+
+function summarizeMessageItem(item, fallbackTitle) {
+  const content = Array.isArray(item?.content) ? item.content : [];
+  const text = item?.text
+    || content.map((entry) => {
+      if (typeof entry === "string") {
+        return entry;
+      }
+
+      if (entry?.type === "text") {
+        return entry.text || "";
+      }
+
+      return "";
+    }).join(" ");
+
+  return oneLine(text) || fallbackTitle;
+}
+
+function summarizeIntermediateItems(items) {
+  const count = Array.isArray(items) ? items.length : 0;
+
+  if (!count) {
+    return "No steps";
+  }
+
+  const labels = [];
+  const reasoningCount = items.filter((item) => item?.type === "reasoning").length;
+  const commandCount = items.filter((item) => item?.type === "commandExecution").length;
+  const toolCount = items.filter((item) => ["mcpToolCall", "dynamicToolCall", "collabAgentToolCall"].includes(item?.type)).length;
+  const fileChangeCount = items.filter((item) => item?.type === "fileChange").length;
+
+  if (reasoningCount) {
+    labels.push(`${reasoningCount} reasoning`);
+  }
+
+  if (commandCount) {
+    labels.push(`${commandCount} command${commandCount === 1 ? "" : "s"}`);
+  }
+
+  if (toolCount) {
+    labels.push(`${toolCount} tool${toolCount === 1 ? "" : "s"}`);
+  }
+
+  if (fileChangeCount) {
+    labels.push(`${fileChangeCount} file change${fileChangeCount === 1 ? "" : "s"}`);
+  }
+
+  return labels.length ? labels.join(" · ") : `${count} step${count === 1 ? "" : "s"}`;
+}
+
+function patchCollapsibleConversationItem(item, display) {
+  const article = findConversationItemElement(item?.id);
+
+  if (!article) {
+    return false;
+  }
+
+  const summaryNode = article.querySelector("[data-role='summary']");
+  const bodyNode = article.querySelector("[data-role='body']");
+  const metaNode = article.querySelector("[data-role='meta']");
+
+  if (!summaryNode || !bodyNode) {
+    return false;
+  }
+
+  summaryNode.textContent = display.summary || display.title;
+  bodyNode.textContent = display.body || display.summary || display.title || "";
+
+  if (metaNode) {
+    metaNode.textContent = display.meta || "";
+  }
+
+  keepLatestCollapsibleItemExpanded();
+  scrollConversationToBottom();
+  return true;
+}
+
+function patchStreamingConversationItem(item) {
+  if (!item?.id) {
+    return false;
+  }
+
+  if (item.type === "agentMessage") {
+    const article = findConversationItemElement(item.id);
+    const bodyNode = article?.querySelector(".message-body");
+
+    if (!bodyNode) {
+      return false;
+    }
+
+    collapseConversationItemsExcept(item.id);
+    bodyNode.innerHTML = renderMessageContent(item.content, item.text || "");
+    scrollConversationToBottom();
+    return true;
+  }
+
+  if (item.type === "reasoning") {
+    return patchCollapsibleConversationItem(item, getReasoningDisplay(item));
+  }
+
+  if (item.type === "plan") {
+    return patchCollapsibleConversationItem(item, getPlanDisplay(item));
+  }
+
+  if (item.type === "commandExecution") {
+    return patchCollapsibleConversationItem(item, getCommandExecutionDisplay(item));
+  }
+
+  return false;
+}
+
+function findLastItemIndexByType(items, type) {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (items[index]?.type === type) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function renderIntermediateItemsGroup(turn, items, latestCollapsibleItemId = "") {
+  if (!Array.isArray(items) || !items.length) {
+    return "";
+  }
+
+  const groupId = `${turn.id}:steps`;
+  const open = shouldExpandConversationItem(groupId, latestCollapsibleItemId) ? " open" : "";
+
+  return `
+    <article class="bubble agent collapsed-item" data-item-id="${escapeHtml(groupId)}" data-item-type="turnSteps">
+      <details data-item-id="${escapeHtml(groupId)}"${open}>
+        <summary class="collapsed-summary">
+          <span class="collapsed-title">Steps</span>
+          <span class="collapsed-text">${escapeHtml(summarizeIntermediateItems(items))}</span>
+        </summary>
+        <div class="collapsed-body turn-steps-body">
+          ${items.map((item) => renderItem(item, latestCollapsibleItemId)).join("")}
+        </div>
+      </details>
+    </article>
+  `;
+}
+
+function renderTurnItems(turn, latestCollapsibleItemId = "") {
+  const items = Array.isArray(turn?.items) ? turn.items : [];
+
+  if (isLiveStatus(turn?.status) || items.length < 3) {
+    return items.map((item) => renderItem(item, latestCollapsibleItemId)).join("");
+  }
+
+  const firstUserIndex = items.findIndex((item) => item?.type === "userMessage");
+  const lastAgentIndex = findLastItemIndexByType(items, "agentMessage");
+
+  if (firstUserIndex === -1 || lastAgentIndex === -1 || firstUserIndex >= lastAgentIndex) {
+    return items.map((item) => renderItem(item, latestCollapsibleItemId)).join("");
+  }
+
+  const leadingItems = items.slice(0, firstUserIndex + 1);
+  const intermediateItems = items.slice(firstUserIndex + 1, lastAgentIndex).concat(items.slice(lastAgentIndex + 1));
+  const finalAgentItem = items[lastAgentIndex];
+
+  return [
+    ...leadingItems.map((item) => renderItem(item, latestCollapsibleItemId)),
+    renderIntermediateItemsGroup(turn, intermediateItems, latestCollapsibleItemId),
+    renderItem(finalAgentItem, latestCollapsibleItemId),
+  ].filter(Boolean).join("");
 }
 
 function applyStreamingNotification(message) {
@@ -549,76 +943,71 @@ function applyStreamingNotification(message) {
   }
 
   if (method === "item/agentMessage/delta") {
-    const item = ensureTurnItem(turn, {
-      id: params.itemId,
-      type: "agentMessage",
-      text: "",
-    });
+    const item = ensureTurnItem(turn, params.itemId, "agentMessage");
+    item.text = item.text || "";
     item.text = `${item.text || ""}${params.delta || ""}`;
     syncThreadSummary(state.selectedThread);
-    renderSelectedThread();
+    renderProjects();
+    if (!patchStreamingConversationItem(item)) {
+      renderSelectedThread();
+    }
     return true;
   }
 
   if (method === "item/commandExecution/outputDelta") {
-    const item = ensureTurnItem(turn, {
-      id: params.itemId,
-      type: "commandExecution",
-      command: "",
-      commandActions: [],
-      cwd: state.selectedThread.cwd || "",
-      status: "inProgress",
-      aggregatedOutput: "",
-    });
+    const item = ensureTurnItem(turn, params.itemId, "commandExecution");
+    item.command = item.command || "";
+    item.commandActions = Array.isArray(item.commandActions) ? item.commandActions : [];
+    item.cwd = item.cwd || state.selectedThread.cwd || "";
+    item.status = item.status || "inProgress";
+    item.aggregatedOutput = item.aggregatedOutput || "";
     item.aggregatedOutput = `${item.aggregatedOutput || ""}${params.delta || ""}`;
-    renderSelectedThread();
+    if (!patchStreamingConversationItem(item)) {
+      renderSelectedThread();
+    }
     return true;
   }
 
   if (method === "item/reasoning/textDelta") {
-    const item = ensureTurnItem(turn, {
-      id: params.itemId,
-      type: "reasoning",
-      content: [],
-      summary: [],
-    });
+    const item = ensureTurnItem(turn, params.itemId, "reasoning");
+    item.content = Array.isArray(item.content) ? item.content : [];
+    item.summary = Array.isArray(item.summary) ? item.summary : [];
     appendIndexedDelta(item, "content", params.contentIndex, params.delta || "");
-    renderSelectedThread();
+    if (!patchStreamingConversationItem(item)) {
+      renderSelectedThread();
+    }
     return true;
   }
 
   if (method === "item/reasoning/summaryTextDelta") {
-    const item = ensureTurnItem(turn, {
-      id: params.itemId,
-      type: "reasoning",
-      content: [],
-      summary: [],
-    });
+    const item = ensureTurnItem(turn, params.itemId, "reasoning");
+    item.content = Array.isArray(item.content) ? item.content : [];
+    item.summary = Array.isArray(item.summary) ? item.summary : [];
     appendIndexedDelta(item, "summary", params.summaryIndex, params.delta || "");
-    renderSelectedThread();
+    if (!patchStreamingConversationItem(item)) {
+      renderSelectedThread();
+    }
     return true;
   }
 
   if (method === "item/reasoning/summaryPartAdded") {
-    const item = ensureTurnItem(turn, {
-      id: params.itemId,
-      type: "reasoning",
-      content: [],
-      summary: [],
-    });
+    const item = ensureTurnItem(turn, params.itemId, "reasoning");
+    item.content = Array.isArray(item.content) ? item.content : [];
+    item.summary = Array.isArray(item.summary) ? item.summary : [];
     appendIndexedDelta(item, "summary", params.summaryIndex, "");
-    renderSelectedThread();
+    if (!patchStreamingConversationItem(item)) {
+      renderSelectedThread();
+    }
     return true;
   }
 
   if (method === "item/plan/delta") {
-    const item = ensureTurnItem(turn, {
-      id: params.itemId,
-      type: "plan",
-      text: "",
-    });
+    const item = ensureTurnItem(turn, params.itemId, "plan");
+    item.text = item.text || "";
     item.text = `${item.text || ""}${params.delta || ""}`;
-    renderSelectedThread();
+    if (!patchStreamingConversationItem(item)) {
+      renderSelectedThread();
+    }
     return true;
   }
 
@@ -643,6 +1032,7 @@ function persistSelection() {
   localStorage.setItem("selectedProjectId", state.selectedProjectId || "");
   localStorage.setItem("selectedThreadId", state.selectedThreadId || "");
   localStorage.setItem("activeThreadTab", state.activeThreadTab || "chat");
+  localStorage.setItem("sidebarCollapsed", String(state.sidebarCollapsed));
   localStorage.setItem("autoscroll", String(state.autoscroll));
   localStorage.setItem("sidebarWidth", String(state.sidebarWidth));
   persistComposerSettings();
@@ -662,6 +1052,45 @@ function clearComposerDraft() {
 
 function selectedProject() {
   return state.projects.find((project) => project.id === state.selectedProjectId) || null;
+}
+
+function projectDisplayName(project) {
+  const cwd = String(project?.cwd || "").trim();
+  if (!cwd) {
+    return String(project?.name || "Project");
+  }
+
+  const normalized = cwd.replace(/[\\/]+$/g, "");
+  if (!normalized) {
+    return cwd;
+  }
+
+  const segments = normalized.split(/[\\/]+/).filter(Boolean);
+  return segments.at(-1) || normalized || cwd;
+}
+
+function toggleProjectCollapsed(projectId) {
+  if (!projectId) {
+    return;
+  }
+
+  if (state.collapsedProjectIds.has(projectId)) {
+    state.collapsedProjectIds.delete(projectId);
+  } else {
+    state.collapsedProjectIds.add(projectId);
+  }
+}
+
+function toggleProjectThreads(projectId) {
+  if (!projectId) {
+    return;
+  }
+
+  if (state.expandedProjectIds.has(projectId)) {
+    state.expandedProjectIds.delete(projectId);
+  } else {
+    state.expandedProjectIds.add(projectId);
+  }
 }
 
 function optionHtml(value, label) {
@@ -723,6 +1152,8 @@ function renderThreadActionMenu() {
 }
 
 function renderProjects() {
+  const projects = sortProjectsByRecentConversationActivity(state.projects, state.projectThreads);
+
   elements.archivedToggle.textContent = state.archived ? "Archived" : "Active";
   elements.archivedToggle.setAttribute("aria-pressed", state.archived ? "true" : "false");
   elements.archivedToggle.setAttribute(
@@ -732,27 +1163,48 @@ function renderProjects() {
   elements.archivedToggle.title = state.archived ? "Viewing archived conversations" : "Viewing active conversations";
   elements.archivedToggle.classList.toggle("is-active", state.archived);
 
-  if (state.projects.length === 0) {
+  if (projects.length === 0) {
     elements.projectList.innerHTML = `<div class="empty">No projects yet.</div>`;
     return;
   }
 
-  elements.projectList.innerHTML = state.projects.map((project) => {
+  elements.projectList.innerHTML = projects.map((project) => {
     const threads = state.projectThreads[project.id] || [];
     const collapsedVisibleCount = collapsedVisibleThreadCount(threads);
+    const projectCollapsed = state.collapsedProjectIds.has(project.id);
     const expanded = state.expandedProjectIds.has(project.id);
     const visibleThreads = expanded ? threads : threads.slice(0, collapsedVisibleCount);
     const moreCount = Math.max(0, threads.length - collapsedVisibleCount);
+    const projectStackId = `project-stack-${project.id}`;
+    const projectName = projectDisplayName(project);
+    const projectPath = project.cwd || projectName;
+    const caretLabel = `${projectCollapsed ? "Expand" : "Collapse"} ${projectName}`;
 
     return `
       <section class="project-node ${project.id === state.selectedProjectId ? "active" : ""}">
-        ${project.id === state.selectedProjectId ? `
-          <div class="project-row project-row-with-menu">
-            <button class="project-row-main" data-action="select-project" data-id="${escapeHtml(project.id)}">
-              <span class="project-caret">⌄</span>
-              <span class="project-folder">□</span>
-              <span class="project-name">${escapeHtml(project.name)}</span>
-            </button>
+        <div class="project-row project-row-with-menu">
+          <button
+            type="button"
+            class="project-caret-button"
+            data-action="toggle-project-collapse"
+            data-project-id="${escapeHtml(project.id)}"
+            aria-controls="${escapeHtml(projectStackId)}"
+            aria-expanded="${projectCollapsed ? "false" : "true"}"
+            aria-label="${escapeHtml(caretLabel)}"
+            title="${escapeHtml(caretLabel)}"
+          >
+            <span class="project-caret">⌄</span>
+          </button>
+          <button
+            type="button"
+            class="project-row-main"
+            data-action="select-project"
+            data-id="${escapeHtml(project.id)}"
+            title="${escapeHtml(projectPath)}"
+          >
+            <span class="project-name">${escapeHtml(projectName)}</span>
+          </button>
+          ${project.id === state.selectedProjectId ? `
             <button
               type="button"
               class="project-row-new-thread"
@@ -760,31 +1212,31 @@ function renderProjects() {
               aria-label="New thread"
               title="New Thread"
             >+</button>
-          </div>
-        ` : `
-          <button class="project-row" data-action="select-project" data-id="${escapeHtml(project.id)}">
-            <span class="project-caret">⌄</span>
-            <span class="project-folder">□</span>
-            <span class="project-name">${escapeHtml(project.name)}</span>
-          </button>
-        `}
-        <div class="conversation-stack">
+          ` : ""}
+        </div>
+        <div id="${escapeHtml(projectStackId)}" class="conversation-stack${projectCollapsed ? " hidden" : ""}">
           ${visibleThreads.length ? visibleThreads.map((thread) => {
             const preview = (thread.preview || thread.name || "New conversation").replace(/\s+/g, " ").trim();
             const timeText = relativeTime(thread.updatedAt || thread.createdAt);
-            const selectedClass = thread.id === state.selectedThreadId ? "selected" : "";
             const activity = describeThreadActivity(thread);
+            const rowClasses = ["conversation-row"];
+            if (thread.id === state.selectedThreadId) {
+              rowClasses.push("selected");
+            }
+            if (activity.isWorking) {
+              rowClasses.push("working");
+            }
             return `
-              <button class="conversation-row ${selectedClass}" data-action="select-thread" data-project-id="${escapeHtml(project.id)}" data-id="${escapeHtml(thread.id)}">
-                <span class="conversation-title-wrap">
+              <button class="${rowClasses.join(" ")}" data-action="select-thread" data-project-id="${escapeHtml(project.id)}" data-id="${escapeHtml(thread.id)}">
+                <span class="conversation-primary">
                   <span class="conversation-title">${escapeHtml(preview)}</span>
-                  ${activity.isWorking ? renderActivityBadge(activity.label, activity.statusText, "small") : ""}
+                  ${activity.isWorking ? `<span class="conversation-status">${renderActivityBadge(activity.label, activity.statusText, "sidebar")}</span>` : ""}
                 </span>
                 <span class="conversation-time">${escapeHtml(timeText)}</span>
               </button>
             `;
           }).join("") : `<div class="conversation-empty">No conversations yet</div>`}
-          ${moreCount > 0 ? `
+          ${!projectCollapsed && moreCount > 0 ? `
             <button
               type="button"
               class="conversation-more-button"
@@ -812,6 +1264,7 @@ function collapsedVisibleThreadCount(threads) {
 function renderThreadHeader() {
   const thread = state.selectedThread;
   const project = selectedProject();
+  const projectName = project ? projectDisplayName(project) : "";
 
   if (!thread) {
     elements.threadHeader.innerHTML = `
@@ -838,7 +1291,7 @@ function renderThreadHeader() {
       </div>
       <div class="thread-toolbar">
         <div class="thread-title-wrap">
-          <h2 class="thread-title" title="${escapeHtml(project?.name || "No project selected")}">${escapeHtml(project?.name || "No project selected")}</h2>
+          <h2 class="thread-title" title="${escapeHtml(project?.cwd || projectName || "No project selected")}">${escapeHtml(projectName || "No project selected")}</h2>
           <p class="meta">Start a new conversation below. The first prompt creates the thread.</p>
         </div>
       </div>
@@ -875,7 +1328,7 @@ function renderThreadHeader() {
       <div class="thread-title-wrap">
         <h2 class="thread-title" title="${escapeHtml(thread.name || thread.preview || "Untitled thread")}">${escapeHtml(thread.name || thread.preview || "Untitled thread")}</h2>
         <div class="meta thread-meta">
-          <span>${escapeHtml(selectedProject()?.name || "")}</span>
+          <span>${escapeHtml(projectName)}</span>
           <span>·</span>
           ${renderActivityBadge(activity.isWorking ? activity.label : threadStatusText, threadStatusText, activity.isWorking ? "live" : "idle")}
           <span>·</span>
@@ -895,17 +1348,20 @@ function renderThreadPane() {
   syncDesktopInputBinding();
 
   if (!desktopVisible) {
+    renderThreadDesktopAnalysis();
     return;
   }
 
   if (!state.selectedThread) {
     elements.threadDesktopStatus.textContent = "Start a conversation first.";
+    renderThreadDesktopAnalysis();
     return;
   }
 
   const session = state.desktopSessionByThreadId[state.selectedThread.id];
   if (!session) {
     elements.threadDesktopStatus.textContent = "Starting virtual desktop...";
+    renderThreadDesktopAnalysis();
     return;
   }
 
@@ -917,6 +1373,79 @@ function renderThreadPane() {
   } else {
     elements.threadDesktopStatus.textContent = `${session.state.displayName} · connecting`;
   }
+
+  renderThreadDesktopAnalysis();
+}
+
+function renderThreadDesktopAnalysis() {
+  const desktopVisible = state.activeThreadTab === "desktop" && Boolean(state.selectedThreadId);
+  const threadId = state.selectedThreadId || "";
+  const analysis = threadId ? state.desktopAnalysisByThreadId[threadId] : null;
+  const inFlight = threadId && state.desktopAnalysisInFlightThreadId === threadId;
+  const desktopState = state.desktopClient?.threadId === threadId
+    ? state.desktopClient.client?.getState?.()
+    : null;
+  const canAnalyze = desktopVisible && Boolean(desktopState?.authenticated) && !inFlight;
+
+  elements.threadDesktopAnalyze.disabled = !canAnalyze;
+  elements.threadDesktopAnalyze.textContent = inFlight ? "Analyzing..." : "Analyze Screen";
+
+  if (!desktopVisible) {
+    elements.threadDesktopAnalysis.classList.add("hidden");
+    elements.threadDesktopAnalysis.innerHTML = "";
+    return;
+  }
+
+  if (inFlight && !analysis) {
+    elements.threadDesktopAnalysis.classList.remove("hidden");
+    elements.threadDesktopAnalysis.innerHTML = `<p class="thread-desktop-analysis-empty">Analyzing the watched live desktop session with local Ollama vision...</p>`;
+    return;
+  }
+
+  if (!analysis) {
+    elements.threadDesktopAnalysis.classList.add("hidden");
+    elements.threadDesktopAnalysis.innerHTML = "";
+    return;
+  }
+
+  const targets = Array.isArray(analysis.targets) ? analysis.targets : [];
+  const usage = analysis.usage || {};
+  const usageParts = [
+    Number.isFinite(usage.promptEvalCount) ? `${usage.promptEvalCount} prompt tokens` : "",
+    Number.isFinite(usage.evalCount) ? `${usage.evalCount} output tokens` : "",
+  ].filter(Boolean).join(" · ");
+
+  elements.threadDesktopAnalysis.classList.remove("hidden");
+  elements.threadDesktopAnalysis.innerHTML = `
+    <div class="thread-desktop-analysis-head">
+      <div>
+        <p class="thread-desktop-analysis-title">Live Desktop Analysis</p>
+        <p class="thread-desktop-analysis-meta">
+          ${escapeHtml(`${analysis.width}x${analysis.height}`)}
+          · ${escapeHtml(analysis.model || "local vision")}
+          ${analysis.goal ? `· Goal: ${escapeHtml(analysis.goal)}` : ""}
+          ${usageParts ? `· ${escapeHtml(usageParts)}` : ""}
+        </p>
+      </div>
+    </div>
+    <p class="thread-desktop-analysis-summary">${escapeHtml(analysis.summary || "Local vision completed.")}</p>
+    ${analysis.uncertainty ? `<p class="thread-desktop-analysis-meta">Uncertainty: ${escapeHtml(analysis.uncertainty)}</p>` : ""}
+    ${targets.length ? `
+      <div class="thread-desktop-analysis-list">
+        ${targets.map((target, index) => `
+          <article class="thread-desktop-analysis-target">
+            <p class="thread-desktop-analysis-target-label">${escapeHtml(`${index + 1}. ${target.label || target.kind || target.targetId || "Target"}`)}</p>
+            <p class="thread-desktop-analysis-target-meta">
+              ${escapeHtml(target.kind || "control")}
+              · conf ${escapeHtml(Number(target.confidence || 0).toFixed(2))}
+              · center (${escapeHtml(String(target.center?.x ?? ""))}, ${escapeHtml(String(target.center?.y ?? ""))})
+            </p>
+            ${target.description ? `<p class="thread-desktop-analysis-target-meta">${escapeHtml(target.description)}</p>` : ""}
+          </article>
+        `).join("")}
+      </div>
+    ` : `<p class="thread-desktop-analysis-empty">No clickable targets were returned for this live desktop frame.</p>`}
+  `;
 }
 
 function syncDesktopInputBinding() {
@@ -936,14 +1465,22 @@ function syncDesktopInputBinding() {
 
 function renderConversation() {
   const thread = state.selectedThread;
+  const pendingRequests = pendingServerRequestsForThread(thread?.id);
+  const latestCollapsibleItemId = findLatestCollapsibleItemId(thread);
 
-  if (!thread?.turns?.length) {
+  if (!thread?.turns?.length && pendingRequests.length === 0) {
     elements.conversation.innerHTML = `<div class="empty">No turns yet.</div>`;
     scrollConversationToBottom();
     return;
   }
 
   const activity = describeThreadActivity(thread);
+  const pendingBanner = pendingRequests.length ? `
+    <section class="conversation-activity-banner" aria-live="polite">
+      ${renderActivityBadge(pendingRequests.some((request) => request.method === "item/tool/requestUserInput") ? "Needs Input" : "Needs Approval", "pending", "live")}
+      <span>${escapeHtml(pendingRequests.length === 1 ? "Conversation is waiting for one response." : `Conversation is waiting for ${pendingRequests.length} responses.`)}</span>
+    </section>
+  ` : "";
   const activityBanner = activity.isWorking ? `
     <section class="conversation-activity-banner" aria-live="polite">
       ${renderActivityBadge(activity.label, activity.statusText, "live")}
@@ -951,8 +1488,8 @@ function renderConversation() {
     </section>
   ` : "";
 
-  elements.conversation.innerHTML = `${activityBanner}${thread.turns.map((turn) => {
-    const items = (turn.items || []).map(renderItem).join("");
+  elements.conversation.innerHTML = `${pendingBanner}${activityBanner}${thread.turns.map((turn) => {
+    const items = renderTurnItems(turn, latestCollapsibleItemId);
     const turnWorking = isLiveStatus(turn.status);
 
     return `
@@ -968,7 +1505,7 @@ function renderConversation() {
         ${turn.error ? `<div class="bubble agent"><strong>Error</strong><div class="message-body"><pre>${escapeHtml(JSON.stringify(turn.error, null, 2))}</pre></div></div>` : ""}
       </section>
     `;
-  }).join("")}`;
+  }).join("")}${pendingRequests.map(renderPendingServerRequest).join("")}`;
 
   scrollConversationToBottom();
 }
@@ -1018,33 +1555,36 @@ function renderComposerAttachments() {
   `).join("");
 }
 
-function renderItem(item) {
+function renderItem(item, latestCollapsibleItemId = "") {
+  const itemId = item?.id ? escapeHtml(item.id) : "";
+  const itemType = escapeHtml(item?.type || "");
+  const isLatestItem = item?.id && item.id === latestCollapsibleItemId;
+
   if (item.type === "userMessage") {
-    return `<article class="bubble user"><strong>User</strong><div class="message-body">${renderMessageContent(item.content, item.text || "")}</div></article>`;
+    if (!isLatestItem) {
+      return renderMessageCollapsibleItem(item, "User", latestCollapsibleItemId);
+    }
+    return `<article class="bubble user" data-item-id="${itemId}" data-item-type="${itemType}"><strong>User</strong><div class="message-body">${renderMessageContent(item.content, item.text || "")}</div></article>`;
   }
 
   if (item.type === "agentMessage") {
-    return `<article class="bubble agent"><strong>Agent</strong><div class="message-body">${renderMessageContent(item.content, item.text || "")}</div></article>`;
+    if (!isLatestItem) {
+      return renderMessageCollapsibleItem(item, "Agent", latestCollapsibleItemId);
+    }
+    return `<article class="bubble agent" data-item-id="${itemId}" data-item-type="${itemType}"><strong>Agent</strong><div class="message-body">${renderMessageContent(item.content, item.text || "")}</div></article>`;
   }
 
   if (item.type === "plan") {
-    return renderCollapsibleItem("Plan", oneLine(item.text || "Plan update"), escapeHtml(item.text || ""));
+    const display = getPlanDisplay(item);
+    return renderCollapsibleItem(item, display, latestCollapsibleItemId);
   }
 
   if (item.type === "reasoning") {
-    const summary = oneLine((item.summary || []).join(" ")) || oneLine((item.content || []).join(" ")) || "Reasoning";
-    const details = [
-      (item.summary || []).length ? `Summary\n${(item.summary || []).join("\n")}` : "",
-      (item.content || []).length ? `\nContent\n${(item.content || []).join("\n")}` : "",
-    ].filter(Boolean).join("\n");
-    return renderCollapsibleItem("Reasoning", summary, escapeHtml(details || summary));
+    return renderCollapsibleItem(item, getReasoningDisplay(item), latestCollapsibleItemId);
   }
 
   if (item.type === "commandExecution") {
-    const summary = oneLine(item.command || "Command");
-    const meta = `${formatStatus(item.status)}${item.exitCode != null ? ` · exit ${item.exitCode}` : ""}`;
-    const details = [item.command || "", meta, item.aggregatedOutput || ""].filter(Boolean).join("\n");
-    return renderCollapsibleItem("Command", summary, escapeHtml(details), meta);
+    return renderCollapsibleItem(item, getCommandExecutionDisplay(item), latestCollapsibleItemId);
   }
 
   if (item.type === "fileChange") {
@@ -1056,12 +1596,13 @@ function renderItem(item) {
     `).join("");
 
     const summary = `${item.changes?.length || 0} file ${item.changes?.length === 1 ? "change" : "changes"}`;
+    const open = shouldExpandConversationItem(item.id, latestCollapsibleItemId) ? " open" : "";
     return `
-      <article class="bubble agent collapsed-item">
-        <details>
+      <article class="bubble agent collapsed-item" data-item-id="${itemId}" data-item-type="${itemType}">
+        <details data-item-id="${itemId}"${open}>
           <summary class="collapsed-summary">
             <span class="collapsed-title">File Changes</span>
-            <span class="collapsed-text">${escapeHtml(summary)}</span>
+            <span class="collapsed-text" data-role="summary">${escapeHtml(summary)}</span>
           </summary>
           <div class="collapsed-body">${changes}</div>
         </details>
@@ -1072,39 +1613,275 @@ function renderItem(item) {
   if (item.type === "mcpToolCall") {
     const summary = `${item.server || "mcp"} · ${item.tool || "tool"}`;
     const details = JSON.stringify(item, null, 2);
-    return renderCollapsibleItem("MCP Tool", summary, escapeHtml(details), formatStatus(item.status));
+    return renderCollapsibleItem(item, {
+      title: "MCP Tool",
+      summary,
+      body: details,
+      meta: formatStatus(item.status),
+    }, latestCollapsibleItemId);
   }
 
   if (item.type === "dynamicToolCall") {
     const summary = item.tool || "dynamic tool";
-    const details = JSON.stringify(item, null, 2);
-    return renderCollapsibleItem("Tool Call", summary, escapeHtml(details), formatStatus(item.status));
+    return renderCollapsibleItem(item, {
+      title: "Tool Call",
+      summary,
+      bodyHtml: renderToolCallBody(item),
+      meta: formatStatus(item.status),
+    }, latestCollapsibleItemId);
   }
 
   if (item.type === "collabAgentToolCall") {
     const summary = `${item.tool || "agent tool"}${item.model ? ` · ${item.model}` : ""}`;
     const details = JSON.stringify(item, null, 2);
-    return renderCollapsibleItem("Collaboration", summary, escapeHtml(details), formatStatus(item.status));
+    return renderCollapsibleItem(item, {
+      title: "Collaboration",
+      summary,
+      body: details,
+      meta: formatStatus(item.status),
+    }, latestCollapsibleItemId);
   }
 
-  return renderCollapsibleItem(item.type, oneLine(JSON.stringify(item)), escapeHtml(JSON.stringify(item, null, 2)));
+  return renderCollapsibleItem(item, {
+    title: item.type,
+    summary: oneLine(JSON.stringify(item)),
+    body: JSON.stringify(item, null, 2),
+  }, latestCollapsibleItemId);
 }
 
-function renderCollapsibleItem(title, summary, body, meta = "") {
+function renderMessageCollapsibleItem(item, title, latestCollapsibleItemId = "") {
+  const itemId = item?.id ? escapeHtml(item.id) : "";
+  const itemType = escapeHtml(item?.type || "");
+  const summary = summarizeMessageItem(item, title);
+  const open = shouldExpandConversationItem(item?.id, latestCollapsibleItemId) ? " open" : "";
+
   return `
-    <article class="bubble agent collapsed-item">
-      <details>
+    <article class="bubble ${item.type === "userMessage" ? "user" : "agent"} collapsed-item" data-item-id="${itemId}" data-item-type="${itemType}">
+      <details data-item-id="${itemId}"${open}>
         <summary class="collapsed-summary">
           <span class="collapsed-title">${escapeHtml(title)}</span>
-          <span class="collapsed-text">${escapeHtml(summary || title)}</span>
-          ${meta ? `<span class="collapsed-meta">${escapeHtml(meta)}</span>` : ""}
+          <span class="collapsed-text" data-role="summary">${escapeHtml(summary)}</span>
         </summary>
         <div class="collapsed-body">
-          <pre>${body}</pre>
+          <div class="message-body">${renderMessageContent(item.content, item.text || "")}</div>
         </div>
       </details>
     </article>
   `;
+}
+
+function renderCollapsibleItem(item, display, latestCollapsibleItemId = "") {
+  const itemId = item?.id ? escapeHtml(item.id) : "";
+  const itemType = escapeHtml(item?.type || "");
+  const title = display?.title || item?.type || "Item";
+  const summary = display?.summary || title;
+  const body = display?.body || summary;
+  const bodyHtml = typeof display?.bodyHtml === "string"
+    ? display.bodyHtml
+    : `<pre data-role="body">${escapeHtml(body)}</pre>`;
+  const meta = display?.meta || "";
+  const open = shouldExpandConversationItem(item?.id, latestCollapsibleItemId) ? " open" : "";
+
+  return `
+    <article class="bubble agent collapsed-item" data-item-id="${itemId}" data-item-type="${itemType}">
+      <details data-item-id="${itemId}"${open}>
+        <summary class="collapsed-summary">
+          <span class="collapsed-title">${escapeHtml(title)}</span>
+          <span class="collapsed-text" data-role="summary">${escapeHtml(summary || title)}</span>
+          ${meta ? `<span class="collapsed-meta" data-role="meta">${escapeHtml(meta)}</span>` : ""}
+        </summary>
+        <div class="collapsed-body">
+          ${bodyHtml}
+        </div>
+      </details>
+    </article>
+  `;
+}
+
+function renderToolCallBody(item) {
+  const metadata = [];
+
+  if (item?.id) {
+    metadata.push(`id: ${item.id}`);
+  }
+
+  if (item?.tool) {
+    metadata.push(`tool: ${item.tool}`);
+  }
+
+  if (item?.status) {
+    metadata.push(`status: ${item.status}`);
+  }
+
+  if (item?.arguments && Object.keys(item.arguments).length > 0) {
+    metadata.push(`arguments:\n${JSON.stringify(item.arguments, null, 2)}`);
+  }
+
+  const contentItems = Array.isArray(item?.contentItems) ? item.contentItems : [];
+  const sections = [];
+
+  if (metadata.length > 0) {
+    sections.push(`<pre data-role="body">${escapeHtml(metadata.join("\n\n"))}</pre>`);
+  }
+
+  if (contentItems.length > 0) {
+    sections.push(`<div class="message-body tool-call-content">${renderMessageContent(contentItems)}</div>`);
+  }
+
+  if (!sections.length) {
+    sections.push(`<pre data-role="body">${escapeHtml(JSON.stringify(item, null, 2))}</pre>`);
+  }
+
+  return `<div class="tool-call-body">${sections.join("")}</div>`;
+}
+
+function renderPendingServerRequest(request) {
+  if (!request?.method) {
+    return "";
+  }
+
+  if (request.method === "item/tool/requestUserInput") {
+    const questions = Array.isArray(request.params?.questions) ? request.params.questions : [];
+    const body = questions.map((question, index) => {
+      const options = Array.isArray(question.options) ? question.options : [];
+      const fieldId = `pending-${escapeHtml(String(request.id))}-${escapeHtml(question.id || String(index))}`;
+      const useSelect = options.length > 0;
+      const allowOther = Boolean(question.isOther);
+
+      return `
+        <label class="pending-request-field" for="${fieldId}">
+          <span class="pending-request-label">${escapeHtml(question.header || question.id || `Question ${index + 1}`)}</span>
+          <span class="pending-request-help">${escapeHtml(question.question || "")}</span>
+          ${useSelect ? `
+            <select id="${fieldId}" name="${escapeHtml(question.id || `question_${index}`)}" class="pending-request-input" ${allowOther ? `data-has-other="true" data-other-target="${fieldId}-other"` : ""}>
+              <option value="">Select an answer</option>
+              ${options.map((option) => `<option value="${escapeHtml(option.label || "")}">${escapeHtml(option.label || "")}</option>`).join("")}
+              ${allowOther ? `<option value="__other__">Other</option>` : ""}
+            </select>
+          ` : `
+            <input id="${fieldId}" name="${escapeHtml(question.id || `question_${index}`)}" class="pending-request-input" type="${question.isSecret ? "password" : "text"}" autocomplete="off">
+          `}
+          ${allowOther ? `<input id="${fieldId}-other" name="${escapeHtml(question.id || `question_${index}`)}__other" class="pending-request-input hidden" type="${question.isSecret ? "password" : "text"}" autocomplete="off" placeholder="Enter another answer">` : ""}
+        </label>
+      `;
+    }).join("");
+
+    return `
+      <article class="bubble agent pending-request-card">
+        <strong>Input Required</strong>
+        <div class="message-body">
+          <form data-action="respond-tool-request-user-input" data-request-id="${escapeHtml(String(request.id))}">
+            ${body}
+            <div class="pending-request-actions">
+              <button type="submit">Send Response</button>
+            </div>
+          </form>
+        </div>
+      </article>
+    `;
+  }
+
+  if (request.method === "item/commandExecution/requestApproval") {
+    const decisions = Array.isArray(request.params?.availableDecisions) && request.params.availableDecisions.length
+      ? request.params.availableDecisions
+      : ["accept", "decline"];
+    const reason = request.params?.reason || "";
+    const command = request.params?.command || "";
+    const cwd = request.params?.cwd || "";
+
+    return `
+      <article class="bubble agent pending-request-card">
+        <strong>Command Approval</strong>
+        <div class="message-body">
+          ${reason ? `<p>${escapeHtml(reason)}</p>` : ""}
+          ${command ? `<pre>${escapeHtml(command)}</pre>` : ""}
+          ${cwd ? `<p><strong>cwd</strong> ${escapeHtml(cwd)}</p>` : ""}
+          <div class="pending-request-actions">
+            ${decisions.map((decision) => {
+              const value = typeof decision === "string" ? decision : JSON.stringify(decision);
+              return `<button type="button" data-action="respond-command-approval" data-request-id="${escapeHtml(String(request.id))}" data-decision="${escapeHtml(value)}">${escapeHtml(commandApprovalDecisionLabel(decision))}</button>`;
+            }).join("")}
+          </div>
+        </div>
+      </article>
+    `;
+  }
+
+  if (request.method === "item/fileChange/requestApproval") {
+    const reason = request.params?.reason || "Approve file changes?";
+    const grantRoot = request.params?.grantRoot || "";
+
+    return `
+      <article class="bubble agent pending-request-card">
+        <strong>File Change Approval</strong>
+        <div class="message-body">
+          <p>${escapeHtml(reason)}</p>
+          ${grantRoot ? `<p><strong>root</strong> ${escapeHtml(grantRoot)}</p>` : ""}
+          <div class="pending-request-actions">
+            <button type="button" data-action="respond-file-change-approval" data-request-id="${escapeHtml(String(request.id))}" data-decision="accept">Allow</button>
+            <button type="button" data-action="respond-file-change-approval" data-request-id="${escapeHtml(String(request.id))}" data-decision="acceptForSession">Allow For Session</button>
+            <button type="button" data-action="respond-file-change-approval" data-request-id="${escapeHtml(String(request.id))}" data-decision="decline">Decline</button>
+            <button type="button" data-action="respond-file-change-approval" data-request-id="${escapeHtml(String(request.id))}" data-decision="cancel">Cancel</button>
+          </div>
+        </div>
+      </article>
+    `;
+  }
+
+  if (request.method === "item/permissions/requestApproval") {
+    const reason = request.params?.reason || "Grant additional permissions?";
+    const details = request.params?.permissions ? escapeHtml(JSON.stringify(request.params.permissions, null, 2)) : "";
+
+    return `
+      <article class="bubble agent pending-request-card">
+        <strong>Permissions Approval</strong>
+        <div class="message-body">
+          <p>${escapeHtml(reason)}</p>
+          ${details ? `<pre>${details}</pre>` : ""}
+          <div class="pending-request-actions">
+            <button type="button" data-action="respond-permissions-approval" data-request-id="${escapeHtml(String(request.id))}" data-scope="turn">Grant For Turn</button>
+            <button type="button" data-action="respond-permissions-approval" data-request-id="${escapeHtml(String(request.id))}" data-scope="session">Grant For Session</button>
+          </div>
+        </div>
+      </article>
+    `;
+  }
+
+  return renderCollapsibleItem({
+    id: request.id || request.method,
+    type: "pendingRequest",
+  }, {
+    title: "Pending Request",
+    summary: request.method,
+    body: JSON.stringify(request, null, 2),
+  });
+}
+
+function commandApprovalDecisionLabel(decision) {
+  if (typeof decision === "string") {
+    switch (decision) {
+      case "accept":
+        return "Allow";
+      case "acceptForSession":
+        return "Allow For Session";
+      case "decline":
+        return "Decline";
+      case "cancel":
+        return "Cancel";
+      default:
+        return decision;
+    }
+  }
+
+  if (decision?.acceptWithExecpolicyAmendment) {
+    return "Allow With Policy";
+  }
+
+  if (decision?.applyNetworkPolicyAmendment) {
+    return "Allow Network Policy";
+  }
+
+  return "Respond";
 }
 
 function renderMarkdown(text) {
@@ -1132,9 +1909,13 @@ function renderContentEntry(entry) {
     return renderMarkdown(entry.text || "");
   }
 
+  if (entry.type === "inputText") {
+    return `<pre>${escapeHtml(entry.text || "")}</pre>`;
+  }
+
   const imageUrl = entry.url || entry.imageUrl || entry.image_url || entry.data;
 
-  if ((entry.type === "image" || entry.type === "local_image" || entry.type === "localImage") && imageUrl) {
+  if ((entry.type === "image" || entry.type === "local_image" || entry.type === "localImage" || entry.type === "inputImage") && imageUrl) {
     return `
       <figure class="message-image-wrap">
         <img class="message-image" src="${escapeHtml(imageUrl)}" alt="${escapeHtml(entry.alt || entry.name || "Attached image")}">
@@ -1165,13 +1946,20 @@ function connectEvents() {
       scrollConversationToBottom();
     }
   });
+  elements.approveAllDangerousToggle.addEventListener("change", (event) => {
+    state.composerApproveAllDangerous = event.target.checked;
+    persistSelection();
+    if (state.composerApproveAllDangerous) {
+      void maybeAutoApprovePendingRequests();
+    }
+  });
   elements.imageEditorOverlayCanvas.addEventListener("pointerdown", handleImageEditorPointerDown);
   elements.imageEditorOverlayCanvas.addEventListener("pointermove", handleImageEditorPointerMove);
   elements.imageEditorOverlayCanvas.addEventListener("dblclick", handleImageEditorDoubleClick);
   window.addEventListener("pointerup", handleImageEditorPointerUp);
   window.addEventListener("resize", () => {
     if (window.innerWidth > 980) {
-      applySidebarWidth();
+      applySidebarLayout();
     }
 
     if (state.imageEditor.open) {
@@ -1215,6 +2003,18 @@ function connectEvents() {
     void updateThreadDesktopFrameRate();
   });
 
+  elements.threadDesktopPasteText.addEventListener("click", () => {
+    void pasteTextToThreadDesktop();
+  });
+
+  elements.threadDesktopCopyClipboard.addEventListener("click", () => {
+    void copyThreadDesktopClipboard();
+  });
+
+  elements.threadDesktopAnalyze.addEventListener("click", () => {
+    void analyzeLiveThreadDesktop();
+  });
+
   elements.threadDesktopScreenshot.addEventListener("click", () => {
     void captureThreadDesktopScreenshot();
   });
@@ -1233,17 +2033,52 @@ function clampSidebarWidth(width) {
   return Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, Math.round(width)));
 }
 
-function applySidebarWidth() {
+function syncSidebarToggleControls() {
+  const collapsed = state.sidebarCollapsed;
+  const label = collapsed ? "Expand sidebar" : "Collapse sidebar";
+  const icon = collapsed ? "&gt;" : "&lt;";
+
+  [elements.sidebarToggleButton, elements.sidebarRailToggle].forEach((button) => {
+    if (!button) {
+      return;
+    }
+
+    button.setAttribute("aria-pressed", collapsed ? "true" : "false");
+    button.setAttribute("aria-label", label);
+    button.title = label;
+    button.innerHTML = `<span aria-hidden="true">${icon}</span>`;
+  });
+
+  if (elements.sidebarPanel) {
+    elements.sidebarPanel.setAttribute("aria-hidden", collapsed ? "true" : "false");
+  }
+}
+
+function applySidebarLayout() {
   if (!elements.layout) {
     return;
   }
 
   state.sidebarWidth = clampSidebarWidth(state.sidebarWidth);
   elements.layout.style.setProperty("--sidebar-width", `${state.sidebarWidth}px`);
+  elements.layout.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
+  elements.sidebarResizeHandle.setAttribute("aria-label", state.sidebarCollapsed ? "Expand sidebar" : "Resize sidebar");
+  syncSidebarToggleControls();
+}
+
+function toggleSidebarCollapsed(force) {
+  const nextCollapsed = typeof force === "boolean" ? force : !state.sidebarCollapsed;
+  if (nextCollapsed === state.sidebarCollapsed) {
+    return;
+  }
+
+  state.sidebarCollapsed = nextCollapsed;
+  applySidebarLayout();
+  persistSelection();
 }
 
 function startSidebarResize(event) {
-  if (window.innerWidth <= 980) {
+  if (state.sidebarCollapsed || window.innerWidth <= 980 || event.target.closest("[data-action='toggle-sidebar']")) {
     return;
   }
 
@@ -1261,7 +2096,7 @@ function handleSidebarResizePointerMove(event) {
   }
 
   state.sidebarWidth = clampSidebarWidth(event.clientX);
-  applySidebarWidth();
+  applySidebarLayout();
 }
 
 function stopSidebarResize(event) {
@@ -1276,7 +2111,13 @@ function stopSidebarResize(event) {
 }
 
 function handleSidebarResizeKeydown(event) {
-  if (window.innerWidth <= 980) {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    toggleSidebarCollapsed();
+    return;
+  }
+
+  if (window.innerWidth <= 980 || state.sidebarCollapsed) {
     return;
   }
 
@@ -1296,7 +2137,7 @@ function handleSidebarResizeKeydown(event) {
 
   event.preventDefault();
   state.sidebarWidth = clampSidebarWidth(nextWidth);
-  applySidebarWidth();
+  applySidebarLayout();
   persistSelection();
 }
 
@@ -1341,6 +2182,17 @@ function connectConversationSocket() {
       return;
     }
 
+    if (payload.type === "server-request") {
+      upsertPendingServerRequest(payload.request);
+      void maybeAutoApprovePendingRequests([payload.request]);
+
+      if (payload.request?.params?.threadId === state.selectedThreadId) {
+        renderSelectedThread();
+      }
+
+      return;
+    }
+
     if (payload.type === "notification") {
       const message = payload.message;
       const method = typeof message?.method === "string" ? message.method : "";
@@ -1348,6 +2200,10 @@ function connectConversationSocket() {
 
       if (!method) {
         return;
+      }
+
+      if (method === "serverRequest/resolved" && message.params?.requestId != null) {
+        removePendingServerRequest(message.params.requestId);
       }
 
       if (threadId && threadId === state.selectedThreadId) {
@@ -1429,6 +2285,11 @@ document.addEventListener("click", async (event) => {
       if (!elements.projectQuickAddForm.classList.contains("hidden")) {
         elements.projectPathInput.focus();
       }
+      return;
+    }
+
+    if (action === "toggle-sidebar") {
+      toggleSidebarCollapsed();
       return;
     }
 
@@ -1533,12 +2394,18 @@ document.addEventListener("click", async (event) => {
         return;
       }
 
-      if (state.expandedProjectIds.has(projectId)) {
-        state.expandedProjectIds.delete(projectId);
-      } else {
-        state.expandedProjectIds.add(projectId);
+      toggleProjectThreads(projectId);
+      renderProjects();
+      return;
+    }
+
+    if (action === "toggle-project-collapse") {
+      const projectId = button.dataset.projectId || "";
+      if (!projectId) {
+        return;
       }
 
+      toggleProjectCollapsed(projectId);
       renderProjects();
       return;
     }
@@ -1660,6 +2527,34 @@ document.addEventListener("click", async (event) => {
       return;
     }
 
+    if (action === "respond-command-approval") {
+      const requestId = button.dataset.requestId || "";
+      const request = state.pendingServerRequests.find((entry) => String(entry?.id) === requestId);
+      await respondToPendingServerRequest(request || { id: requestId }, {
+        decision: parsePendingDecision(button.dataset.decision),
+      });
+      return;
+    }
+
+    if (action === "respond-file-change-approval") {
+      const requestId = button.dataset.requestId || "";
+      const request = state.pendingServerRequests.find((entry) => String(entry?.id) === requestId);
+      await respondToPendingServerRequest(request || { id: requestId }, {
+        decision: button.dataset.decision || "decline",
+      });
+      return;
+    }
+
+    if (action === "respond-permissions-approval") {
+      const requestId = button.dataset.requestId || "";
+      const request = state.pendingServerRequests.find((entry) => String(entry?.id) === requestId);
+      await respondToPendingServerRequest(request || { id: requestId }, {
+        permissions: request?.params?.permissions || {},
+        scope: button.dataset.scope === "session" ? "session" : "turn",
+      });
+      return;
+    }
+
   } catch (error) {
     alert(error.message);
   }
@@ -1749,9 +2644,47 @@ document.addEventListener("submit", async (event) => {
       return;
     }
 
+    if (form.dataset.action === "respond-tool-request-user-input") {
+      const requestId = form.dataset.requestId || "";
+      const formData = new FormData(form);
+      const request = state.pendingServerRequests.find((entry) => String(entry?.id) === requestId);
+      const questions = Array.isArray(request?.params?.questions) ? request.params.questions : [];
+      const answers = {};
+
+      for (const question of questions) {
+        const key = question.id;
+        const selected = String(formData.get(key) || "").trim();
+        const other = String(formData.get(`${key}__other`) || "").trim();
+        const finalAnswer = selected === "__other__" ? other : selected;
+
+        if (!finalAnswer) {
+          throw new Error(`Answer required for ${question.header || key}`);
+        }
+
+        answers[key] = { answers: [finalAnswer] };
+      }
+
+      await respondToPendingServerRequest(request || { id: requestId }, { answers });
+      return;
+    }
+
   } catch (error) {
     alert(error.message);
   }
+});
+
+document.addEventListener("change", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLSelectElement) || target.dataset.hasOther !== "true") {
+    return;
+  }
+
+  const otherTarget = document.getElementById(target.dataset.otherTarget || "");
+  if (!(otherTarget instanceof HTMLElement)) {
+    return;
+  }
+
+  otherTarget.classList.toggle("hidden", target.value !== "__other__");
 });
 
 function findLatestTurnId(thread) {
@@ -1882,6 +2815,8 @@ async function stopThreadDesktop() {
     return;
   }
 
+  delete state.desktopAnalysisByThreadId[state.selectedThreadId];
+  state.desktopAnalysisInFlightThreadId = "";
   await disconnectDesktopClient();
   await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/desktop`, {
     method: "DELETE",
@@ -1941,6 +2876,114 @@ async function captureThreadDesktopScreenshot() {
   renderThreadPane();
 
   await openImageEditor(attachmentId);
+}
+
+async function analyzeLiveThreadDesktop() {
+  if (!state.selectedThreadId || state.activeThreadTab !== "desktop") {
+    return;
+  }
+
+  const desktopState = state.desktopClient?.client?.getState?.();
+  if (!desktopState?.authenticated) {
+    throw new Error("Virtual desktop is not connected");
+  }
+
+  const threadId = state.selectedThreadId;
+  const goal = window.prompt(
+    "What should local desktop vision look for? Leave blank for a general screen analysis.",
+    state.desktopAnalysisByThreadId[threadId]?.goal || "",
+  );
+
+  if (goal === null) {
+    return;
+  }
+
+  state.desktopAnalysisInFlightThreadId = threadId;
+  elements.threadDesktopStatus.textContent = "Analyzing live desktop with local Ollama vision...";
+  renderThreadPane();
+
+  try {
+    const payload = await api(`/api/threads/${encodeURIComponent(threadId)}/desktop/analyze`, {
+      method: "POST",
+      body: {
+        goal,
+        maxTargets: 12,
+      },
+    });
+    state.desktopAnalysisByThreadId[threadId] = payload.data || payload;
+    elements.threadDesktopStatus.textContent = `Analyzed ${payload.data?.width || "live"} desktop with ${payload.data?.model || "local vision"}`;
+  } catch (error) {
+    elements.threadDesktopStatus.textContent = `Desktop analysis failed: ${error.message}`;
+    throw error;
+  } finally {
+    state.desktopAnalysisInFlightThreadId = "";
+    renderThreadPane();
+  }
+}
+
+async function pasteTextToThreadDesktop() {
+  if (!state.selectedThreadId || state.activeThreadTab !== "desktop") {
+    return;
+  }
+
+  const desktopState = state.desktopClient?.client?.getState?.();
+  if (!desktopState?.authenticated) {
+    throw new Error("Virtual desktop is not connected");
+  }
+
+  const text = await readClipboardTextForDesktopInput();
+  if (!text) {
+    return;
+  }
+
+  await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/desktop/type`, {
+    method: "POST",
+    body: { text },
+  });
+  elements.threadDesktopStatus.textContent = `Typed ${text.length} characters`;
+}
+
+async function copyThreadDesktopClipboard() {
+  if (!state.selectedThreadId || state.activeThreadTab !== "desktop") {
+    return;
+  }
+
+  const desktopState = state.desktopClient?.client?.getState?.();
+  if (!desktopState?.authenticated) {
+    throw new Error("Virtual desktop is not connected");
+  }
+
+  const payload = await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/desktop/clipboard`);
+  const text = String(payload.data?.text || "");
+  await writeTextToLocalClipboard(text);
+  elements.threadDesktopStatus.textContent = text
+    ? `Copied ${text.length} characters from desktop clipboard`
+    : "Desktop clipboard is empty";
+}
+
+async function readClipboardTextForDesktopInput() {
+  if (navigator.clipboard?.readText) {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        return text;
+      }
+    } catch {}
+  }
+
+  const fallback = window.prompt("Paste text to type into the virtual desktop", "");
+  return fallback == null ? "" : fallback;
+}
+
+async function writeTextToLocalClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {}
+  }
+
+  window.prompt("Copy text from the virtual desktop", text);
 }
 
 async function handleComposerPaste(event) {
@@ -2691,9 +3734,18 @@ function describeThreadActivity(thread) {
 }
 
 function renderActivityBadge(label, statusText = "", tone = "idle") {
-  const className = `status-badge${tone === "live" ? " live" : ""}${tone === "small" ? " small live" : ""}`;
+  const classNames = ["status-badge"];
+  if (tone === "live" || tone === "small" || tone === "sidebar") {
+    classNames.push("live");
+  }
+  if (tone === "small") {
+    classNames.push("small");
+  }
+  if (tone === "sidebar") {
+    classNames.push("sidebar");
+  }
   const title = statusText ? ` title="${escapeHtml(statusText)}"` : "";
-  return `<span class="${className}"${title}><span class="status-dot" aria-hidden="true"></span>${escapeHtml(label)}</span>`;
+  return `<span class="${classNames.join(" ")}"${title}><span class="status-dot" aria-hidden="true"></span>${escapeHtml(label)}</span>`;
 }
 
 function formatStatus(status) {
@@ -2721,6 +3773,19 @@ function isLiveStatus(status) {
     || text.includes("thinking")
     || text.includes("stream")
     || text.includes("respond");
+}
+
+function parsePendingDecision(rawDecision) {
+  const value = String(rawDecision || "");
+  if (!value) {
+    return "decline";
+  }
+
+  if (value.startsWith("{")) {
+    return JSON.parse(value);
+  }
+
+  return value;
 }
 
 function escapeHtml(value) {

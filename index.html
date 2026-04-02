@@ -8,30 +8,26 @@
   <body>
     <div class="shell">
       <main class="layout" id="appLayout">
-        <aside class="panel panel-sidebar">
-          <div class="sidebar-brand">
-            <div class="sidebar-brand-copy">
-              <p class="brand-kicker">Code</p>
-              <h1>Project Desk</h1>
-            </div>
-            <div class="sidebar-brand-actions">
-              <a class="sidebar-link" href="/x-session.html">X Session</a>
-            </div>
-          </div>
-
-          <div class="sidebar-section-head sidebar-projects-head">
-            <span class="sidebar-label">Projects</span>
-            <div class="toolbar sidebar-toolbar">
-              <button
-                data-action="toggle-archived"
-                class="ghost-button small sidebar-filter-button"
-                id="archivedToggle"
-                type="button"
-                aria-pressed="false"
-              >Active</button>
-              <button data-action="refresh-all-projects" class="icon-button" title="Refresh">↻</button>
-              <button data-action="toggle-project-adder" class="icon-button" title="Add project">+</button>
-            </div>
+        <aside class="panel panel-sidebar" id="sidebarPanel">
+          <div class="toolbar sidebar-toolbar sidebar-projects-toolbar">
+            <button
+              data-action="toggle-sidebar"
+              class="icon-button"
+              id="sidebarToggleButton"
+              type="button"
+              aria-pressed="false"
+              aria-label="Collapse sidebar"
+              title="Collapse sidebar"
+            ><span aria-hidden="true">&lt;</span></button>
+            <button
+              data-action="toggle-archived"
+              class="ghost-button small sidebar-filter-button"
+              id="archivedToggle"
+              type="button"
+              aria-pressed="false"
+            >Active</button>
+            <button data-action="refresh-all-projects" class="icon-button" title="Refresh">↻</button>
+            <button data-action="toggle-project-adder" class="icon-button" title="Add project">+</button>
           </div>
 
           <form id="projectQuickAddForm" class="sidebar-adder hidden">
@@ -49,7 +45,17 @@
           aria-orientation="vertical"
           aria-label="Resize sidebar"
           tabindex="0"
-        ></div>
+        >
+          <button
+            id="sidebarRailToggle"
+            class="sidebar-rail-toggle"
+            data-action="toggle-sidebar"
+            type="button"
+            aria-pressed="false"
+            aria-label="Collapse sidebar"
+            title="Collapse sidebar"
+          ><span aria-hidden="true">&lt;</span></button>
+        </div>
 
         <section class="panel panel-conversation">
           <div id="threadHeader" class="thread-header"></div>
@@ -78,10 +84,14 @@
                     <option value="2">2.0x</option>
                   </select>
                 </label>
+                <button id="threadDesktopPasteText" type="button" class="ghost-button">Paste Text</button>
+                <button id="threadDesktopCopyClipboard" type="button" class="ghost-button">Copy Clipboard</button>
+                <button id="threadDesktopAnalyze" type="button" class="ghost-button">Analyze Screen</button>
                 <button id="threadDesktopScreenshot" type="button" class="ghost-button">Screenshot</button>
                 <button id="threadDesktopStop" type="button" class="danger-button">Stop Desktop</button>
               </div>
             </div>
+            <section id="threadDesktopAnalysis" class="thread-desktop-analysis hidden" aria-live="polite"></section>
             <div class="thread-desktop-surface">
               <canvas id="threadDesktopCanvas" class="thread-desktop-canvas"></canvas>
             </div>
@@ -109,6 +119,10 @@
                 <label class="composer-toggle composer-toggle-inline">
                   <input id="autoscrollToggle" type="checkbox" checked>
                   <span>Autoscroll</span>
+                </label>
+                <label class="composer-toggle composer-toggle-inline composer-dangerous-toggle">
+                  <input id="approveAllDangerousToggle" type="checkbox">
+                  <span>Approve all dangerous</span>
                 </label>
               </div>
             </div>

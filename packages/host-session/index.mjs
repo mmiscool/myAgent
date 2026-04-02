@@ -88,7 +88,151 @@ function pathExists(targetPath) {
   return fsp.access(targetPath).then(() => true).catch(() => false);
 }
 
+function cleanString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function commandToShellSource(command) {
+  const source = cleanString(command?.source);
+  if (source) {
+    return source;
+  }
+
+  const commandName = cleanString(command?.command);
+  if (!commandName) {
+    return "";
+  }
+
+  const args = Array.isArray(command?.args)
+    ? command.args.map((value) => quoteShell(String(value)))
+    : [];
+  return [quoteShell(commandName), ...args].join(" ");
+}
+
+function normalizeWindowId(value) {
+  const normalized = cleanString(value).toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+
+  if (normalized.startsWith("0x")) {
+    return normalized;
+  }
+
+  return `0x${normalized}`;
+}
+
+function parseWmctrlWindowList(stdout) {
+  return String(stdout || "")
+    .split(/\r?\n/)
+    .map((line) => {
+      const match = line.match(/^(\S+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(\S+)\s+(\S+)\s*(.*)$/);
+      if (!match) {
+        return null;
+      }
+
+      const [, id, desktop, pid, x, y, width, height, wmClass, host, title] = match;
+      const [instanceName, className] = wmClass.includes(".")
+        ? wmClass.split(".", 2)
+        : [wmClass, wmClass];
+
+      return {
+        id: normalizeWindowId(id),
+        desktop: Number.parseInt(desktop, 10),
+        pid: Number.parseInt(pid, 10) >= 0 ? Number.parseInt(pid, 10) : null,
+        x: Number.parseInt(x, 10),
+        y: Number.parseInt(y, 10),
+        width: Number.parseInt(width, 10),
+        height: Number.parseInt(height, 10),
+        wmClass,
+        instanceName,
+        className,
+        host: cleanString(host),
+        title,
+      };
+    })
+    .filter(Boolean);
+}
+
+function parseActiveWindowId(stdout) {
+  const match = String(stdout || "").match(/window id # (0x[0-9a-fA-F]+)/);
+  return match ? normalizeWindowId(match[1]) : "";
+}
+
+function parseStateAtoms(stdout) {
+  const match = String(stdout || "").match(/_NET_WM_STATE\(ATOM\)\s*=\s*(.*)/);
+  if (!match) {
+    return [];
+  }
+
+  return match[1]
+    .split(/\s*,\s*/)
+    .map((value) => cleanString(value))
+    .filter(Boolean);
+}
+
+function buildMissingWindowManagementDependencyMessage(executable) {
+  const command = cleanString(executable) || "command";
+  if (command === "wmctrl") {
+    return `${command} is required for virtual desktop window management. Run "pnpm setupVirtualDesktops" to install the missing desktop dependencies.`;
+  }
+  return `${command} is required for virtual desktop window management.`;
+}
+
+function wrapCommandForMaximize(command, wmctrlExecutable = "wmctrl") {
+  const shellSource = commandToShellSource(command);
+  if (!shellSource) {
+    return command;
+  }
+
+  const wmctrlCommand = cleanString(wmctrlExecutable) || "wmctrl";
+
+  return {
+    command: "bash",
+    args: [
+      "-lc",
+      [
+        `wmctrl_bin=${quoteShell(wmctrlCommand)}`,
+        `(${shellSource}) &`,
+        "app_pid=$!",
+        "if command -v \"$wmctrl_bin\" >/dev/null 2>&1; then",
+        "  for _ in $(seq 1 100); do",
+        "    window_id=$(\"$wmctrl_bin\" -lp 2>/dev/null | awk -v pid=\"$app_pid\" '$3 == pid { print $1; exit }')",
+        "    if [ -n \"$window_id\" ]; then",
+        "      \"$wmctrl_bin\" -i -r \"$window_id\" -b add,maximized_vert,maximized_horz >/dev/null 2>&1 || true",
+        "      \"$wmctrl_bin\" -i -a \"$window_id\" >/dev/null 2>&1 || true",
+        "      break",
+        "    fi",
+        "    sleep 0.1",
+        "  done",
+        "fi",
+        "wait \"$app_pid\"",
+      ].join("\n"),
+    ],
+    source: shellSource,
+  };
+}
+
+function pushBind(args, seen, hostPath, guestPath) {
+  const source = cleanString(hostPath);
+  const target = cleanString(guestPath);
+  if (!source || !target) {
+    return;
+  }
+
+  const key = `${source}=>${target}`;
+  if (seen.has(key)) {
+    return;
+  }
+
+  seen.add(key);
+  args.push("--bind", source, target);
+}
+
 async function buildBubblewrapArgs(sessionDirs, envOverrides = {}, options = {}) {
+  const guestHomePath = cleanString(options.guestHomePath) || sessionDirs.home;
+  const guestRuntimePath = cleanString(options.guestRuntimePath) || sessionDirs.runtime;
+  const bindPairs = new Set();
   const args = [
     "--die-with-parent",
     "--new-session",
@@ -101,24 +245,12 @@ async function buildBubblewrapArgs(sessionDirs, envOverrides = {}, options = {})
     "/proc",
     "--dev",
     "/dev",
-    "--bind",
-    sessionDirs.home,
-    sessionDirs.home,
-    "--bind",
-    sessionDirs.runtime,
-    sessionDirs.runtime,
-    "--bind",
-    sessionDirs.tmp,
-    "/tmp",
-    "--bind",
-    "/tmp/.X11-unix",
-    "/tmp/.X11-unix",
     "--setenv",
     "HOME",
-    sessionDirs.home,
+    guestHomePath,
     "--setenv",
     "XDG_RUNTIME_DIR",
-    sessionDirs.runtime,
+    guestRuntimePath,
     "--setenv",
     "TMPDIR",
     "/tmp",
@@ -129,6 +261,12 @@ async function buildBubblewrapArgs(sessionDirs, envOverrides = {}, options = {})
     "PATH",
     envOverrides.PATH || process.env.PATH || "/usr/bin:/bin",
   ];
+
+  pushBind(args, bindPairs, sessionDirs.home, sessionDirs.home);
+  pushBind(args, bindPairs, sessionDirs.runtime, sessionDirs.runtime);
+  pushBind(args, bindPairs, sessionDirs.tmp, "/tmp");
+  pushBind(args, bindPairs, "/tmp/.X11-unix", "/tmp/.X11-unix");
+  pushBind(args, bindPairs, sessionDirs.runtime, guestRuntimePath);
 
   if (envOverrides.XAUTHORITY) {
     args.push("--setenv", "XAUTHORITY", envOverrides.XAUTHORITY);
@@ -152,7 +290,7 @@ async function buildBubblewrapArgs(sessionDirs, envOverrides = {}, options = {})
     if (!mount?.hostPath || !mount?.guestPath) {
       continue;
     }
-    args.push("--bind", mount.hostPath, mount.guestPath);
+    pushBind(args, bindPairs, mount.hostPath, mount.guestPath);
   }
 
   return args;
@@ -174,6 +312,8 @@ export class HeadlessXSessionHost {
       xorgExecutable: "Xorg",
       xrandrExecutable: "xrandr",
       cvtExecutable: "cvt",
+      xpropExecutable: "xprop",
+      wmctrlExecutable: "wmctrl",
       windowManagerCommand: null,
       appCommands: [],
       virtualWidth: 4096,
@@ -189,6 +329,8 @@ export class HeadlessXSessionHost {
       dbusRunSessionExecutable: "dbus-run-session",
       sessionDirectory: null,
       workingDirectory: null,
+      guestHomePath: null,
+      guestRuntimePath: null,
       writableMounts: [],
       x11Adapter: null,
       debug: false,
@@ -248,6 +390,27 @@ export class HeadlessXSessionHost {
     this.events.emit(eventName, payload);
   }
 
+  trackChildProcess(child, command) {
+    const removeChild = () => {
+      const index = this.childApps.indexOf(child);
+      if (index !== -1) {
+        this.childApps.splice(index, 1);
+      }
+    };
+
+    child.once("error", (error) => {
+      removeChild();
+      this.emit("error", error);
+    });
+    child.once("exit", (code, signal) => {
+      removeChild();
+      this.log("child-exited", cleanString(command?.source) || command?.command, code, signal);
+    });
+
+    this.log("child-launched", cleanString(command?.source) || command?.command, command?.args || []);
+    this.childApps.push(child);
+  }
+
   getState() {
     return { ...this.state };
   }
@@ -262,6 +425,134 @@ export class HeadlessXSessionHost {
       png,
       dataUrl: `data:image/png;base64,${png.toString("base64")}`,
     };
+  }
+
+  async readClipboard() {
+    return this.adapter.readClipboard();
+  }
+
+  assertSessionRunning() {
+    if (!this.state.running) {
+      throw new Error("Session is not running");
+    }
+  }
+
+  async runWindowCommand(command, args, options = {}) {
+    try {
+      return await this.runDisplayCommand(command, args, options);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        throw new Error(buildMissingWindowManagementDependencyMessage(command));
+      }
+      throw error;
+    }
+  }
+
+  async getActiveWindowId() {
+    const { stdout } = await this.runWindowCommand(this.options.xpropExecutable, ["-root", "_NET_ACTIVE_WINDOW"]);
+    return parseActiveWindowId(stdout);
+  }
+
+  async getWindowStateAtoms(windowId) {
+    const normalizedWindowId = normalizeWindowId(windowId);
+    if (!normalizedWindowId) {
+      return [];
+    }
+
+    const { stdout } = await this.runWindowCommand(this.options.xpropExecutable, [
+      "-id",
+      normalizedWindowId,
+      "_NET_WM_STATE",
+    ]);
+    return parseStateAtoms(stdout);
+  }
+
+  async listWindows() {
+    this.assertSessionRunning();
+
+    let stdout = "";
+    let activeWindowId = "";
+
+    try {
+      [{ stdout }, activeWindowId] = await Promise.all([
+        this.runWindowCommand(this.options.wmctrlExecutable, ["-l", "-p", "-x", "-G"]),
+        this.getActiveWindowId().catch(() => ""),
+      ]);
+    } catch (error) {
+      if (error?.message === buildMissingWindowManagementDependencyMessage(this.options.wmctrlExecutable)) {
+        return this.adapter.listWindows();
+      }
+      throw error;
+    }
+
+    const windows = parseWmctrlWindowList(stdout);
+    const stateEntries = await Promise.all(windows.map(async (window) => {
+      try {
+        return [window.id, await this.getWindowStateAtoms(window.id)];
+      } catch {
+        return [window.id, []];
+      }
+    }));
+    const statesByWindowId = new Map(stateEntries);
+
+    return windows.map((window) => {
+      const stateAtoms = statesByWindowId.get(window.id) || [];
+      return {
+        ...window,
+        active: window.id === activeWindowId,
+        stateAtoms,
+        maximized: stateAtoms.includes("_NET_WM_STATE_MAXIMIZED_VERT")
+          && stateAtoms.includes("_NET_WM_STATE_MAXIMIZED_HORZ"),
+      };
+    });
+  }
+
+  async focusWindow(windowId, options = {}) {
+    this.assertSessionRunning();
+
+    const normalizedWindowId = normalizeWindowId(windowId);
+    if (!normalizedWindowId) {
+      throw new Error("windowId is required");
+    }
+
+    const windows = await this.listWindows();
+    const existingWindow = windows.find((window) => window.id === normalizedWindowId);
+    if (!existingWindow) {
+      throw new Error(`Window not found: ${normalizedWindowId}`);
+    }
+
+    try {
+      if (options.maximize) {
+        await this.runWindowCommand(this.options.wmctrlExecutable, [
+          "-i",
+          "-r",
+          normalizedWindowId,
+          "-b",
+          "add,maximized_vert,maximized_horz",
+        ]);
+      }
+
+      await this.runWindowCommand(this.options.wmctrlExecutable, [
+        "-i",
+        "-a",
+        normalizedWindowId,
+      ]);
+    } catch (error) {
+      if (error?.message === buildMissingWindowManagementDependencyMessage(this.options.wmctrlExecutable)) {
+        await this.adapter.focusWindow(normalizedWindowId, options);
+        await sleep(150);
+      } else {
+        throw error;
+      }
+    }
+
+    const updatedWindows = await this.listWindows();
+    return updatedWindows.find((window) => window.id === normalizedWindowId)
+      || {
+        ...existingWindow,
+        active: true,
+        maximized: Boolean(options.maximize) || existingWindow.maximized,
+      };
   }
 
   async injectEvents(events = [], options = {}) {
@@ -722,27 +1013,42 @@ EndSection
       commands.push(this.options.windowManagerCommand);
     }
     commands.push(...this.options.appCommands);
+    await this.launchCommands(commands);
+  }
 
-    for (const item of commands) {
-      const command = typeof item === "string" ? { command: item, args: [] } : item;
-      const child = await this.spawnSessionCommand(command);
-      child.once("error", (error) => {
-        this.emit("error", error);
-      });
-      this.log("child-launched", command.command, command.args || []);
-      this.childApps.push(child);
+  async launchCommands(commands = [], options = {}) {
+    if (!this.state.running) {
+      throw new Error("Session is not running");
     }
+
+    const launched = [];
+    const normalizedCommands = commands
+      .map((item) => (typeof item === "string" ? { command: item, args: [] } : item))
+      .filter((item) => cleanString(item?.command));
+
+    for (const item of normalizedCommands) {
+      const command = options.maximize ? wrapCommandForMaximize(item, this.options.wmctrlExecutable) : item;
+      const child = await this.spawnSessionCommand(command);
+      this.trackChildProcess(child, command);
+      launched.push({
+        pid: Number.isInteger(child.pid) ? child.pid : null,
+        command: cleanString(item?.source) || cleanString(command?.source) || cleanString(item?.command),
+        maximize: Boolean(options.maximize),
+      });
+    }
+
+    return launched;
   }
 
   async spawnSessionCommand(command) {
     if (!this.options.useBubblewrap) {
       return spawnChild(command.command, command.args || [], {
-        cwd: this.options.workingDirectory || this.sessionDirs?.home || process.cwd(),
+        cwd: this.options.workingDirectory || this.options.guestHomePath || this.sessionDirs?.home || process.cwd(),
         env: {
           ...process.env,
           DISPLAY: this.connectionDisplayName,
-          HOME: this.sessionDirs?.home || process.env.HOME,
-          XDG_RUNTIME_DIR: this.sessionDirs?.runtime || process.env.XDG_RUNTIME_DIR,
+          HOME: this.options.guestHomePath || process.env.HOME,
+          XDG_RUNTIME_DIR: this.options.guestRuntimePath || process.env.XDG_RUNTIME_DIR,
           TMPDIR: this.sessionDirs?.tmp || process.env.TMPDIR,
           ...(this.options.xAuthorityPath ? { XAUTHORITY: this.options.xAuthorityPath } : {}),
         },
@@ -751,10 +1057,14 @@ EndSection
 
     const env = {
       DISPLAY: this.connectionDisplayName,
+      HOME: this.options.guestHomePath || this.sessionDirs.home,
+      XDG_RUNTIME_DIR: this.options.guestRuntimePath || this.sessionDirs.runtime,
       PATH: process.env.PATH || "/usr/bin:/bin",
       ...(this.options.xAuthorityPath ? { XAUTHORITY: this.options.xAuthorityPath } : {}),
     };
     const args = await buildBubblewrapArgs(this.sessionDirs, env, {
+      guestHomePath: this.options.guestHomePath,
+      guestRuntimePath: this.options.guestRuntimePath,
       writableMounts: this.options.writableMounts,
     });
     args.push(
@@ -767,7 +1077,7 @@ EndSection
     this.log("bubblewrap-launch", command.command, command.args || []);
 
     return spawnChild(this.options.bubblewrapExecutable, args, {
-      cwd: this.options.workingDirectory || this.sessionDirs.home,
+      cwd: this.options.workingDirectory || this.options.guestHomePath || this.sessionDirs.home,
       env: {
         ...process.env,
       },

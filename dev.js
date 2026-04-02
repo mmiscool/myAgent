@@ -43,5 +43,5 @@ function shutdown(code = 0) {
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
 
-start("backend", process.execPath, ["--watch", "server.js"], { PORT: "3211" });
+start("backend", process.execPath, ["server.js"], { PORT: "3211" });
 start("vite", VITE_BIN, ["--host", "127.0.0.1", "--port", "3210"]);

@@ -10,6 +10,18 @@ pnpm dev
 
 - Vite frontend: `http://127.0.0.1:3210`
 - Codex bridge API: `http://127.0.0.1:3211`
+- Frontend changes update in real time through Vite HMR.
+- Backend changes do not auto-restart the Node server.
+
+## Virtual Desktop Setup
+
+```bash
+pnpm setupVirtualDesktops
+```
+
+- Installs the Ubuntu packages required for the virtual desktop stack, including `wmctrl` for window focus and maximize actions.
+- Runs the Ollama installer as part of the same setup flow.
+- Pulls the required Ollama model for preferred local virtual desktop vision analysis: `llava-phi3:latest`.
 
 ## Production Build
 

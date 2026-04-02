@@ -2,9 +2,11 @@
 
 const fs = require("fs");
 const { spawnSync } = require("child_process");
+const { DEFAULT_DESKTOP_VISION_MODEL } = require("../desktop-vision");
 
 const REQUIRED_PACKAGES = [
   "bubblewrap",
+  "curl",
   "dbus-user-session",
   "dbus-x11",
   "openbox",
@@ -19,6 +21,11 @@ const REQUIRED_PACKAGES = [
   "xdg-utils",
   "xterm",
   "xvfb",
+  "wmctrl",
+];
+
+const REQUIRED_OLLAMA_MODELS = [
+  DEFAULT_DESKTOP_VISION_MODEL,
 ];
 
 function readOsRelease() {
@@ -64,6 +71,39 @@ function run(command, args) {
   }
 }
 
+function installOllama() {
+  const result = spawnSync("sh", ["-c", "curl -fsSL https://ollama.com/install.sh | sh"], {
+    stdio: "inherit",
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  if (result.status !== 0) {
+    throw new Error("Failed to install Ollama");
+  }
+}
+
+function pullOllamaModel(model) {
+  const normalizedModel = String(model || "").trim();
+  if (!normalizedModel) {
+    return;
+  }
+
+  const result = spawnSync("ollama", ["pull", normalizedModel], {
+    stdio: "inherit",
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  if (result.status !== 0) {
+    throw new Error(`Failed to pull Ollama model ${JSON.stringify(normalizedModel)}`);
+  }
+}
+
 function writeXwrapperConfig(command, isRoot) {
   const contents = "allowed_users=anybody\nneeds_root_rights=yes\n";
   if (isRoot) {
@@ -99,7 +139,15 @@ function main() {
   run(command, isRoot ? ["install", "-y", ...REQUIRED_PACKAGES] : ["apt-get", "install", "-y", ...REQUIRED_PACKAGES]);
   writeXwrapperConfig(command, isRoot);
 
-  console.log("Virtual desktop dependencies installed.");
+  console.log("Installing Ollama...");
+  installOllama();
+
+  console.log(`Pulling required Ollama models: ${REQUIRED_OLLAMA_MODELS.join(", ")}`);
+  for (const model of REQUIRED_OLLAMA_MODELS) {
+    pullOllamaModel(model);
+  }
+
+  console.log("Virtual desktop dependencies, Ollama, and required Ollama models are installed.");
 }
 
 try {

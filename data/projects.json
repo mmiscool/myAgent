@@ -1,5 +1,20 @@
 [
   {
+    "id": "551d85cb-bd39-4a14-9215-096af923860d",
+    "name": "BREP",
+    "description": "",
+    "cwd": "/home/user/projects/BREP",
+    "defaultModel": "",
+    "defaultEffort": "medium",
+    "defaultSummary": "auto",
+    "defaultPersonality": "pragmatic",
+    "approvalPolicy": "on-request",
+    "sandboxMode": "workspace-write",
+    "networkAccess": true,
+    "createdAt": 1775087143332,
+    "updatedAt": 1775087143332
+  },
+  {
     "id": "workspace",
     "name": "Current Workspace",
     "description": "Default project rooted at this repository.",

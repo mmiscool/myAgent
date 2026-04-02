@@ -162,6 +162,8 @@ class XSessionManager extends EventEmitter {
     const authToken = cleanString(input.authToken) || crypto.randomBytes(16).toString("hex");
     const appCommands = parseShellCommands(input.command);
     const workingDirectory = cleanString(input.workingDirectory);
+    const guestHomePath = cleanString(input.guestHomePath);
+    const guestRuntimePath = cleanString(input.guestRuntimePath);
     const writableMounts = Array.isArray(input.writableMounts)
       ? input.writableMounts
         .map((entry) => ({
@@ -205,6 +207,8 @@ class XSessionManager extends EventEmitter {
       useBubblewrap: input.useBubblewrap !== false,
       sessionDirectory: cleanString(input.sessionDirectory) || undefined,
       workingDirectory: workingDirectory || undefined,
+      guestHomePath: guestHomePath || undefined,
+      guestRuntimePath: guestRuntimePath || undefined,
       writableMounts,
       windowManagerCommand,
       appCommands,
@@ -221,6 +225,8 @@ class XSessionManager extends EventEmitter {
         useBubblewrap: input.useBubblewrap !== false,
         xServerBackend: cleanString(input.xServerBackend) || "xvfb",
         workingDirectory,
+        guestHomePath,
+        guestRuntimePath,
       },
       authToken,
       wsPort,
@@ -308,6 +314,47 @@ class XSessionManager extends EventEmitter {
     return session;
   }
 
+  async launchThreadCommands(threadId, commandText, options = {}) {
+    const session = this.getSessionRecordByThreadId(threadId);
+    if (!session) {
+      throw new Error("Session not found");
+    }
+
+    const commands = parseShellCommands(commandText);
+    if (!commands.length) {
+      throw new Error("command is required");
+    }
+
+    return session.host.launchCommands(commands, options);
+  }
+
+  async listThreadWindows(threadId) {
+    const session = this.getSessionRecordByThreadId(threadId);
+    if (!session) {
+      throw new Error("Session not found");
+    }
+
+    return session.host.listWindows();
+  }
+
+  async focusThreadWindow(threadId, windowId, options = {}) {
+    const session = this.getSessionRecordByThreadId(threadId);
+    if (!session) {
+      throw new Error("Session not found");
+    }
+
+    return session.host.focusWindow(windowId, options);
+  }
+
+  async readThreadClipboard(threadId) {
+    const session = this.getSessionRecordByThreadId(threadId);
+    if (!session) {
+      throw new Error("Session not found");
+    }
+
+    return session.host.readClipboard();
+  }
+
   async stopAll() {
     const sessions = Array.from(this.sessions.values());
     this.sessions.clear();
@@ -354,6 +401,8 @@ class XSessionManager extends EventEmitter {
       useBubblewrap: session.input.useBubblewrap,
       xServerBackend: session.input.xServerBackend,
       workingDirectory: session.input.workingDirectory || null,
+      guestHomePath: session.input.guestHomePath || null,
+      guestRuntimePath: session.input.guestRuntimePath || null,
       frameRate: session.host.options.frameRate,
       authToken: session.authToken,
       wsUrl: makeWsUrl(hostHeader, session.wsPort),
