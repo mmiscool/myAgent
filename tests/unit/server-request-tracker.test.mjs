@@ -65,4 +65,37 @@ describe("ServerRequestTracker", () => {
 
     expect(tracker.normalizeRequest(request)).toBe(request);
   });
+
+  test("tracks repeated request ids so duplicate pending tool calls are visible", () => {
+    const tracker = new ServerRequestTracker();
+
+    const first = tracker.observeRequest({ id: 42 });
+    expect(first).toMatchObject({
+      requestId: "42",
+      occurrence: 1,
+      isDuplicate: false,
+      isPendingReplay: false,
+      wasResolved: false,
+    });
+
+    const second = tracker.observeRequest({ id: 42 });
+    expect(second).toMatchObject({
+      requestId: "42",
+      occurrence: 2,
+      isDuplicate: true,
+      isPendingReplay: true,
+      wasResolved: false,
+    });
+
+    tracker.resolveRequest(42);
+
+    const third = tracker.observeRequest({ id: 42 });
+    expect(third).toMatchObject({
+      requestId: "42",
+      occurrence: 3,
+      isDuplicate: true,
+      isPendingReplay: false,
+      wasResolved: true,
+    });
+  });
 });

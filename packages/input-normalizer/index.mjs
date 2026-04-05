@@ -2,6 +2,23 @@ const MOD_SHIFT = 1 << 0;
 const MOD_CONTROL = 1 << 1;
 const MOD_ALT = 1 << 2;
 const MOD_META = 1 << 3;
+const NON_TEXT_INPUT_TYPES = new Set([
+  "button",
+  "checkbox",
+  "color",
+  "date",
+  "datetime-local",
+  "file",
+  "hidden",
+  "image",
+  "month",
+  "radio",
+  "range",
+  "reset",
+  "submit",
+  "time",
+  "week",
+]);
 
 function buttonMask(buttons) {
   return buttons || 0;
@@ -30,12 +47,36 @@ export function normalizeCanvasCoordinates(renderer, event) {
   return renderer.mapCanvasPointToRemote(event.clientX, event.clientY);
 }
 
+function isTextEditableTarget(target) {
+  if (typeof Element === "undefined" || !(target instanceof Element)) {
+    return false;
+  }
+
+  const editable = target.closest("textarea, input, [contenteditable], [contenteditable='plaintext-only']");
+  if (!editable) {
+    return false;
+  }
+
+  const tagName = editable.tagName.toLowerCase();
+  if (tagName === "textarea") {
+    return true;
+  }
+
+  if (tagName === "input") {
+    const type = (editable.getAttribute("type") || "text").toLowerCase();
+    return !NON_TEXT_INPUT_TYPES.has(type);
+  }
+
+  return editable.getAttribute("contenteditable") !== "false";
+}
+
 export class InputNormalizer {
   constructor(options = {}) {
     this.renderer = options.renderer;
     this.send = options.send;
     this.batchDelay = options.batchDelay ?? 8;
     this.enableInput = options.enableInput !== false;
+    this.captureKeyboardOnPage = options.captureKeyboardOnPage === true;
     this.canvas = null;
     this.pendingEvents = [];
     this.flushTimer = null;
@@ -66,8 +107,8 @@ export class InputNormalizer {
     window.addEventListener("pointerup", this.boundHandlers.pointerup);
     canvas.addEventListener("wheel", this.boundHandlers.wheel, { passive: false });
     canvas.addEventListener("contextmenu", this.boundHandlers.contextmenu);
-    window.addEventListener("keydown", this.boundHandlers.keydown);
-    window.addEventListener("keyup", this.boundHandlers.keyup);
+    window.addEventListener("keydown", this.boundHandlers.keydown, true);
+    window.addEventListener("keyup", this.boundHandlers.keyup, true);
   }
 
   detach() {
@@ -80,8 +121,8 @@ export class InputNormalizer {
     window.removeEventListener("pointerup", this.boundHandlers.pointerup);
     this.canvas.removeEventListener("wheel", this.boundHandlers.wheel);
     this.canvas.removeEventListener("contextmenu", this.boundHandlers.contextmenu);
-    window.removeEventListener("keydown", this.boundHandlers.keydown);
-    window.removeEventListener("keyup", this.boundHandlers.keyup);
+    window.removeEventListener("keydown", this.boundHandlers.keydown, true);
+    window.removeEventListener("keyup", this.boundHandlers.keyup, true);
 
     this.canvas = null;
     this.boundHandlers = null;
@@ -159,9 +200,24 @@ export class InputNormalizer {
     event.preventDefault();
   }
 
+  shouldCaptureKey(event) {
+    if (!this.canvas?.isConnected) {
+      return false;
+    }
+
+    if (this.captureKeyboardOnPage) {
+      return !isTextEditableTarget(event.target);
+    }
+
+    return document.activeElement === this.canvas;
+  }
+
   onKey(event, isDown) {
-    if (this.canvas && document.activeElement === this.canvas) {
+    if (this.shouldCaptureKey(event)) {
       event.preventDefault();
+      event.stopPropagation();
+    } else {
+      return;
     }
 
     this.queue({

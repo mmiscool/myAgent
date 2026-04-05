@@ -1,8 +1,11 @@
 import "./styles.css";
+import "@xterm/xterm/css/xterm.css";
 import { marked } from "marked";
-import { RemoteXBrowserClient } from "../packages/browser-client/index.mjs";
+import { FitAddon } from "@xterm/addon-fit";
+import { Terminal } from "@xterm/xterm";
 import { buildAutoApprovalResult, composerApprovalPolicyOverride } from "./approval-utils.mjs";
 import { sortProjectsByRecentConversationActivity } from "./project-activity-utils.mjs";
+import { findLatestRalphLoopInput, normalizeRalphLoopInput } from "./ralph-loop-utils.mjs";
 
 marked.setOptions({
   gfm: true,
@@ -33,14 +36,16 @@ const state = {
   composerServiceTier: localStorage.getItem("composerServiceTier") || "flex",
   composerMode: localStorage.getItem("composerMode") || "default",
   composerApproveAllDangerous: localStorage.getItem("composerApproveAllDangerous") === "true",
+  composerRalphLoop: false,
   composerAttachments: [],
   pendingServerRequests: [],
   autoApprovalInFlight: new Set(),
-  desktopSessionByThreadId: {},
-  desktopAnalysisByThreadId: {},
-  desktopAnalysisInFlightThreadId: "",
-  desktopClient: null,
-  desktopConnectInFlight: false,
+  ralphLoopInputByThreadId: {},
+  ralphLoopLastCompletedTurnId: "",
+  terminalSessionByProjectId: {},
+  terminalClient: null,
+  terminalConnectInFlight: false,
+  terminalEmulator: null,
   imageEditor: createImageEditorState(),
 };
 
@@ -56,20 +61,17 @@ const elements = {
   archivedToggle: document.getElementById("archivedToggle"),
   threadHeader: document.getElementById("threadHeader"),
   conversation: document.getElementById("conversation"),
-  threadDesktop: document.getElementById("threadDesktop"),
-  threadDesktopStatus: document.getElementById("threadDesktopStatus"),
-  threadDesktopFrameRate: document.getElementById("threadDesktopFrameRate"),
-  threadDesktopScale: document.getElementById("threadDesktopScale"),
-  threadDesktopPasteText: document.getElementById("threadDesktopPasteText"),
-  threadDesktopCopyClipboard: document.getElementById("threadDesktopCopyClipboard"),
-  threadDesktopAnalyze: document.getElementById("threadDesktopAnalyze"),
-  threadDesktopScreenshot: document.getElementById("threadDesktopScreenshot"),
-  threadDesktopStop: document.getElementById("threadDesktopStop"),
-  threadDesktopAnalysis: document.getElementById("threadDesktopAnalysis"),
-  threadDesktopCanvas: document.getElementById("threadDesktopCanvas"),
+  threadTerminal: document.getElementById("threadTerminal"),
+  threadTerminalStatus: document.getElementById("threadTerminalStatus"),
+  threadTerminalReconnect: document.getElementById("threadTerminalReconnect"),
+  threadTerminalInterrupt: document.getElementById("threadTerminalInterrupt"),
+  threadTerminalClear: document.getElementById("threadTerminalClear"),
+  threadTerminalStop: document.getElementById("threadTerminalStop"),
+  threadTerminalViewport: document.getElementById("threadTerminalViewport"),
   composerForm: document.getElementById("composerForm"),
   autoscrollToggle: document.getElementById("autoscrollToggle"),
   approveAllDangerousToggle: document.getElementById("approveAllDangerousToggle"),
+  ralphLoopToggle: document.getElementById("ralphLoopToggle"),
   composerAttachments: document.getElementById("composerAttachments"),
   promptInput: document.getElementById("promptInput"),
   composerModelButton: document.getElementById("composerModelButton"),
@@ -94,8 +96,8 @@ const MIN_SIDEBAR_WIDTH = 240;
 const MAX_SIDEBAR_WIDTH = 560;
 const DEFAULT_VISIBLE_THREADS = 6;
 const COMPOSER_DRAFT_STORAGE_KEY = "composerDraft";
-let desktopResizeObserver = null;
-let desktopResizeTimer = null;
+let terminalResizeObserver = null;
+let terminalFitTimer = null;
 let conversationSocket = null;
 let conversationSocketRetryTimer = null;
 let conversationSocketShouldReconnect = true;
@@ -106,9 +108,13 @@ boot().catch(showFatalError);
 async function boot() {
   applySidebarLayout();
   await loadBoot();
+  if (!["chat", "terminal"].includes(state.activeThreadTab)) {
+    state.activeThreadTab = "chat";
+  }
   normalizeComposerSettings();
   elements.autoscrollToggle.checked = state.autoscroll;
   elements.approveAllDangerousToggle.checked = state.composerApproveAllDangerous;
+  elements.ralphLoopToggle.checked = state.composerRalphLoop;
   restoreComposerDraft();
   renderComposerControls();
   renderProjects();
@@ -124,6 +130,8 @@ async function boot() {
 
   if (state.selectedThreadId) {
     await loadThread(state.selectedThreadId);
+  } else if (state.activeThreadTab === "terminal" && selectedProject()) {
+    await ensureProjectTerminal();
   }
 }
 
@@ -311,6 +319,7 @@ function renderComposerControls() {
   elements.composerModeButton.classList.toggle("plan", state.composerMode === "plan");
   elements.composerModeButton.setAttribute("aria-pressed", state.composerMode === "plan" ? "true" : "false");
   elements.approveAllDangerousToggle.checked = state.composerApproveAllDangerous;
+  elements.ralphLoopToggle.checked = state.composerRalphLoop;
 }
 
 function composerRequestOverrides() {
@@ -338,6 +347,106 @@ function composerRequestOverrides() {
   return overrides;
 }
 
+function storeRalphLoopInput(threadId, input) {
+  const normalizedThreadId = String(threadId || "");
+  const normalizedInput = normalizeRalphLoopInput(input);
+
+  if (!normalizedThreadId || (!normalizedInput.text && normalizedInput.images.length === 0)) {
+    return;
+  }
+
+  state.ralphLoopInputByThreadId[normalizedThreadId] = normalizedInput;
+}
+
+function currentRalphLoopInput(threadId) {
+  const normalizedThreadId = String(threadId || "");
+
+  if (!normalizedThreadId) {
+    return null;
+  }
+
+  const stored = state.ralphLoopInputByThreadId[normalizedThreadId];
+  if (stored?.text || stored?.images?.length) {
+    return normalizeRalphLoopInput(stored);
+  }
+
+  if (state.selectedThread?.id === normalizedThreadId) {
+    return findLatestRalphLoopInput(state.selectedThread);
+  }
+
+  return null;
+}
+
+function isRalphLoopActiveForThread(threadId) {
+  return state.composerRalphLoop
+    && state.activeThreadTab === "chat"
+    && Boolean(threadId)
+    && threadId === state.selectedThreadId
+    && Boolean(state.selectedThread?.id);
+}
+
+async function sendConversationMessage(input) {
+  const project = selectedProject();
+  const normalizedInput = normalizeRalphLoopInput(input);
+  const overrides = composerRequestOverrides();
+
+  if (!project) {
+    throw new Error("Select a project first");
+  }
+
+  if (!normalizedInput.text && normalizedInput.images.length === 0) {
+    throw new Error("Enter a prompt or paste an image");
+  }
+
+  if (state.selectedThreadId) {
+    await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/message`, {
+      method: "POST",
+      body: { projectId: project.id, text: normalizedInput.text, images: normalizedInput.images, ...overrides },
+    });
+  } else {
+    const created = await api("/api/threads", {
+      method: "POST",
+      body: { projectId: project.id, prompt: normalizedInput.text, images: normalizedInput.images, ...overrides },
+    });
+
+    state.selectedThreadId = created.data?.thread?.id || "";
+  }
+
+  storeRalphLoopInput(state.selectedThreadId, normalizedInput);
+  persistSelection();
+  await loadAllProjectThreads();
+  renderProjects();
+
+  if (state.selectedThreadId) {
+    await loadThread(state.selectedThreadId);
+  }
+
+  return state.selectedThreadId;
+}
+
+async function maybeRunRalphLoop(threadId, completedTurnId = "") {
+  if (!isRalphLoopActiveForThread(threadId)) {
+    return;
+  }
+
+  if (completedTurnId && state.ralphLoopLastCompletedTurnId === completedTurnId) {
+    return;
+  }
+
+  const replayInput = currentRalphLoopInput(threadId);
+  if (!replayInput) {
+    return;
+  }
+
+  state.ralphLoopLastCompletedTurnId = completedTurnId || state.ralphLoopLastCompletedTurnId;
+
+  try {
+    await sendConversationMessage(replayInput);
+  } catch (error) {
+    console.error("Ralph loop failed", error);
+  }
+}
+
 async function loadThreads() {
   const project = selectedProject();
 
@@ -362,6 +471,10 @@ async function loadThreads() {
   renderThreadHeader();
   renderConversation();
   renderComposerControls();
+
+  if (state.activeThreadTab === "terminal" && project) {
+    await ensureProjectTerminal();
+  }
 }
 
 async function loadProjectThreads(projectId) {
@@ -393,8 +506,8 @@ async function loadThread(threadId) {
   renderThreadHeader();
   renderConversation();
   renderThreadPane();
-  if (state.activeThreadTab === "desktop") {
-    await ensureThreadDesktop();
+  if (state.activeThreadTab === "terminal") {
+    await ensureProjectTerminal();
   }
 }
 
@@ -918,6 +1031,7 @@ function applyStreamingNotification(message) {
     state.selectedThread.status = completedTurn.status || state.selectedThread.status || "completed";
     syncThreadSummary(state.selectedThread);
     renderSelectedThread();
+    void maybeRunRalphLoop(threadId, completedTurn.id || turn?.id || "");
     return true;
   }
 
@@ -1265,6 +1379,9 @@ function renderThreadHeader() {
   const thread = state.selectedThread;
   const project = selectedProject();
   const projectName = project ? projectDisplayName(project) : "";
+  const emptyStateSubtitle = state.activeThreadTab === "terminal"
+    ? "Open a shell in the selected project on the host."
+    : "Start a new conversation below. The first prompt creates the thread.";
 
   if (!thread) {
     elements.threadHeader.innerHTML = `
@@ -1279,12 +1396,12 @@ function renderThreadHeader() {
               aria-selected="${state.activeThreadTab === "chat" ? "true" : "false"}"
             >Chat</button>
             <button
-              class="thread-tab ${state.activeThreadTab === "desktop" ? "active" : ""}"
+              class="thread-tab ${state.activeThreadTab === "terminal" ? "active" : ""}"
               data-action="select-thread-tab"
-              data-tab="desktop"
+              data-tab="terminal"
               role="tab"
-              aria-selected="${state.activeThreadTab === "desktop" ? "true" : "false"}"
-            >Virtual Desktop</button>
+              aria-selected="${state.activeThreadTab === "terminal" ? "true" : "false"}"
+            >Terminal</button>
           </div>
           ${renderThreadActionMenu()}
         </div>
@@ -1292,7 +1409,7 @@ function renderThreadHeader() {
       <div class="thread-toolbar">
         <div class="thread-title-wrap">
           <h2 class="thread-title" title="${escapeHtml(project?.cwd || projectName || "No project selected")}">${escapeHtml(projectName || "No project selected")}</h2>
-          <p class="meta">Start a new conversation below. The first prompt creates the thread.</p>
+          <p class="meta">${escapeHtml(emptyStateSubtitle)}</p>
         </div>
       </div>
     `;
@@ -1314,12 +1431,12 @@ function renderThreadHeader() {
             aria-selected="${state.activeThreadTab === "chat" ? "true" : "false"}"
           >Chat</button>
           <button
-            class="thread-tab ${state.activeThreadTab === "desktop" ? "active" : ""}"
+            class="thread-tab ${state.activeThreadTab === "terminal" ? "active" : ""}"
             data-action="select-thread-tab"
-            data-tab="desktop"
+            data-tab="terminal"
             role="tab"
-            aria-selected="${state.activeThreadTab === "desktop" ? "true" : "false"}"
-          >Virtual Desktop</button>
+            aria-selected="${state.activeThreadTab === "terminal" ? "true" : "false"}"
+          >Terminal</button>
         </div>
         ${renderThreadActionMenu()}
       </div>
@@ -1340,127 +1457,60 @@ function renderThreadHeader() {
 }
 
 function renderThreadPane() {
-  const desktopVisible = state.activeThreadTab === "desktop" && Boolean(state.selectedThreadId);
-  elements.conversation.classList.toggle("hidden", desktopVisible);
-  elements.composerForm.classList.toggle("hidden", desktopVisible);
-  elements.threadDesktop.classList.toggle("hidden", !desktopVisible);
-  elements.threadDesktop.setAttribute("aria-hidden", desktopVisible ? "false" : "true");
-  syncDesktopInputBinding();
+  const terminalVisible = state.activeThreadTab === "terminal";
+  const conversationVisible = !terminalVisible;
 
-  if (!desktopVisible) {
-    renderThreadDesktopAnalysis();
+  elements.conversation.classList.toggle("hidden", !conversationVisible);
+  elements.composerForm.classList.toggle("hidden", !conversationVisible);
+  elements.threadTerminal.classList.toggle("hidden", !terminalVisible);
+  elements.threadTerminal.setAttribute("aria-hidden", terminalVisible ? "false" : "true");
+  renderTerminalPane(terminalVisible);
+}
+
+function renderTerminalPane(terminalVisible) {
+  if (!terminalVisible) {
     return;
   }
 
-  if (!state.selectedThread) {
-    elements.threadDesktopStatus.textContent = "Start a conversation first.";
-    renderThreadDesktopAnalysis();
+  const project = selectedProject();
+  if (!project) {
+    elements.threadTerminalStatus.textContent = "Select a project first.";
     return;
   }
 
-  const session = state.desktopSessionByThreadId[state.selectedThread.id];
+  ensureTerminalEmulator();
+  scheduleTerminalFit();
+
+  const session = state.terminalSessionByProjectId[project.id];
+  const socket = state.terminalClient?.projectId === project.id ? state.terminalClient.socket : null;
+  const connected = socket?.readyState === WebSocket.OPEN;
+
+  if (state.terminalConnectInFlight && !session) {
+    elements.threadTerminalStatus.textContent = "Starting terminal...";
+    return;
+  }
+
   if (!session) {
-    elements.threadDesktopStatus.textContent = "Starting virtual desktop...";
-    renderThreadDesktopAnalysis();
+    elements.threadTerminalStatus.textContent = "Terminal is not running.";
     return;
   }
 
-  elements.threadDesktopFrameRate.value = String(session.frameRate || 30);
-
-  const status = state.desktopClient?.client?.getState?.();
-  if (status?.authenticated) {
-    elements.threadDesktopStatus.textContent = `${session.state.width}x${session.state.height} · live`;
-  } else {
-    elements.threadDesktopStatus.textContent = `${session.state.displayName} · connecting`;
-  }
-
-  renderThreadDesktopAnalysis();
-}
-
-function renderThreadDesktopAnalysis() {
-  const desktopVisible = state.activeThreadTab === "desktop" && Boolean(state.selectedThreadId);
-  const threadId = state.selectedThreadId || "";
-  const analysis = threadId ? state.desktopAnalysisByThreadId[threadId] : null;
-  const inFlight = threadId && state.desktopAnalysisInFlightThreadId === threadId;
-  const desktopState = state.desktopClient?.threadId === threadId
-    ? state.desktopClient.client?.getState?.()
-    : null;
-  const canAnalyze = desktopVisible && Boolean(desktopState?.authenticated) && !inFlight;
-
-  elements.threadDesktopAnalyze.disabled = !canAnalyze;
-  elements.threadDesktopAnalyze.textContent = inFlight ? "Analyzing..." : "Analyze Screen";
-
-  if (!desktopVisible) {
-    elements.threadDesktopAnalysis.classList.add("hidden");
-    elements.threadDesktopAnalysis.innerHTML = "";
+  if (session.state === "running") {
+    elements.threadTerminalStatus.textContent = `${session.locationLabel || "host"} · ${connected ? "connected" : "disconnected"}`;
     return;
   }
 
-  if (inFlight && !analysis) {
-    elements.threadDesktopAnalysis.classList.remove("hidden");
-    elements.threadDesktopAnalysis.innerHTML = `<p class="thread-desktop-analysis-empty">Analyzing the watched live desktop session with local Ollama vision...</p>`;
+  if (session.state === "error") {
+    elements.threadTerminalStatus.textContent = `${session.locationLabel || "host"} · error`;
     return;
   }
 
-  if (!analysis) {
-    elements.threadDesktopAnalysis.classList.add("hidden");
-    elements.threadDesktopAnalysis.innerHTML = "";
-    return;
-  }
-
-  const targets = Array.isArray(analysis.targets) ? analysis.targets : [];
-  const usage = analysis.usage || {};
-  const usageParts = [
-    Number.isFinite(usage.promptEvalCount) ? `${usage.promptEvalCount} prompt tokens` : "",
-    Number.isFinite(usage.evalCount) ? `${usage.evalCount} output tokens` : "",
-  ].filter(Boolean).join(" · ");
-
-  elements.threadDesktopAnalysis.classList.remove("hidden");
-  elements.threadDesktopAnalysis.innerHTML = `
-    <div class="thread-desktop-analysis-head">
-      <div>
-        <p class="thread-desktop-analysis-title">Live Desktop Analysis</p>
-        <p class="thread-desktop-analysis-meta">
-          ${escapeHtml(`${analysis.width}x${analysis.height}`)}
-          · ${escapeHtml(analysis.model || "local vision")}
-          ${analysis.goal ? `· Goal: ${escapeHtml(analysis.goal)}` : ""}
-          ${usageParts ? `· ${escapeHtml(usageParts)}` : ""}
-        </p>
-      </div>
-    </div>
-    <p class="thread-desktop-analysis-summary">${escapeHtml(analysis.summary || "Local vision completed.")}</p>
-    ${analysis.uncertainty ? `<p class="thread-desktop-analysis-meta">Uncertainty: ${escapeHtml(analysis.uncertainty)}</p>` : ""}
-    ${targets.length ? `
-      <div class="thread-desktop-analysis-list">
-        ${targets.map((target, index) => `
-          <article class="thread-desktop-analysis-target">
-            <p class="thread-desktop-analysis-target-label">${escapeHtml(`${index + 1}. ${target.label || target.kind || target.targetId || "Target"}`)}</p>
-            <p class="thread-desktop-analysis-target-meta">
-              ${escapeHtml(target.kind || "control")}
-              · conf ${escapeHtml(Number(target.confidence || 0).toFixed(2))}
-              · center (${escapeHtml(String(target.center?.x ?? ""))}, ${escapeHtml(String(target.center?.y ?? ""))})
-            </p>
-            ${target.description ? `<p class="thread-desktop-analysis-target-meta">${escapeHtml(target.description)}</p>` : ""}
-          </article>
-        `).join("")}
-      </div>
-    ` : `<p class="thread-desktop-analysis-empty">No clickable targets were returned for this live desktop frame.</p>`}
-  `;
-}
-
-function syncDesktopInputBinding() {
-  const client = state.desktopClient?.client;
-
-  if (!client) {
-    return;
-  }
-
-  if (state.activeThreadTab === "desktop" && state.selectedThreadId === state.desktopClient.threadId) {
-    client.attachInput(elements.threadDesktopCanvas);
-    return;
-  }
-
-  client.detachInput();
+  const exitDetails = Number.isInteger(session.exitCode)
+    ? `exit ${session.exitCode}`
+    : session.signal
+      ? `signal ${session.signal}`
+      : "stopped";
+  elements.threadTerminalStatus.textContent = `${session.locationLabel || "host"} · ${exitDetails}`;
 }
 
 function renderConversation() {
@@ -1929,6 +1979,9 @@ function renderContentEntry(entry) {
 function connectEvents() {
   connectConversationSocket();
   window.addEventListener("beforeunload", disconnectConversationSocket);
+  window.addEventListener("beforeunload", () => {
+    void disconnectTerminalClient();
+  });
   elements.sidebarResizeHandle.addEventListener("pointerdown", startSidebarResize);
   elements.sidebarResizeHandle.addEventListener("keydown", handleSidebarResizeKeydown);
   window.addEventListener("pointermove", handleSidebarResizePointerMove);
@@ -1952,6 +2005,9 @@ function connectEvents() {
     if (state.composerApproveAllDangerous) {
       void maybeAutoApprovePendingRequests();
     }
+  });
+  elements.ralphLoopToggle.addEventListener("change", (event) => {
+    state.composerRalphLoop = event.target.checked;
   });
   elements.imageEditorOverlayCanvas.addEventListener("pointerdown", handleImageEditorPointerDown);
   elements.imageEditorOverlayCanvas.addEventListener("pointermove", handleImageEditorPointerMove);
@@ -1995,38 +2051,26 @@ function connectEvents() {
     }
   });
 
-  elements.threadDesktopScale.addEventListener("change", () => {
-    scheduleThreadDesktopResize();
+  elements.threadTerminalReconnect.addEventListener("click", () => {
+    void reconnectProjectTerminal();
   });
 
-  elements.threadDesktopFrameRate.addEventListener("change", () => {
-    void updateThreadDesktopFrameRate();
+  elements.threadTerminalInterrupt.addEventListener("click", () => {
+    void sendTerminalControl("interrupt");
   });
 
-  elements.threadDesktopPasteText.addEventListener("click", () => {
-    void pasteTextToThreadDesktop();
+  elements.threadTerminalClear.addEventListener("click", () => {
+    clearProjectTerminal();
   });
 
-  elements.threadDesktopCopyClipboard.addEventListener("click", () => {
-    void copyThreadDesktopClipboard();
+  elements.threadTerminalStop.addEventListener("click", () => {
+    void stopProjectTerminal();
   });
 
-  elements.threadDesktopAnalyze.addEventListener("click", () => {
-    void analyzeLiveThreadDesktop();
+  terminalResizeObserver = new ResizeObserver(() => {
+    scheduleTerminalFit();
   });
-
-  elements.threadDesktopScreenshot.addEventListener("click", () => {
-    void captureThreadDesktopScreenshot();
-  });
-
-  elements.threadDesktopStop.addEventListener("click", () => {
-    void stopThreadDesktop();
-  });
-
-  desktopResizeObserver = new ResizeObserver(() => {
-    scheduleThreadDesktopResize();
-  });
-  desktopResizeObserver.observe(elements.threadDesktopCanvas);
+  terminalResizeObserver.observe(elements.threadTerminalViewport);
 }
 
 function clampSidebarWidth(width) {
@@ -2255,6 +2299,286 @@ function disconnectConversationSocket() {
   }
 }
 
+function terminalSocketUrl(projectId, size = {}) {
+  const url = new URL(`/ws/projects/${encodeURIComponent(projectId)}/terminal`, window.location.href);
+  url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+
+  if (state.app?.port) {
+    url.port = String(state.app.port);
+  }
+
+  if (Number.isInteger(size.columns) && size.columns > 0) {
+    url.searchParams.set("columns", String(size.columns));
+  }
+  if (Number.isInteger(size.rows) && size.rows > 0) {
+    url.searchParams.set("rows", String(size.rows));
+  }
+  url.searchParams.set("term", "xterm-256color");
+  return url.toString();
+}
+
+function ensureTerminalEmulator() {
+  if (state.terminalEmulator) {
+    return state.terminalEmulator;
+  }
+
+  const terminal = new Terminal({
+    cursorBlink: true,
+    fontFamily: "\"SFMono-Regular\", Menlo, Consolas, monospace",
+    fontSize: 13,
+    lineHeight: 1.35,
+    scrollback: 5000,
+    theme: {
+      background: "#0d0f12",
+      foreground: "#eceef0",
+      cursor: "#4aa3ff",
+      selectionBackground: "rgba(74, 163, 255, 0.24)",
+    },
+  });
+  const fitAddon = new FitAddon();
+
+  terminal.loadAddon(fitAddon);
+  terminal.open(elements.threadTerminalViewport);
+  elements.threadTerminalViewport.addEventListener("click", () => {
+    terminal.focus();
+  });
+  terminal.onData((data) => {
+    const socket = state.terminalClient?.socket;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "input", data }));
+    }
+  });
+  terminal.onResize(({ cols, rows }) => {
+    const socket = state.terminalClient?.socket;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "resize", columns: cols, rows }));
+    }
+  });
+
+  state.terminalEmulator = { terminal, fitAddon };
+  return state.terminalEmulator;
+}
+
+function resolveTerminalGeometry() {
+  const { terminal, fitAddon } = ensureTerminalEmulator();
+  if (state.activeThreadTab === "terminal") {
+    try {
+      fitAddon.fit();
+    } catch {}
+  }
+
+  return {
+    columns: Math.max(40, terminal.cols || 120),
+    rows: Math.max(12, terminal.rows || 32),
+  };
+}
+
+async function ensureProjectTerminal() {
+  const project = selectedProject();
+  if (!project || state.terminalConnectInFlight) {
+    return;
+  }
+
+  const current = state.terminalClient;
+  if (current?.projectId === project.id && (
+    current.socket.readyState === WebSocket.OPEN
+    || current.socket.readyState === WebSocket.CONNECTING
+  )) {
+    scheduleTerminalFit();
+    return;
+  }
+
+  state.terminalConnectInFlight = true;
+  renderThreadPane();
+
+  try {
+    const geometry = resolveTerminalGeometry();
+    const payload = await api(`/api/projects/${encodeURIComponent(project.id)}/terminal`, {
+      method: "POST",
+      body: {
+        columns: geometry.columns,
+        rows: geometry.rows,
+        term: "xterm-256color",
+      },
+    });
+    state.terminalSessionByProjectId[project.id] = payload.data || payload;
+    await connectTerminalClient(project.id, geometry);
+  } finally {
+    state.terminalConnectInFlight = false;
+    renderThreadPane();
+  }
+}
+
+async function connectTerminalClient(projectId, geometry = resolveTerminalGeometry()) {
+  const current = state.terminalClient;
+  const emulator = ensureTerminalEmulator();
+
+  if (current?.projectId === projectId && (
+    current.socket.readyState === WebSocket.OPEN
+    || current.socket.readyState === WebSocket.CONNECTING
+  )) {
+    scheduleTerminalFit();
+    emulator.terminal.focus();
+    return;
+  }
+
+  await disconnectTerminalClient();
+  const socket = new WebSocket(terminalSocketUrl(projectId, geometry));
+  state.terminalClient = { projectId, socket };
+
+  socket.addEventListener("open", () => {
+    if (state.terminalClient?.socket !== socket) {
+      return;
+    }
+
+    scheduleTerminalFit();
+    emulator.terminal.focus();
+    renderThreadPane();
+  });
+
+  socket.addEventListener("message", (event) => {
+    if (typeof event.data !== "string") {
+      return;
+    }
+
+    let payload;
+
+    try {
+      payload = JSON.parse(event.data);
+    } catch (error) {
+      console.error("Failed to parse terminal payload", error);
+      return;
+    }
+
+    if (payload.type === "session") {
+      state.terminalSessionByProjectId[projectId] = payload.data || payload;
+      if (state.terminalClient?.projectId === projectId) {
+        emulator.terminal.reset();
+        if (payload.data?.buffer) {
+          emulator.terminal.write(String(payload.data.buffer));
+        }
+        scheduleTerminalFit();
+        emulator.terminal.focus();
+      }
+      renderThreadPane();
+      return;
+    }
+
+    if (payload.type === "output") {
+      if (state.terminalClient?.projectId === projectId) {
+        emulator.terminal.write(String(payload.data || ""));
+      }
+      return;
+    }
+
+    if (payload.type === "exit") {
+      state.terminalSessionByProjectId[projectId] = {
+        ...(state.terminalSessionByProjectId[projectId] || {}),
+        state: "stopped",
+        exitCode: payload.exitCode ?? null,
+        signal: payload.signal ?? null,
+      };
+      renderThreadPane();
+      return;
+    }
+
+    if (payload.type === "error") {
+      if (state.terminalClient?.projectId === projectId) {
+        emulator.terminal.writeln(`\r\n[terminal error] ${String(payload.error || "unknown error")}`);
+      }
+      state.terminalSessionByProjectId[projectId] = {
+        ...(state.terminalSessionByProjectId[projectId] || {}),
+        state: "error",
+        error: String(payload.error || "unknown error"),
+      };
+      renderThreadPane();
+    }
+  });
+
+  socket.addEventListener("close", () => {
+    if (state.terminalClient?.socket === socket) {
+      state.terminalClient = null;
+      renderThreadPane();
+    }
+  });
+
+  socket.addEventListener("error", () => {
+    if (state.terminalClient?.socket === socket && state.activeThreadTab === "terminal") {
+      elements.threadTerminalStatus.textContent = "Terminal connection error";
+    }
+  });
+}
+
+async function disconnectTerminalClient() {
+  if (!state.terminalClient) {
+    return;
+  }
+
+  const { socket } = state.terminalClient;
+  state.terminalClient = null;
+  if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+    socket.close();
+  }
+}
+
+function scheduleTerminalFit() {
+  clearTimeout(terminalFitTimer);
+  terminalFitTimer = setTimeout(() => {
+    applyTerminalFit();
+  }, 80);
+}
+
+function applyTerminalFit() {
+  if (state.activeThreadTab !== "terminal" || !state.terminalEmulator) {
+    return;
+  }
+
+  try {
+    state.terminalEmulator.fitAddon.fit();
+  } catch {}
+}
+
+function requireActiveTerminalSocket() {
+  const project = selectedProject();
+  const socket = state.terminalClient?.socket;
+  if (!project || state.terminalClient?.projectId !== project.id || socket?.readyState !== WebSocket.OPEN) {
+    throw new Error("Terminal is not connected");
+  }
+
+  return socket;
+}
+
+async function reconnectProjectTerminal() {
+  await disconnectTerminalClient();
+  await ensureProjectTerminal();
+}
+
+function sendTerminalControl(action) {
+  const socket = requireActiveTerminalSocket();
+  socket.send(JSON.stringify({ type: "control", action }));
+}
+
+function clearProjectTerminal() {
+  const { terminal } = ensureTerminalEmulator();
+  terminal.clear();
+}
+
+async function stopProjectTerminal() {
+  const project = selectedProject();
+  if (!project) {
+    return;
+  }
+
+  await disconnectTerminalClient();
+  await api(`/api/projects/${encodeURIComponent(project.id)}/terminal`, {
+    method: "DELETE",
+  });
+  delete state.terminalSessionByProjectId[project.id];
+  ensureTerminalEmulator().terminal.reset();
+  renderThreadPane();
+  elements.threadTerminalStatus.textContent = "Terminal stopped";
+}
+
 document.addEventListener("click", async (event) => {
   if (event.target === elements.imageEditorModal) {
     closeImageEditor();
@@ -2375,7 +2699,7 @@ document.addEventListener("click", async (event) => {
       state.selectedThreadId = "";
       state.selectedThread = null;
       state.threadActionMenuOpen = false;
-      await disconnectDesktopClient();
+      await disconnectTerminalClient();
       persistSelection();
       renderProjects();
       await loadThreads();
@@ -2411,13 +2735,13 @@ document.addEventListener("click", async (event) => {
     }
 
     if (action === "select-thread-tab") {
-      state.activeThreadTab = button.dataset.tab === "desktop" ? "desktop" : "chat";
+      state.activeThreadTab = button.dataset.tab === "terminal" ? "terminal" : "chat";
       state.threadActionMenuOpen = false;
       persistSelection();
       renderThreadHeader();
       renderThreadPane();
-      if (state.activeThreadTab === "desktop") {
-        await ensureThreadDesktop();
+      if (state.activeThreadTab === "terminal") {
+        await ensureProjectTerminal();
       }
       return;
     }
@@ -2435,7 +2759,6 @@ document.addEventListener("click", async (event) => {
       state.selectedThread = null;
       state.currentTurnId = "";
       state.threadActionMenuOpen = false;
-      await disconnectDesktopClient();
       persistSelection();
       renderThreadHeader();
       renderConversation();
@@ -2446,6 +2769,7 @@ document.addEventListener("click", async (event) => {
     if (action === "select-thread") {
       if (button.dataset.projectId && button.dataset.projectId !== state.selectedProjectId) {
         state.selectedProjectId = button.dataset.projectId;
+        await disconnectTerminalClient();
       }
       state.threadActionMenuOpen = false;
       await loadThread(button.dataset.id);
@@ -2520,7 +2844,6 @@ document.addEventListener("click", async (event) => {
       renderProjects();
       state.selectedThreadId = "";
       state.selectedThread = null;
-      await disconnectDesktopClient();
       renderThreadHeader();
       renderConversation();
       renderThreadPane();
@@ -2598,49 +2921,19 @@ document.addEventListener("submit", async (event) => {
     }
 
     if (form === elements.composerForm) {
-      const project = selectedProject();
-      const text = elements.promptInput.value.trim();
-      const overrides = composerRequestOverrides();
+      const text = elements.promptInput.value;
       const images = state.composerAttachments.map((attachment) => ({
         type: "image",
         url: attachment.url,
         name: attachment.name,
       }));
 
-      if (!project) {
-        throw new Error("Select a project first");
-      }
-
-      if (!text && images.length === 0) {
-        throw new Error("Enter a prompt or paste an image");
-      }
-
-      if (state.selectedThreadId) {
-        await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/message`, {
-          method: "POST",
-          body: { projectId: project.id, text, images, ...overrides },
-        });
-      } else {
-        const created = await api("/api/threads", {
-          method: "POST",
-          body: { projectId: project.id, prompt: text, images, ...overrides },
-        });
-
-        state.selectedThreadId = created.data?.thread?.id;
-      }
+      await sendConversationMessage({ text, images });
 
       elements.promptInput.value = "";
       clearComposerDraft();
       state.composerAttachments = [];
       renderComposerAttachments();
-      persistSelection();
-      await loadAllProjectThreads();
-      renderProjects();
-
-      if (state.selectedThreadId) {
-        await loadThread(state.selectedThreadId);
-      }
-
       return;
     }
 
@@ -2690,300 +2983,6 @@ document.addEventListener("change", (event) => {
 function findLatestTurnId(thread) {
   const turns = thread?.turns || [];
   return turns.length > 0 ? turns[turns.length - 1].id : "";
-}
-
-async function ensureThreadDesktop() {
-  if (!state.selectedThreadId || state.desktopConnectInFlight) {
-    return;
-  }
-
-  const threadId = state.selectedThreadId;
-  const project = selectedProject();
-  if (!project) {
-    return;
-  }
-
-  state.desktopConnectInFlight = true;
-  renderThreadPane();
-
-  try {
-    const payload = await api(`/api/threads/${encodeURIComponent(threadId)}/desktop`, {
-      method: "POST",
-      body: { projectId: project.id },
-    });
-    state.desktopSessionByThreadId[threadId] = payload.data || payload;
-    await connectDesktopClient(state.desktopSessionByThreadId[threadId], threadId);
-  } finally {
-    state.desktopConnectInFlight = false;
-    renderThreadPane();
-  }
-}
-
-async function connectDesktopClient(session, threadId) {
-  if (!session || threadId !== state.selectedThreadId) {
-    return;
-  }
-
-  const current = state.desktopClient;
-  if (current?.threadId === threadId) {
-    const currentState = current.client.getState();
-    syncDesktopInputBinding();
-    if (currentState.connected && currentState.authenticated) {
-      scheduleThreadDesktopResize();
-      return;
-    }
-  }
-
-  await disconnectDesktopClient();
-
-  const client = new RemoteXBrowserClient({
-    url: session.wsUrl,
-    preferredEncoding: session.state.encoding,
-    autoScale: true,
-  });
-
-  client.attachCanvas(elements.threadDesktopCanvas);
-  client.on("connected", () => {
-    if (state.selectedThreadId === threadId && state.activeThreadTab === "desktop") {
-      elements.threadDesktopStatus.textContent = `${session.state.displayName} · connected`;
-    }
-  });
-  client.on("authenticated", () => {
-    if (state.selectedThreadId === threadId && state.activeThreadTab === "desktop") {
-      elements.threadDesktopStatus.textContent = `${session.state.displayName} · authenticated`;
-    }
-    scheduleThreadDesktopResize();
-  });
-  client.on("screen-info", (screen) => {
-    if (state.selectedThreadId === threadId && state.activeThreadTab === "desktop") {
-      elements.threadDesktopStatus.textContent = `${screen.width}x${screen.height} · live`;
-    }
-  });
-  client.on("disconnected", () => {
-    if (state.desktopClient?.threadId === threadId) {
-      elements.threadDesktopStatus.textContent = "Virtual desktop disconnected";
-    }
-  });
-  client.on("error", (error) => {
-    if (state.desktopClient?.threadId === threadId) {
-      elements.threadDesktopStatus.textContent = `Desktop error: ${error.message}`;
-    }
-  });
-
-  state.desktopClient = { threadId, client };
-  await client.connect();
-  await client.authenticate(session.authToken);
-  syncDesktopInputBinding();
-}
-
-async function disconnectDesktopClient() {
-  if (!state.desktopClient) {
-    return;
-  }
-  const { client } = state.desktopClient;
-  state.desktopClient = null;
-  await client.disconnect();
-  client.detachCanvas();
-}
-
-function scheduleThreadDesktopResize() {
-  clearTimeout(desktopResizeTimer);
-  desktopResizeTimer = setTimeout(() => {
-    void applyThreadDesktopResize();
-  }, 120);
-}
-
-async function applyThreadDesktopResize() {
-  if (!state.desktopClient || state.activeThreadTab !== "desktop") {
-    return;
-  }
-
-  const clientState = state.desktopClient.client.getState();
-  if (!clientState.connected || !clientState.authenticated) {
-    return;
-  }
-
-  const rect = elements.threadDesktopCanvas.getBoundingClientRect();
-  const scale = Number(elements.threadDesktopScale.value) || 1;
-  const width = Math.max(64, Math.round(rect.width * (window.devicePixelRatio || 1) * scale));
-  const height = Math.max(64, Math.round(rect.height * (window.devicePixelRatio || 1) * scale));
-  await state.desktopClient.client.requestResize(width, height, scale);
-}
-
-async function stopThreadDesktop() {
-  if (!state.selectedThreadId) {
-    return;
-  }
-
-  delete state.desktopAnalysisByThreadId[state.selectedThreadId];
-  state.desktopAnalysisInFlightThreadId = "";
-  await disconnectDesktopClient();
-  await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/desktop`, {
-    method: "DELETE",
-  });
-  delete state.desktopSessionByThreadId[state.selectedThreadId];
-  if (state.activeThreadTab === "desktop") {
-    elements.threadDesktopStatus.textContent = "Virtual desktop stopped";
-  }
-}
-
-async function updateThreadDesktopFrameRate() {
-  if (!state.selectedThreadId) {
-    return;
-  }
-
-  const frameRate = Number(elements.threadDesktopFrameRate.value) || 30;
-  const payload = await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/desktop/frame-rate`, {
-    method: "POST",
-    body: { frameRate },
-  });
-  state.desktopSessionByThreadId[state.selectedThreadId] = payload.data || payload;
-  renderThreadPane();
-}
-
-async function captureThreadDesktopScreenshot() {
-  if (!state.selectedThreadId || state.activeThreadTab !== "desktop") {
-    return;
-  }
-
-  const desktopState = state.desktopClient?.client?.getState?.();
-  if (!desktopState?.authenticated) {
-    throw new Error("Virtual desktop is not connected");
-  }
-
-  const canvas = elements.threadDesktopCanvas;
-  if (!canvas || canvas.width < 1 || canvas.height < 1) {
-    throw new Error("No virtual desktop frame available");
-  }
-
-  const url = canvas.toDataURL("image/png");
-  const attachmentId = createAttachmentId();
-  const threadName = (state.selectedThread?.name || state.selectedThread?.preview || "desktop")
-    .replace(/[^\w.-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    || "desktop";
-
-  state.composerAttachments = state.composerAttachments.concat([{
-    id: attachmentId,
-    name: `${threadName}-screenshot-${Date.now()}.png`,
-    url,
-  }]);
-  renderComposerAttachments();
-
-  state.activeThreadTab = "chat";
-  persistSelection();
-  renderThreadHeader();
-  renderThreadPane();
-
-  await openImageEditor(attachmentId);
-}
-
-async function analyzeLiveThreadDesktop() {
-  if (!state.selectedThreadId || state.activeThreadTab !== "desktop") {
-    return;
-  }
-
-  const desktopState = state.desktopClient?.client?.getState?.();
-  if (!desktopState?.authenticated) {
-    throw new Error("Virtual desktop is not connected");
-  }
-
-  const threadId = state.selectedThreadId;
-  const goal = window.prompt(
-    "What should local desktop vision look for? Leave blank for a general screen analysis.",
-    state.desktopAnalysisByThreadId[threadId]?.goal || "",
-  );
-
-  if (goal === null) {
-    return;
-  }
-
-  state.desktopAnalysisInFlightThreadId = threadId;
-  elements.threadDesktopStatus.textContent = "Analyzing live desktop with local Ollama vision...";
-  renderThreadPane();
-
-  try {
-    const payload = await api(`/api/threads/${encodeURIComponent(threadId)}/desktop/analyze`, {
-      method: "POST",
-      body: {
-        goal,
-        maxTargets: 12,
-      },
-    });
-    state.desktopAnalysisByThreadId[threadId] = payload.data || payload;
-    elements.threadDesktopStatus.textContent = `Analyzed ${payload.data?.width || "live"} desktop with ${payload.data?.model || "local vision"}`;
-  } catch (error) {
-    elements.threadDesktopStatus.textContent = `Desktop analysis failed: ${error.message}`;
-    throw error;
-  } finally {
-    state.desktopAnalysisInFlightThreadId = "";
-    renderThreadPane();
-  }
-}
-
-async function pasteTextToThreadDesktop() {
-  if (!state.selectedThreadId || state.activeThreadTab !== "desktop") {
-    return;
-  }
-
-  const desktopState = state.desktopClient?.client?.getState?.();
-  if (!desktopState?.authenticated) {
-    throw new Error("Virtual desktop is not connected");
-  }
-
-  const text = await readClipboardTextForDesktopInput();
-  if (!text) {
-    return;
-  }
-
-  await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/desktop/type`, {
-    method: "POST",
-    body: { text },
-  });
-  elements.threadDesktopStatus.textContent = `Typed ${text.length} characters`;
-}
-
-async function copyThreadDesktopClipboard() {
-  if (!state.selectedThreadId || state.activeThreadTab !== "desktop") {
-    return;
-  }
-
-  const desktopState = state.desktopClient?.client?.getState?.();
-  if (!desktopState?.authenticated) {
-    throw new Error("Virtual desktop is not connected");
-  }
-
-  const payload = await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/desktop/clipboard`);
-  const text = String(payload.data?.text || "");
-  await writeTextToLocalClipboard(text);
-  elements.threadDesktopStatus.textContent = text
-    ? `Copied ${text.length} characters from desktop clipboard`
-    : "Desktop clipboard is empty";
-}
-
-async function readClipboardTextForDesktopInput() {
-  if (navigator.clipboard?.readText) {
-    try {
-      const text = await navigator.clipboard.readText();
-      if (text) {
-        return text;
-      }
-    } catch {}
-  }
-
-  const fallback = window.prompt("Paste text to type into the virtual desktop", "");
-  return fallback == null ? "" : fallback;
-}
-
-async function writeTextToLocalClipboard(text) {
-  if (navigator.clipboard?.writeText) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return;
-    } catch {}
-  }
-
-  window.prompt("Copy text from the virtual desktop", text);
 }
 
 async function handleComposerPaste(event) {

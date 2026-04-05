@@ -6,9 +6,7 @@ const crypto = require("crypto");
 const { EventEmitter } = require("events");
 const { spawn } = require("child_process");
 const { WebSocketServer } = require("ws");
-const { XSessionManager } = require("./x-session-manager");
-const { buildDesktopSessionConfig } = require("./desktop-session-config");
-const { analyzeDesktopScreenshot, DEFAULT_DESKTOP_VISION_MODEL } = require("./desktop-vision");
+const { TerminalManager } = require("./terminal-manager");
 const { ServerRequestTracker } = require("./server-request-tracker");
 const { dedupeProjectsByPath, projectPathKey } = require("./project-store-utils");
 
@@ -19,6 +17,7 @@ const PROJECTS_FILE = path.join(DATA_DIR, "projects.json");
 const PORT = Number(process.env.PORT || 3210);
 const CODEX_BIN = process.env.CODEX_BIN || "codex";
 const MAX_BODY_BYTES = 15 * 1024 * 1024;
+const RAW_BRIDGE_LOG_ENABLED = process.env.CODEX_LOG_JSON === "true";
 
 const CONTENT_TYPES = {
   ".css": "text/css; charset=utf-8",
@@ -42,282 +41,9 @@ const THREAD_SOURCE_KINDS = [
   "unknown",
 ];
 
-const MOD_SHIFT = 1 << 0;
-const MOD_CONTROL = 1 << 1;
-const MOD_ALT = 1 << 2;
-const MOD_META = 1 << 3;
-
-const DESKTOP_TOOL_SPECS = [
-  {
-    name: "virtual_desktop_analyze",
-    description: `Preferred low-token path: use local Phi vision via Ollama (${DEFAULT_DESKTOP_VISION_MODEL}) to inspect the current desktop and return structured clickable targets without sending a raw screenshot into the Codex runtime. Use this before virtual_desktop_snapshot unless local vision is insufficient or you need exact pixels.`,
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        goal: {
-          type: "string",
-          minLength: 1,
-          description: "Optional task or target to prioritize, such as 'find the Save button' or 'locate the browser address bar'.",
-        },
-        maxTargets: {
-          type: "integer",
-          minimum: 1,
-          maximum: 20,
-          description: "Maximum number of clickable targets to return. Defaults to 12.",
-        },
-        delayMs: {
-          type: "integer",
-          minimum: 0,
-          maximum: 5000,
-          description: "Optional delay before capturing the screenshot for local vision analysis.",
-        },
-      },
-    },
-  },
-  {
-    name: "virtual_desktop_click_target",
-    description: "Preferred low-token path: click one of the targets returned by virtual_desktop_analyze, then optionally re-analyze the updated screen locally without sending a raw screenshot into the Codex runtime. Prefer this over virtual_desktop_click when coordinates are not already known.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["targetId"],
-      properties: {
-        targetId: {
-          type: "string",
-          minLength: 1,
-          description: "Target id returned by virtual_desktop_analyze, for example target-1.",
-        },
-        analysisId: {
-          type: "string",
-          minLength: 1,
-          description: "Optional analysis id returned by virtual_desktop_analyze. Defaults to the most recent analysis for this thread.",
-        },
-        goal: {
-          type: "string",
-          minLength: 1,
-          description: "Optional follow-up goal for the post-click local vision pass.",
-        },
-        maxTargets: {
-          type: "integer",
-          minimum: 1,
-          maximum: 20,
-          description: "Maximum number of clickable targets to return from the post-click local vision pass. Defaults to 12.",
-        },
-        reanalyze: {
-          type: "boolean",
-          description: "If false, skip the post-click local vision pass and only report the click.",
-        },
-        button: {
-          type: "string",
-          enum: ["left", "middle", "right"],
-          description: "Mouse button to click. Defaults to left.",
-        },
-        clicks: {
-          type: "integer",
-          minimum: 1,
-          maximum: 3,
-          description: "Number of clicks to perform. Defaults to 1.",
-        },
-        delayMs: {
-          type: "integer",
-          minimum: 0,
-          maximum: 5000,
-          description: "Optional delay after the click before the post-click local vision pass.",
-        },
-      },
-    },
-  },
-  {
-    name: "virtual_desktop_list_windows",
-    description: "List the current top-level windows in the virtual desktop session.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "virtual_desktop_focus_window",
-    description: "Focus a specific virtual desktop window and optionally maximize it, then return an updated screenshot.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["windowId"],
-      properties: {
-        windowId: {
-          type: "string",
-          minLength: 1,
-          description: "X11 window id from virtual_desktop_list_windows, for example 0xa00007.",
-        },
-        maximize: {
-          type: "boolean",
-          description: "If true, request maximized state for the selected window before focusing it.",
-        },
-        delayMs: {
-          type: "integer",
-          minimum: 0,
-          maximum: 5000,
-          description: "Optional delay after changing focus before capturing the next screenshot.",
-        },
-      },
-    },
-  },
-  {
-    name: "virtual_desktop_launch",
-    description: "Launch an additional application in the current virtual desktop session and return an updated screenshot.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["command"],
-      properties: {
-        command: {
-          type: "string",
-          minLength: 1,
-          description: "Shell command to launch inside the current virtual desktop session.",
-        },
-        maximize: {
-          type: "boolean",
-          description: "If true, attempt to maximize the launched window after it appears.",
-        },
-        delayMs: {
-          type: "integer",
-          minimum: 0,
-          maximum: 5000,
-          description: "Optional delay after launching before capturing the next screenshot.",
-        },
-      },
-    },
-  },
-  {
-    name: "virtual_desktop_snapshot",
-    description: "Fallback higher-token path: capture the current virtual desktop screenshot for this conversation. Prefer virtual_desktop_analyze for local screen understanding and clickable-target discovery when possible.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        delayMs: {
-          type: "integer",
-          minimum: 0,
-          maximum: 5000,
-          description: "Optional delay before taking the screenshot.",
-        },
-      },
-    },
-  },
-  {
-    name: "virtual_desktop_click",
-    description: "Fallback coordinate click: click at a screen position on the virtual desktop and return an updated screenshot. Prefer virtual_desktop_click_target after virtual_desktop_analyze when coordinates are not already known.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["x", "y"],
-      properties: {
-        x: { type: "integer", minimum: 0, description: "Horizontal screen coordinate in desktop pixels." },
-        y: { type: "integer", minimum: 0, description: "Vertical screen coordinate in desktop pixels." },
-        button: {
-          type: "string",
-          enum: ["left", "middle", "right"],
-          description: "Mouse button to click. Defaults to left.",
-        },
-        clicks: {
-          type: "integer",
-          minimum: 1,
-          maximum: 3,
-          description: "Number of clicks to perform. Defaults to 1.",
-        },
-        delayMs: {
-          type: "integer",
-          minimum: 0,
-          maximum: 5000,
-          description: "Optional delay after the click before capturing the next screenshot.",
-        },
-      },
-    },
-  },
-  {
-    name: "virtual_desktop_scroll",
-    description: "Scroll at a screen position on the virtual desktop and return an updated screenshot.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["x", "y"],
-      properties: {
-        x: { type: "integer", minimum: 0, description: "Horizontal screen coordinate in desktop pixels." },
-        y: { type: "integer", minimum: 0, description: "Vertical screen coordinate in desktop pixels." },
-        deltaX: { type: "integer", description: "Horizontal wheel delta. Positive scrolls right." },
-        deltaY: { type: "integer", description: "Vertical wheel delta. Positive scrolls down." },
-        delayMs: {
-          type: "integer",
-          minimum: 0,
-          maximum: 5000,
-          description: "Optional delay after scrolling before capturing the next screenshot.",
-        },
-      },
-    },
-  },
-  {
-    name: "virtual_desktop_key",
-    description: "Send a key press with optional modifiers to the virtual desktop and return an updated screenshot.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["key"],
-      properties: {
-        key: {
-          type: "string",
-          minLength: 1,
-          description: "Key name such as Enter, Tab, Escape, ArrowLeft, a, A, or space.",
-        },
-        modifiers: {
-          type: "array",
-          description: "Optional modifier keys held during the key press.",
-          items: {
-            type: "string",
-            enum: ["Shift", "Control", "Alt", "Meta"],
-          },
-        },
-        delayMs: {
-          type: "integer",
-          minimum: 0,
-          maximum: 5000,
-          description: "Optional delay after the key press before capturing the next screenshot.",
-        },
-      },
-    },
-  },
-  {
-    name: "virtual_desktop_type",
-    description: "Type text into the virtual desktop and return an updated screenshot.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      required: ["text"],
-      properties: {
-        text: {
-          type: "string",
-          minLength: 1,
-          description: "Text to type. Supports letters, numbers, punctuation, spaces, newlines, and tabs.",
-        },
-        submit: {
-          type: "boolean",
-          description: "If true, press Enter after typing.",
-        },
-        delayMs: {
-          type: "integer",
-          minimum: 0,
-          maximum: 5000,
-          description: "Optional delay after typing before capturing the next screenshot.",
-        },
-      },
-    },
-  },
-];
-
 const eventSocketClients = new Set();
-const xSessionManager = new XSessionManager();
-const desktopVisionAnalysisById = new Map();
-const latestDesktopVisionAnalysisByThreadId = new Map();
-const MAX_DESKTOP_VISION_ANALYSES = 100;
+const terminalSocketClientsByProjectId = new Map();
+const terminalManager = new TerminalManager();
 
 function formatBridgePayload(value) {
   try {
@@ -331,11 +57,73 @@ function formatBridgePayload(value) {
 }
 
 function logBridgeTraffic(direction, payload) {
+  if (!RAW_BRIDGE_LOG_ENABLED) {
+    return;
+  }
+
   closeConsoleResponseStream();
   const label = direction === "out" ? "-> codex" : "<- codex";
   console.log(`[sdk ${label}] ${formatBridgePayload(payload)}`);
 }
 
+function formatConsoleSectionBar() {
+  const width = Math.max(48, Math.min(process.stdout.columns || 80, 72));
+  return "-".repeat(width);
+}
+
+function truncateConsoleText(text, maxLength = 280) {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength - 3)}...`;
+}
+
+function writeConsoleSection(title, lines = []) {
+  closeConsoleResponseStream();
+  const visibleLines = [formatConsoleSectionBar(), title];
+  for (const line of lines) {
+    const text = String(line || "").trim();
+    if (text) {
+      visibleLines.push(text);
+    }
+  }
+  visibleLines.push(formatConsoleSectionBar());
+  process.stdout.write(`${visibleLines.join("\n")}\n`);
+}
+
+function summarizeTurnInput(input) {
+  const items = Array.isArray(input) ? input : [];
+  const text = items
+    .filter((item) => item?.type === "text")
+    .map((item) => String(item.text || "").trim())
+    .filter(Boolean)
+    .join("\n\n");
+  const imageCount = items.filter((item) => /image/i.test(String(item?.type || ""))).length;
+  const lines = [];
+
+  if (text) {
+    lines.push(text);
+  }
+
+  if (imageCount > 0) {
+    lines.push(`[${imageCount} image${imageCount === 1 ? "" : "s"} attached]`);
+  }
+
+  return lines;
+}
+
+function logTurnStart(params) {
+  const threadId = cleanString(params?.threadId);
+  const lines = [];
+
+  if (threadId) {
+    lines.push(`thread: ${threadId}`);
+  }
+
+  lines.push(...summarizeTurnInput(params?.input));
+  writeConsoleSection("User Message", lines);
+}
 class CodexBridge extends EventEmitter {
   constructor() {
     super();
@@ -451,6 +239,7 @@ class CodexBridge extends EventEmitter {
         continue;
       }
 
+      closeConsoleResponseStream();
       console.error(`[codex] ${line}`);
       this.emit("event", { type: "bridge-log", line });
     }
@@ -461,8 +250,15 @@ class CodexBridge extends EventEmitter {
 
     if (message && typeof message === "object" && "method" in message && "id" in message) {
       const normalizedRequest = this.serverRequestTracker.normalizeRequest(message);
-      this.pendingServerRequests.set(String(message.id), { ...normalizedRequest, receivedAt: Date.now() });
-      this.emit("event", { type: "server-request", request: normalizedRequest });
+      const requestObservation = this.serverRequestTracker.observeRequest(normalizedRequest);
+      const requestId = String(message.id);
+      const existingRequest = this.pendingServerRequests.get(requestId);
+
+      this.pendingServerRequests.set(requestId, {
+        ...normalizedRequest,
+        receivedAt: existingRequest?.receivedAt || requestObservation.receivedAt,
+      });
+      this.emit("event", { type: "server-request", request: normalizedRequest, requestObservation });
       return;
     }
 
@@ -470,6 +266,7 @@ class CodexBridge extends EventEmitter {
       this.serverRequestTracker.observeNotification(message);
 
       if (message.method === "serverRequest/resolved" && message.params?.requestId != null) {
+        this.serverRequestTracker.resolveRequest(message.params.requestId);
         this.pendingServerRequests.delete(String(message.params.requestId));
       }
 
@@ -499,6 +296,10 @@ class CodexBridge extends EventEmitter {
   send(message) {
     if (!this.child || !this.child.stdin.writable) {
       throw new Error("Codex app-server is not running");
+    }
+
+    if (!RAW_BRIDGE_LOG_ENABLED && message?.method === "turn/start") {
+      logTurnStart(message.params);
     }
 
     logBridgeTraffic("out", message);
@@ -553,13 +354,31 @@ bridge.on("event", (payload) => {
     writeRealtimeLlmDelta(payload.message);
   }
 
-  if (payload?.type === "server-request" && payload.request?.method === "item/tool/call") {
-    handleDynamicToolCallRequest(payload.request).catch((error) => {
-      console.error("Failed to handle dynamic tool call", error);
-    });
-  }
-
   broadcast({ timestamp: Date.now(), ...payload });
+});
+
+terminalManager.on("output", (payload) => {
+  broadcastProjectTerminal(payload.projectId, {
+    type: "output",
+    timestamp: Date.now(),
+    ...payload,
+  });
+});
+
+terminalManager.on("exit", (payload) => {
+  broadcastProjectTerminal(payload.projectId, {
+    type: "exit",
+    timestamp: Date.now(),
+    ...payload,
+  });
+});
+
+terminalManager.on("error", (payload) => {
+  broadcastProjectTerminal(payload.projectId, {
+    type: "error",
+    timestamp: Date.now(),
+    ...payload,
+  });
 });
 
 async function assertCodexInstalled() {
@@ -789,18 +608,12 @@ function buildSandboxPolicy(project, overrides = {}) {
 }
 
 function buildThreadConfig(project, overrides = {}) {
-  const dynamicTools = DESKTOP_TOOL_SPECS.map((tool) => ({ ...tool }));
-
   return compactObject({
     model: cleanString(overrides.model) || cleanString(project.defaultModel) || undefined,
     cwd: project.cwd,
     approvalPolicy: pickApprovalPolicy(overrides.approvalPolicy, project.approvalPolicy),
     sandbox: pickEnum(overrides.sandboxMode || project.sandboxMode, ["read-only", "workspace-write", "danger-full-access"], project.sandboxMode),
     personality: pickEnum(overrides.personality || project.defaultPersonality, ["none", "friendly", "pragmatic"], project.defaultPersonality),
-    dynamicTools,
-    config: {
-      dynamicTools,
-    },
   });
 }
 
@@ -906,7 +719,6 @@ async function getBootState() {
     ok: true,
     projects,
     models,
-    xSessions: xSessionManager.listSessions(""),
     pendingRequests: bridge.listPendingServerRequests(),
     app: {
       port: PORT,
@@ -953,6 +765,52 @@ function broadcast(payload) {
     if (socket.readyState === socket.OPEN) {
       socket.send(message);
     }
+  }
+}
+
+function sendSocketJson(socket, payload) {
+  if (socket.readyState !== socket.OPEN) {
+    return;
+  }
+
+  socket.send(JSON.stringify(payload));
+}
+
+function getProjectTerminalSockets(projectId) {
+  const normalizedProjectId = cleanString(projectId);
+  if (!normalizedProjectId) {
+    return null;
+  }
+
+  let sockets = terminalSocketClientsByProjectId.get(normalizedProjectId);
+  if (!sockets) {
+    sockets = new Set();
+    terminalSocketClientsByProjectId.set(normalizedProjectId, sockets);
+  }
+
+  return sockets;
+}
+
+function removeProjectTerminalSocket(projectId, socket) {
+  const sockets = terminalSocketClientsByProjectId.get(cleanString(projectId));
+  if (!sockets) {
+    return;
+  }
+
+  sockets.delete(socket);
+  if (sockets.size === 0) {
+    terminalSocketClientsByProjectId.delete(cleanString(projectId));
+  }
+}
+
+function broadcastProjectTerminal(projectId, payload) {
+  const sockets = terminalSocketClientsByProjectId.get(cleanString(projectId));
+  if (!sockets) {
+    return;
+  }
+
+  for (const socket of sockets) {
+    sendSocketJson(socket, payload);
   }
 }
 
@@ -1008,6 +866,85 @@ function handleEventSocketConnection(socket) {
   });
 }
 
+function normalizeTerminalColumns(value) {
+  return clamp(toInteger(value, 120), 40, 240);
+}
+
+function normalizeTerminalRows(value) {
+  return clamp(toInteger(value, 32), 12, 80);
+}
+
+async function ensureProjectTerminalSession(projectId, options = {}) {
+  const project = await requireProject(cleanString(projectId));
+  return terminalManager.ensureProjectSession(project, {
+    columns: normalizeTerminalColumns(options.columns),
+    rows: normalizeTerminalRows(options.rows),
+    term: cleanString(options.term) || "xterm-256color",
+  });
+}
+
+function handleTerminalSocketConnection(socket, projectId) {
+  const normalizedProjectId = cleanString(projectId);
+  const sockets = getProjectTerminalSockets(normalizedProjectId);
+  sockets?.add(socket);
+
+  sendSocketJson(socket, {
+    type: "connected",
+    timestamp: Date.now(),
+    projectId: normalizedProjectId,
+  });
+
+  const session = terminalManager.getProjectSession(normalizedProjectId);
+  if (session) {
+    sendSocketJson(socket, {
+      type: "session",
+      timestamp: Date.now(),
+      data: session,
+    });
+  }
+
+  socket.on("message", (raw) => {
+    try {
+      const payload = JSON.parse(Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw || ""));
+
+      if (payload.type === "input") {
+        terminalManager.writeProjectInput(normalizedProjectId, String(payload.data || ""));
+        return;
+      }
+
+      if (payload.type === "control") {
+        terminalManager.sendProjectControl(normalizedProjectId, payload.action);
+        return;
+      }
+
+      if (payload.type === "resize") {
+        terminalManager.resizeProjectSession(normalizedProjectId, {
+          columns: payload.columns,
+          rows: payload.rows,
+        });
+        return;
+      }
+
+      throw new Error(`Unsupported terminal message type: ${cleanString(payload.type) || "unknown"}`);
+    } catch (error) {
+      sendSocketJson(socket, {
+        type: "error",
+        timestamp: Date.now(),
+        projectId: normalizedProjectId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  socket.on("close", () => {
+    removeProjectTerminalSocket(normalizedProjectId, socket);
+  });
+
+  socket.on("error", () => {
+    removeProjectTerminalSocket(normalizedProjectId, socket);
+  });
+}
+
 async function serveStatic(pathname, response) {
   const requestedPath = pathname === "/" ? "/index.html" : pathname;
   const safePath = path.normalize(requestedPath).replace(/^(\.\.[/\\])+/, "");
@@ -1021,11 +958,8 @@ async function serveStatic(pathname, response) {
       sendError(response, 403, "Forbidden");
       return;
     }
-  } else if (safePath === "/index.html" || safePath === "/x-session.html") {
+  } else if (safePath === "/index.html") {
     filePath = path.join(ROOT_DIR, "index.html");
-    if (safePath === "/x-session.html") {
-      filePath = path.join(ROOT_DIR, "x-session.html");
-    }
   } else if (safePath.startsWith("/src/")) {
     filePath = path.join(ROOT_DIR, safePath);
 
@@ -1083,10 +1017,6 @@ function parseReviewTarget(body) {
   return { type: "uncommittedChanges" };
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function toNumber(value, fallback = 0) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
@@ -1100,645 +1030,6 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
-function normalizeToolArguments(value) {
-  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-}
-
-function normalizeDelayMs(value, fallback = 250) {
-  return clamp(toInteger(value, fallback), 0, 5000);
-}
-
-function buttonNameToIndex(button) {
-  const normalized = cleanString(button).toLowerCase();
-  if (normalized === "middle") return 1;
-  if (normalized === "right") return 2;
-  return 0;
-}
-
-function modifierNameToEvent(name) {
-  const normalized = cleanString(name).toLowerCase();
-
-  if (normalized === "shift") {
-    return { key: "Shift", code: "ShiftLeft", bit: MOD_SHIFT };
-  }
-  if (normalized === "control" || normalized === "ctrl") {
-    return { key: "Control", code: "ControlLeft", bit: MOD_CONTROL };
-  }
-  if (normalized === "alt" || normalized === "option") {
-    return { key: "Alt", code: "AltLeft", bit: MOD_ALT };
-  }
-  if (normalized === "meta" || normalized === "cmd" || normalized === "command") {
-    return { key: "Meta", code: "MetaLeft", bit: MOD_META };
-  }
-
-  return null;
-}
-
-function normalizeKeyDescriptor(value) {
-  const raw = String(value ?? "");
-  const trimmed = raw.trim();
-  const token = trimmed || raw;
-
-  if (!token) {
-    throw new Error("key is required");
-  }
-
-  const lower = token.toLowerCase();
-
-  if (lower === "enter" || lower === "return") return { key: "Enter", code: "Enter" };
-  if (lower === "tab") return { key: "Tab", code: "Tab" };
-  if (lower === "escape" || lower === "esc") return { key: "Escape", code: "Escape" };
-  if (lower === "backspace") return { key: "Backspace", code: "Backspace" };
-  if (lower === "delete" || lower === "del") return { key: "Delete", code: "Delete" };
-  if (lower === "space" || raw === " ") return { key: " ", code: "Space" };
-  if (lower === "arrowup") return { key: "ArrowUp", code: "ArrowUp" };
-  if (lower === "arrowdown") return { key: "ArrowDown", code: "ArrowDown" };
-  if (lower === "arrowleft") return { key: "ArrowLeft", code: "ArrowLeft" };
-  if (lower === "arrowright") return { key: "ArrowRight", code: "ArrowRight" };
-
-  if (token.length === 1) {
-    if (/[a-z]/i.test(token)) {
-      return { key: token, code: `Key${token.toUpperCase()}` };
-    }
-
-    if (/[0-9]/.test(token)) {
-      return { key: token, code: `Digit${token}` };
-    }
-
-    return { key: token, code: token === " " ? "Space" : "" };
-  }
-
-  return { key: token, code: token };
-}
-
-function createKeyStrokeEvents(keyDescriptor, modifiers = []) {
-  const modifierEvents = modifiers
-    .map((value) => modifierNameToEvent(value))
-    .filter(Boolean);
-  let modifierMask = 0;
-  const events = [];
-
-  for (const modifier of modifierEvents) {
-    modifierMask |= modifier.bit;
-    events.push({
-      kind: "keyDown",
-      key: modifier.key,
-      code: modifier.code,
-      modifiers: modifierMask,
-    });
-  }
-
-  events.push({
-    kind: "keyDown",
-    key: keyDescriptor.key,
-    code: keyDescriptor.code,
-    modifiers: modifierMask,
-  });
-  events.push({
-    kind: "keyUp",
-    key: keyDescriptor.key,
-    code: keyDescriptor.code,
-    modifiers: modifierMask,
-  });
-
-  for (let index = modifierEvents.length - 1; index >= 0; index -= 1) {
-    const modifier = modifierEvents[index];
-    events.push({
-      kind: "keyUp",
-      key: modifier.key,
-      code: modifier.code,
-      modifiers: modifierMask,
-    });
-    modifierMask &= ~modifier.bit;
-  }
-
-  return events;
-}
-
-function createTypeEvents(text, submit = false) {
-  const events = [];
-
-  for (const char of String(text || "")) {
-    if (char === "\r") {
-      continue;
-    }
-
-    if (char === "\n") {
-      events.push(...createKeyStrokeEvents({ key: "Enter", code: "Enter" }));
-      continue;
-    }
-
-    if (char === "\t") {
-      events.push(...createKeyStrokeEvents({ key: "Tab", code: "Tab" }));
-      continue;
-    }
-
-    if (char === "\b") {
-      events.push(...createKeyStrokeEvents({ key: "Backspace", code: "Backspace" }));
-      continue;
-    }
-
-    events.push(...createKeyStrokeEvents(normalizeKeyDescriptor(char)));
-  }
-
-  if (submit) {
-    events.push(...createKeyStrokeEvents({ key: "Enter", code: "Enter" }));
-  }
-
-  return events;
-}
-
-async function resolveThreadProject(threadId) {
-  const threadPayload = await bridge.request("thread/read", {
-    threadId,
-    includeTurns: false,
-  });
-  const thread = threadPayload.data?.thread || threadPayload.thread || threadPayload;
-  const project = await findProjectByCwd(thread?.cwd);
-
-  return { thread, project };
-}
-
-async function ensureThreadDesktopSession(threadId, requestHost = "", options = {}) {
-  const existing = xSessionManager.getSessionByThreadId(threadId, requestHost);
-  if (existing) {
-    return existing;
-  }
-
-  const { project } = await resolveThreadProject(threadId);
-  if (!project) {
-    throw new Error("Unable to resolve project for thread desktop");
-  }
-
-  return xSessionManager.createSession(buildDesktopSessionConfig(project, {
-    threadId,
-    command: options.command,
-    windowManagerCommand: options.windowManagerCommand,
-    xServerBackend: options.xServerBackend,
-    useBubblewrap: typeof options.useBubblewrap === "boolean" ? options.useBubblewrap : undefined,
-  }), requestHost);
-}
-
-async function captureThreadDesktop(threadId, requestHost = "", delayMs = 0) {
-  await ensureThreadDesktopSession(threadId, requestHost);
-  if (delayMs > 0) {
-    await sleep(delayMs);
-  }
-  return xSessionManager.captureThreadScreenshot(threadId);
-}
-
-function buildDesktopScreenshotHash(screenshot) {
-  return crypto.createHash("sha256").update(screenshot.png).digest("hex").slice(0, 16);
-}
-
-function pruneDesktopVisionAnalyses() {
-  while (desktopVisionAnalysisById.size > MAX_DESKTOP_VISION_ANALYSES) {
-    const oldestKey = desktopVisionAnalysisById.keys().next().value;
-    if (!oldestKey) {
-      break;
-    }
-
-    const record = desktopVisionAnalysisById.get(oldestKey);
-    desktopVisionAnalysisById.delete(oldestKey);
-
-    if (record && latestDesktopVisionAnalysisByThreadId.get(record.threadId) === oldestKey) {
-      latestDesktopVisionAnalysisByThreadId.delete(record.threadId);
-    }
-  }
-}
-
-function storeDesktopVisionAnalysis(threadId, screenshot, analysis) {
-  const analysisId = `analysis-${crypto.randomUUID().slice(0, 8)}`;
-  const record = {
-    analysisId,
-    createdAt: Date.now(),
-    threadId,
-    model: analysis.model,
-    pulledModel: Boolean(analysis.pulledModel),
-    goal: cleanString(analysis.goal),
-    summary: cleanString(analysis.summary),
-    uncertainty: cleanString(analysis.uncertainty),
-    width: screenshot.width,
-    height: screenshot.height,
-    screenHash: buildDesktopScreenshotHash(screenshot),
-    targets: Array.isArray(analysis.targets) ? analysis.targets : [],
-    usage: analysis.usage || {},
-  };
-
-  desktopVisionAnalysisById.set(analysisId, record);
-  latestDesktopVisionAnalysisByThreadId.set(threadId, analysisId);
-  pruneDesktopVisionAnalyses();
-  return record;
-}
-
-function serializeDesktopVisionAnalysis(record) {
-  return {
-    analysisId: record.analysisId,
-    createdAt: record.createdAt,
-    threadId: record.threadId,
-    model: record.model,
-    pulledModel: Boolean(record.pulledModel),
-    goal: record.goal || "",
-    summary: record.summary || "",
-    uncertainty: record.uncertainty || "",
-    width: record.width,
-    height: record.height,
-    screenHash: record.screenHash,
-    targets: Array.isArray(record.targets) ? record.targets : [],
-    usage: record.usage || {},
-  };
-}
-
-function getDesktopVisionAnalysis(threadId, analysisId) {
-  const resolvedAnalysisId = cleanString(analysisId) || latestDesktopVisionAnalysisByThreadId.get(threadId);
-
-  if (!resolvedAnalysisId) {
-    throw new Error("No desktop vision analysis is available yet. Call virtual_desktop_analyze first.");
-  }
-
-  const record = desktopVisionAnalysisById.get(resolvedAnalysisId);
-  if (!record || record.threadId !== threadId) {
-    throw new Error(`Desktop vision analysis ${JSON.stringify(resolvedAnalysisId)} was not found for this thread`);
-  }
-
-  return record;
-}
-
-function formatDesktopVisionTargetSummary(target, index) {
-  return [
-    `${index + 1}. ${target.targetId}`,
-    target.kind || "control",
-    target.label || "(unlabeled)",
-    `conf ${target.confidence.toFixed(2)}`,
-    `bounds ${target.bounds.width}x${target.bounds.height}+${target.bounds.x}+${target.bounds.y}`,
-    `center (${target.center.x}, ${target.center.y})`,
-    cleanString(target.description),
-  ].filter(Boolean).join(" | ");
-}
-
-async function analyzeThreadDesktop(threadId, requestHost = "", options = {}) {
-  const delayMs = normalizeDelayMs(options.delayMs, 0);
-  const maxTargets = clamp(toInteger(options.maxTargets, 12), 1, 20);
-  const screenshot = await captureThreadDesktop(threadId, requestHost, delayMs);
-  const analysis = await analyzeDesktopScreenshot(screenshot, {
-    goal: cleanString(options.goal),
-    maxTargets,
-  });
-  return storeDesktopVisionAnalysis(threadId, screenshot, analysis);
-}
-
-function buildDesktopVisionResponse(threadId, toolName, analysis, note) {
-  const lines = [
-    `Tool: ${toolName}`,
-    `Thread: ${threadId}`,
-    "Mode: preferred local vision analysis",
-    `Vision model: ${analysis.model}`,
-    `Analysis id: ${analysis.analysisId}`,
-    `Screen: ${analysis.width}x${analysis.height}`,
-    `Screen hash: ${analysis.screenHash}`,
-    "No raw screenshot was sent to the Codex runtime.",
-    "Fallback: use virtual_desktop_snapshot only if local vision is insufficient or you need exact pixels.",
-  ];
-
-  if (analysis.goal) {
-    lines.push(`Goal: ${analysis.goal}`);
-  }
-
-  if (note) {
-    lines.push(note);
-  }
-
-  if (analysis.summary) {
-    lines.push(`Summary: ${analysis.summary}`);
-  }
-
-  if (analysis.uncertainty) {
-    lines.push(`Uncertainty: ${analysis.uncertainty}`);
-  }
-
-  lines.push(`Clickable targets: ${analysis.targets.length}`);
-
-  if (analysis.targets.length === 0) {
-    lines.push("No confident clickable targets were identified.");
-  } else {
-    lines.push(...analysis.targets.map(formatDesktopVisionTargetSummary));
-    lines.push("Use virtual_desktop_click_target with a targetId from this analysis to click one of these targets.");
-  }
-
-  return buildDesktopToolTextResponse(lines.join("\n"));
-}
-
-function buildDesktopToolResponse(threadId, toolName, screenshot, note) {
-  const lines = [
-    `Tool: ${toolName}`,
-    `Thread: ${threadId}`,
-    `Screen: ${screenshot.width}x${screenshot.height}`,
-    "Mode: raw screenshot fallback attached.",
-    "Preferred low-token path: use virtual_desktop_analyze and virtual_desktop_click_target for local screen understanding and target-based clicking.",
-  ];
-
-  if (note) {
-    lines.push(note);
-  }
-
-  return {
-    success: true,
-    contentItems: [
-      { type: "inputText", text: lines.join("\n") },
-      { type: "inputImage", imageUrl: screenshot.dataUrl },
-    ],
-  };
-}
-
-function buildDesktopToolTextResponse(text) {
-  return {
-    success: true,
-    contentItems: [
-      { type: "inputText", text },
-    ],
-  };
-}
-
-function formatDesktopWindowSummary(window, index) {
-  const flags = [
-    window.active ? "active" : "",
-    window.maximized ? "maximized" : "",
-  ].filter(Boolean).join(", ");
-
-  return [
-    `${index + 1}. ${window.id}`,
-    flags || "window",
-    `${window.width}x${window.height}+${window.x}+${window.y}`,
-    window.wmClass || "unknown",
-    window.title || "(untitled)",
-  ].join(" | ");
-}
-
-function buildDesktopToolErrorResponse(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  const lines = [`Virtual desktop tool failed: ${message}`];
-
-  if (/ollama|vision/i.test(message)) {
-    lines.push("Fallback: use virtual_desktop_snapshot or the existing coordinate-based desktop tools while local vision is unavailable.");
-  }
-
-  return {
-    success: false,
-    contentItems: [
-      {
-        type: "inputText",
-        text: lines.join("\n"),
-      },
-    ],
-  };
-}
-
-async function executeDesktopToolCall(params, requestHost = "") {
-  const threadId = cleanString(params.threadId);
-  const toolName = cleanString(params.tool);
-  const args = normalizeToolArguments(params.arguments);
-
-  if (!threadId) {
-    throw new Error("threadId is required for desktop tool calls");
-  }
-
-  if (toolName === "virtual_desktop_analyze") {
-    const analysis = await analyzeThreadDesktop(threadId, requestHost, {
-      goal: args.goal,
-      maxTargets: args.maxTargets,
-      delayMs: args.delayMs,
-    });
-    const note = analysis.pulledModel
-      ? "The local vision model was pulled into Ollama automatically for this analysis."
-      : "";
-    return buildDesktopVisionResponse(threadId, toolName, analysis, note);
-  }
-
-  if (toolName === "virtual_desktop_click_target") {
-    const targetId = cleanString(args.targetId);
-    if (!targetId) {
-      throw new Error("targetId is required");
-    }
-
-    await ensureThreadDesktopSession(threadId, requestHost);
-
-    const analysis = getDesktopVisionAnalysis(threadId, args.analysisId);
-    const target = analysis.targets.find((entry) => entry.targetId === targetId);
-
-    if (!target) {
-      throw new Error(`Target ${JSON.stringify(targetId)} was not found in analysis ${analysis.analysisId}`);
-    }
-
-    const buttonName = cleanString(args.button) || "left";
-    const button = buttonNameToIndex(buttonName);
-    const clicks = clamp(toInteger(args.clicks, 1), 1, 3);
-    const x = target.center.x;
-    const y = target.center.y;
-    const events = [];
-
-    for (let index = 0; index < clicks; index += 1) {
-      events.push({ kind: "pointerDown", x, y, button, buttons: 0, modifiers: 0 });
-      events.push({ kind: "pointerUp", x, y, button, buttons: 0, modifiers: 0 });
-    }
-
-    await xSessionManager.injectThreadEvents(threadId, events, {
-      delayMs: normalizeDelayMs(args.delayMs),
-    });
-
-    const clickNote = `Clicked ${target.targetId} (${target.label || target.kind}) at (${x}, ${y}) using ${buttonName}${clicks > 1 ? ` x${clicks}` : ""}.`;
-
-    if (args.reanalyze === false) {
-      return buildDesktopToolTextResponse([
-        `Tool: ${toolName}`,
-        `Thread: ${threadId}`,
-        "Mode: preferred local target-based click",
-        clickNote,
-        "No raw screenshot was sent to the Codex runtime.",
-        "Post-click local vision was skipped. Call virtual_desktop_analyze if you need updated targets without using the screenshot fallback path.",
-      ].join("\n"));
-    }
-
-    const nextAnalysis = await analyzeThreadDesktop(threadId, requestHost, {
-      goal: cleanString(args.goal) || analysis.goal,
-      maxTargets: args.maxTargets,
-      delayMs: 0,
-    });
-    const note = [
-      clickNote,
-      nextAnalysis.pulledModel ? "The local vision model was pulled into Ollama automatically for this analysis." : "",
-    ].filter(Boolean).join(" ");
-    return buildDesktopVisionResponse(threadId, toolName, nextAnalysis, note);
-  }
-
-  if (toolName === "virtual_desktop_snapshot") {
-    const screenshot = await captureThreadDesktop(threadId, requestHost, normalizeDelayMs(args.delayMs, 0));
-    return buildDesktopToolResponse(threadId, toolName, screenshot, "Captured the current desktop.");
-  }
-
-  if (toolName === "virtual_desktop_list_windows") {
-    await ensureThreadDesktopSession(threadId, requestHost);
-    const windows = await xSessionManager.listThreadWindows(threadId);
-    const lines = [
-      `Tool: ${toolName}`,
-      `Thread: ${threadId}`,
-      `Windows: ${windows.length}`,
-    ];
-
-    if (windows.length === 0) {
-      lines.push("No managed windows found.");
-    } else {
-      lines.push(...windows.map(formatDesktopWindowSummary));
-    }
-
-    return buildDesktopToolTextResponse(lines.join("\n"));
-  }
-
-  if (toolName === "virtual_desktop_focus_window") {
-    const windowId = cleanString(args.windowId);
-    if (!windowId) {
-      throw new Error("windowId is required");
-    }
-
-    await ensureThreadDesktopSession(threadId, requestHost);
-    const window = await xSessionManager.focusThreadWindow(threadId, windowId, {
-      maximize: Boolean(args.maximize),
-    });
-    const screenshot = await captureThreadDesktop(threadId, requestHost, normalizeDelayMs(args.delayMs, 500));
-    const label = window.title || window.wmClass || window.id;
-    return buildDesktopToolResponse(
-      threadId,
-      toolName,
-      screenshot,
-      `Focused ${window.id} (${label})${args.maximize ? " and requested maximize" : ""}.`,
-    );
-  }
-
-  if (toolName === "virtual_desktop_launch") {
-    const command = cleanString(args.command);
-    if (!command) {
-      throw new Error("command is required");
-    }
-
-    await ensureThreadDesktopSession(threadId, requestHost);
-    const launched = await xSessionManager.launchThreadCommands(threadId, command, {
-      maximize: Boolean(args.maximize),
-    });
-    const screenshot = await captureThreadDesktop(threadId, requestHost, normalizeDelayMs(args.delayMs, 1000));
-    const preview = command.length > 80 ? `${command.slice(0, 77)}...` : command;
-    const note = [
-      `Launched ${JSON.stringify(preview)}${args.maximize ? " with maximize requested" : ""}.`,
-      launched.length > 1 ? `Processes started: ${launched.length}.` : "",
-    ].filter(Boolean).join(" ");
-    return buildDesktopToolResponse(threadId, toolName, screenshot, note);
-  }
-
-  await ensureThreadDesktopSession(threadId, requestHost);
-
-  if (toolName === "virtual_desktop_click") {
-    const x = clamp(toInteger(args.x, 0), 0, 100000);
-    const y = clamp(toInteger(args.y, 0), 0, 100000);
-    const buttonName = cleanString(args.button) || "left";
-    const button = buttonNameToIndex(buttonName);
-    const clicks = clamp(toInteger(args.clicks, 1), 1, 3);
-    const events = [];
-
-    for (let index = 0; index < clicks; index += 1) {
-      events.push({ kind: "pointerDown", x, y, button, buttons: 0, modifiers: 0 });
-      events.push({ kind: "pointerUp", x, y, button, buttons: 0, modifiers: 0 });
-    }
-
-    await xSessionManager.injectThreadEvents(threadId, events, {
-      delayMs: normalizeDelayMs(args.delayMs),
-    });
-    const screenshot = await xSessionManager.captureThreadScreenshot(threadId);
-    return buildDesktopToolResponse(threadId, toolName, screenshot, `Clicked ${buttonName} at (${x}, ${y}).`);
-  }
-
-  if (toolName === "virtual_desktop_scroll") {
-    const x = clamp(toInteger(args.x, 0), 0, 100000);
-    const y = clamp(toInteger(args.y, 0), 0, 100000);
-    const deltaX = toInteger(args.deltaX, 0);
-    const deltaY = toInteger(args.deltaY, 0);
-
-    if (deltaX === 0 && deltaY === 0) {
-      throw new Error("deltaX or deltaY is required");
-    }
-
-    await xSessionManager.injectThreadEvents(threadId, [{
-      kind: "wheel",
-      x,
-      y,
-      deltaX,
-      deltaY,
-      modifiers: 0,
-    }], {
-      delayMs: normalizeDelayMs(args.delayMs),
-    });
-    const screenshot = await xSessionManager.captureThreadScreenshot(threadId);
-    return buildDesktopToolResponse(threadId, toolName, screenshot, `Scrolled at (${x}, ${y}) with delta (${deltaX}, ${deltaY}).`);
-  }
-
-  if (toolName === "virtual_desktop_key") {
-    const keyDescriptor = normalizeKeyDescriptor(args.key);
-    const modifiers = Array.isArray(args.modifiers) ? args.modifiers : [];
-    const events = createKeyStrokeEvents(keyDescriptor, modifiers);
-
-    await xSessionManager.injectThreadEvents(threadId, events, {
-      delayMs: normalizeDelayMs(args.delayMs),
-    });
-    const screenshot = await xSessionManager.captureThreadScreenshot(threadId);
-    return buildDesktopToolResponse(threadId, toolName, screenshot, `Pressed ${[...modifiers, keyDescriptor.key].join("+")}.`);
-  }
-
-  if (toolName === "virtual_desktop_type") {
-    const text = String(args.text || "");
-    if (!text) {
-      throw new Error("text is required");
-    }
-
-    const events = createTypeEvents(text, Boolean(args.submit));
-    await xSessionManager.injectThreadEvents(threadId, events, {
-      delayMs: normalizeDelayMs(args.delayMs),
-    });
-    const screenshot = await xSessionManager.captureThreadScreenshot(threadId);
-    const preview = text.length > 80 ? `${text.slice(0, 77)}...` : text;
-    return buildDesktopToolResponse(
-      threadId,
-      toolName,
-      screenshot,
-      `Typed ${JSON.stringify(preview)}${args.submit ? " and pressed Enter" : ""}.`,
-    );
-  }
-
-  throw new Error(`Unsupported dynamic tool: ${toolName}`);
-}
-
-async function handleDynamicToolCallRequest(request) {
-  try {
-    const result = await executeDesktopToolCall(request.params);
-    await bridge.respondToServerRequest(request.id, result);
-    broadcast({
-      timestamp: Date.now(),
-      type: "dynamic-tool-response",
-      requestId: request.id,
-      threadId: request.params?.threadId || null,
-      tool: request.params?.tool || null,
-      success: true,
-    });
-  } catch (error) {
-    await bridge.respondToServerRequest(request.id, buildDesktopToolErrorResponse(error));
-    broadcast({
-      timestamp: Date.now(),
-      type: "dynamic-tool-response",
-      requestId: request.id,
-      threadId: request.params?.threadId || null,
-      tool: request.params?.tool || null,
-      success: false,
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
-}
-
 let activeConsoleResponseKey = "";
 
 function closeConsoleResponseStream() {
@@ -1750,8 +1041,21 @@ function closeConsoleResponseStream() {
   activeConsoleResponseKey = "";
 }
 
-function formatConsoleResponseLabel(threadId, turnId, itemId) {
-  return `[llm ${String(threadId || "").slice(0, 8)} ${String(turnId || "").slice(0, 8)} ${String(itemId || "").slice(0, 8)}] `;
+function openConsoleResponseStream(threadId, turnId, itemId) {
+  const lines = [];
+
+  if (threadId) {
+    lines.push(`thread: ${threadId}`);
+  }
+  if (turnId) {
+    lines.push(`turn: ${turnId}`);
+  }
+  if (itemId) {
+    lines.push(`item: ${itemId}`);
+  }
+
+  writeConsoleSection("Assistant Message", lines);
+  activeConsoleResponseKey = `${threadId || ""}:${turnId || ""}:${itemId || ""}`;
 }
 
 function writeRealtimeLlmDelta(message) {
@@ -1761,9 +1065,7 @@ function writeRealtimeLlmDelta(message) {
   if (method === "item/agentMessage/delta") {
     const key = `${params.threadId || ""}:${params.turnId || ""}:${params.itemId || ""}`;
     if (key !== activeConsoleResponseKey) {
-      closeConsoleResponseStream();
-      activeConsoleResponseKey = key;
-      process.stdout.write(formatConsoleResponseLabel(params.threadId, params.turnId, params.itemId));
+      openConsoleResponseStream(params.threadId, params.turnId, params.itemId);
     }
 
     process.stdout.write(params.delta || "");
@@ -1783,7 +1085,6 @@ function writeRealtimeLlmDelta(message) {
 async function handleApi(request, response, url) {
   const { pathname, searchParams } = url;
   const parts = pathname.split("/").filter(Boolean);
-  const requestHost = request.headers["x-forwarded-host"] || request.headers.host || "";
 
   if (request.method === "GET" && pathname === "/api/boot") {
     sendJson(response, 200, await getBootState());
@@ -1797,36 +1098,6 @@ async function handleApi(request, response, url) {
 
   if (request.method === "GET" && pathname === "/api/pending-requests") {
     sendJson(response, 200, { ok: true, data: bridge.listPendingServerRequests() });
-    return;
-  }
-
-  if (request.method === "GET" && pathname === "/api/x-sessions") {
-    sendJson(response, 200, { ok: true, data: xSessionManager.listSessions(requestHost) });
-    return;
-  }
-
-  if (request.method === "POST" && pathname === "/api/x-sessions") {
-    const body = await readJsonBody(request);
-    sendJson(response, 200, {
-      ok: true,
-      data: await xSessionManager.createSession(body, requestHost),
-    });
-    return;
-  }
-
-  if (request.method === "GET" && parts[1] === "x-sessions" && parts.length === 3) {
-    const session = xSessionManager.getSession(decodeURIComponent(parts[2]), requestHost);
-    if (!session) {
-      sendError(response, 404, "Session not found");
-      return;
-    }
-    sendJson(response, 200, { ok: true, data: session });
-    return;
-  }
-
-  if (request.method === "DELETE" && parts[1] === "x-sessions" && parts.length === 3) {
-    await xSessionManager.stopSession(decodeURIComponent(parts[2]));
-    sendJson(response, 200, { ok: true });
     return;
   }
 
@@ -1893,6 +1164,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "DELETE" && parts[1] === "projects" && parts.length === 3) {
+    await terminalManager.closeProjectSession(decodeURIComponent(parts[2])).catch(() => {});
     await removeProject(decodeURIComponent(parts[2]));
     sendJson(response, 200, { ok: true });
     return;
@@ -1924,6 +1196,28 @@ async function handleApi(request, response, url) {
         forceReload: searchParams.get("reload") === "true",
       }),
     });
+    return;
+  }
+
+  if (request.method === "GET" && parts[1] === "projects" && parts[3] === "terminal" && parts.length === 4) {
+    sendJson(response, 200, {
+      ok: true,
+      data: terminalManager.getProjectSession(decodeURIComponent(parts[2])),
+    });
+    return;
+  }
+
+  if (request.method === "POST" && parts[1] === "projects" && parts[3] === "terminal" && parts.length === 4) {
+    const body = await readJsonBody(request);
+    const session = await ensureProjectTerminalSession(decodeURIComponent(parts[2]), body);
+    sendJson(response, 200, { ok: true, data: session });
+    return;
+  }
+
+  if (request.method === "DELETE" && parts[1] === "projects" && parts[3] === "terminal" && parts.length === 4) {
+    const projectId = decodeURIComponent(parts[2]);
+    await terminalManager.closeProjectSession(projectId);
+    sendJson(response, 200, { ok: true });
     return;
   }
 
@@ -1960,41 +1254,24 @@ async function handleApi(request, response, url) {
 
   if (request.method === "GET" && parts[1] === "threads" && parts.length === 3) {
     const threadId = decodeURIComponent(parts[2]);
-    let project = null;
-
-    try {
-      project = (await resolveThreadProject(threadId)).project;
-    } catch {
-      project = null;
-    }
 
     try {
       sendJson(response, 200, {
         ok: true,
-        data: await bridge.request("thread/resume", {
+        // Thread selection should be observational. Resuming here can perturb an in-flight thread.
+        data: await bridge.request("thread/read", {
           threadId,
-          ...(project ? buildThreadConfig(project) : {}),
-          persistExtendedHistory: true,
+          includeTurns: true,
         }),
       });
     } catch {
-      try {
-        sendJson(response, 200, {
-          ok: true,
-          data: await bridge.request("thread/read", {
-            threadId,
-            includeTurns: true,
-          }),
-        });
-      } catch {
-        sendJson(response, 200, {
-          ok: true,
-          data: await bridge.request("thread/read", {
-            threadId,
-            includeTurns: false,
-          }),
-        });
-      }
+      sendJson(response, 200, {
+        ok: true,
+        data: await bridge.request("thread/read", {
+          threadId,
+          includeTurns: false,
+        }),
+      });
     }
 
     return;
@@ -2018,140 +1295,6 @@ async function handleApi(request, response, url) {
         ...buildTurnConfig(project, body),
       }),
     });
-    return;
-  }
-
-  if (request.method === "GET" && parts[1] === "threads" && parts[3] === "desktop" && parts.length === 4) {
-    const threadId = decodeURIComponent(parts[2]);
-    const session = xSessionManager.getSessionByThreadId(threadId, requestHost);
-    sendJson(response, 200, { ok: true, data: session });
-    return;
-  }
-
-  if (request.method === "POST" && parts[1] === "threads" && parts[3] === "desktop" && parts.length === 4) {
-    const body = await readJsonBody(request);
-    const threadId = decodeURIComponent(parts[2]);
-    const projectId = cleanString(body.projectId);
-    let session;
-
-    if (projectId) {
-      const project = await requireProject(projectId);
-      session = await xSessionManager.createSession(buildDesktopSessionConfig(project, {
-        threadId,
-        command: body.command,
-        windowManagerCommand: body.windowManagerCommand,
-        xServerBackend: body.xServerBackend,
-        useBubblewrap: typeof body.useBubblewrap === "boolean" ? body.useBubblewrap : undefined,
-      }), requestHost);
-    } else {
-      session = await ensureThreadDesktopSession(threadId, requestHost, {
-        command: body.command,
-        windowManagerCommand: body.windowManagerCommand,
-        xServerBackend: body.xServerBackend,
-        useBubblewrap: body.useBubblewrap,
-      });
-    }
-
-    sendJson(response, 200, { ok: true, data: session });
-    return;
-  }
-
-  if (request.method === "DELETE" && parts[1] === "threads" && parts[3] === "desktop" && parts.length === 4) {
-    const threadId = decodeURIComponent(parts[2]);
-    const session = xSessionManager.getSessionByThreadId(threadId, requestHost);
-    if (session) {
-      await xSessionManager.stopSession(session.id);
-    }
-    sendJson(response, 200, { ok: true });
-    return;
-  }
-
-  if (request.method === "POST" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "frame-rate" && parts.length === 5) {
-    const threadId = decodeURIComponent(parts[2]);
-    const body = await readJsonBody(request);
-    const session = xSessionManager.getSessionByThreadId(threadId, requestHost);
-    if (!session) {
-      throw new Error("Session not found");
-    }
-    const updated = await xSessionManager.updateSessionFrameRate(session.id, body.frameRate);
-    sendJson(response, 200, { ok: true, data: xSessionManager.serializeSession(updated, requestHost) });
-    return;
-  }
-
-  if (request.method === "POST" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "analyze" && parts.length === 5) {
-    const threadId = decodeURIComponent(parts[2]);
-    const body = await readJsonBody(request);
-    const analysis = await analyzeThreadDesktop(threadId, requestHost, {
-      goal: body.goal,
-      maxTargets: body.maxTargets,
-      delayMs: body.delayMs,
-    });
-    sendJson(response, 200, { ok: true, data: serializeDesktopVisionAnalysis(analysis) });
-    return;
-  }
-
-  if (request.method === "POST" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "type" && parts.length === 5) {
-    const threadId = decodeURIComponent(parts[2]);
-    const body = await readJsonBody(request);
-    const text = String(body.text || "");
-
-    if (!text) {
-      throw new Error("text is required");
-    }
-
-    await ensureThreadDesktopSession(threadId, requestHost);
-    await xSessionManager.injectThreadEvents(threadId, createTypeEvents(text, Boolean(body.submit)));
-    sendJson(response, 200, { ok: true, data: { typed: text.length } });
-    return;
-  }
-
-  if (request.method === "POST" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "launch" && parts.length === 5) {
-    const threadId = decodeURIComponent(parts[2]);
-    const body = await readJsonBody(request);
-    const command = cleanString(body.command);
-
-    if (!command) {
-      throw new Error("command is required");
-    }
-
-    await ensureThreadDesktopSession(threadId, requestHost);
-    const launched = await xSessionManager.launchThreadCommands(threadId, command, {
-      maximize: Boolean(body.maximize),
-    });
-    sendJson(response, 200, { ok: true, data: { launched } });
-    return;
-  }
-
-  if (request.method === "GET" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "windows" && parts.length === 5) {
-    const threadId = decodeURIComponent(parts[2]);
-    await ensureThreadDesktopSession(threadId, requestHost);
-    const windows = await xSessionManager.listThreadWindows(threadId);
-    sendJson(response, 200, { ok: true, data: { windows } });
-    return;
-  }
-
-  if (request.method === "POST" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "focus-window" && parts.length === 5) {
-    const threadId = decodeURIComponent(parts[2]);
-    const body = await readJsonBody(request);
-    const windowId = cleanString(body.windowId);
-
-    if (!windowId) {
-      throw new Error("windowId is required");
-    }
-
-    await ensureThreadDesktopSession(threadId, requestHost);
-    const window = await xSessionManager.focusThreadWindow(threadId, windowId, {
-      maximize: Boolean(body.maximize),
-    });
-    sendJson(response, 200, { ok: true, data: { window } });
-    return;
-  }
-
-  if (request.method === "GET" && parts[1] === "threads" && parts[3] === "desktop" && parts[4] === "clipboard" && parts.length === 5) {
-    const threadId = decodeURIComponent(parts[2]);
-    await ensureThreadDesktopSession(threadId, requestHost);
-    const text = await xSessionManager.readThreadClipboard(threadId);
-    sendJson(response, 200, { ok: true, data: { text } });
     return;
   }
 
@@ -2266,21 +1409,44 @@ const server = http.createServer(async (request, response) => {
 });
 
 const eventSocketServer = new WebSocketServer({ noServer: true });
+const terminalSocketServer = new WebSocketServer({ noServer: true });
 
 eventSocketServer.on("connection", (socket) => {
   handleEventSocketConnection(socket);
 });
 
+terminalSocketServer.on("connection", (socket) => {
+  handleTerminalSocketConnection(socket, socket.projectId);
+});
+
 server.on("upgrade", (request, socket, head) => {
   const url = new URL(request.url, `http://${request.headers.host || "127.0.0.1"}`);
 
-  if (url.pathname !== "/ws/events") {
+  if (url.pathname === "/ws/events") {
+    eventSocketServer.handleUpgrade(request, socket, head, (ws) => {
+      eventSocketServer.emit("connection", ws, request);
+    });
+    return;
+  }
+
+  const terminalMatch = url.pathname.match(/^\/ws\/projects\/([^/]+)\/terminal$/);
+  if (!terminalMatch) {
     socket.destroy();
     return;
   }
 
-  eventSocketServer.handleUpgrade(request, socket, head, (ws) => {
-    eventSocketServer.emit("connection", ws, request);
+  void ensureProjectTerminalSession(decodeURIComponent(terminalMatch[1]), {
+    columns: url.searchParams.get("columns"),
+    rows: url.searchParams.get("rows"),
+    term: url.searchParams.get("term"),
+  }).then(() => {
+    terminalSocketServer.handleUpgrade(request, socket, head, (ws) => {
+      ws.projectId = decodeURIComponent(terminalMatch[1]);
+      terminalSocketServer.emit("connection", ws, request);
+    });
+  }).catch((error) => {
+    console.error(error);
+    socket.destroy();
   });
 });
 
@@ -2300,7 +1466,7 @@ server.listen(PORT, async () => {
 });
 
 async function shutdownAndExit(code) {
-  await xSessionManager.stopAll().catch(() => {});
+  await terminalManager.stopAll().catch(() => {});
   process.exit(code);
 }
 

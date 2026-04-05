@@ -60,40 +60,18 @@
         <section class="panel panel-conversation">
           <div id="threadHeader" class="thread-header"></div>
           <div id="conversation" class="conversation"></div>
-          <section id="threadDesktop" class="thread-desktop hidden" aria-hidden="true">
-            <div class="thread-desktop-bar">
-              <div id="threadDesktopStatus" class="thread-desktop-status">Select a conversation and open Virtual Desktop.</div>
-              <div class="thread-desktop-actions">
-                <label class="thread-desktop-rate">
-                  <span>FPS</span>
-                  <select id="threadDesktopFrameRate">
-                    <option value="5">5</option>
-                    <option value="10">10</option>
-                    <option value="15">15</option>
-                    <option value="24">24</option>
-                    <option value="30" selected>30</option>
-                  </select>
-                </label>
-                <label class="thread-desktop-scale">
-                  <span>Scale</span>
-                  <select id="threadDesktopScale">
-                    <option value="0.75" selected>0.75x</option>
-                    <option value="1">1.0x</option>
-                    <option value="1.25">1.25x</option>
-                    <option value="1.5">1.5x</option>
-                    <option value="2">2.0x</option>
-                  </select>
-                </label>
-                <button id="threadDesktopPasteText" type="button" class="ghost-button">Paste Text</button>
-                <button id="threadDesktopCopyClipboard" type="button" class="ghost-button">Copy Clipboard</button>
-                <button id="threadDesktopAnalyze" type="button" class="ghost-button">Analyze Screen</button>
-                <button id="threadDesktopScreenshot" type="button" class="ghost-button">Screenshot</button>
-                <button id="threadDesktopStop" type="button" class="danger-button">Stop Desktop</button>
+          <section id="threadTerminal" class="thread-terminal hidden" aria-hidden="true">
+            <div class="thread-terminal-bar">
+              <div id="threadTerminalStatus" class="thread-terminal-status">Select a project and open Terminal.</div>
+              <div class="thread-terminal-actions">
+                <button id="threadTerminalReconnect" type="button" class="ghost-button">Reconnect</button>
+                <button id="threadTerminalInterrupt" type="button" class="ghost-button">Ctrl+C</button>
+                <button id="threadTerminalClear" type="button" class="ghost-button">Clear</button>
+                <button id="threadTerminalStop" type="button" class="danger-button">Stop Terminal</button>
               </div>
             </div>
-            <section id="threadDesktopAnalysis" class="thread-desktop-analysis hidden" aria-live="polite"></section>
-            <div class="thread-desktop-surface">
-              <canvas id="threadDesktopCanvas" class="thread-desktop-canvas"></canvas>
+            <div class="thread-terminal-surface">
+              <div id="threadTerminalViewport" class="thread-terminal-viewport" aria-label="Project terminal"></div>
             </div>
           </section>
           <form id="composerForm" class="composer">
@@ -123,6 +101,10 @@
                 <label class="composer-toggle composer-toggle-inline composer-dangerous-toggle">
                   <input id="approveAllDangerousToggle" type="checkbox">
                   <span>Approve all dangerous</span>
+                </label>
+                <label class="composer-toggle composer-toggle-inline composer-ralph-loop-toggle">
+                  <input id="ralphLoopToggle" type="checkbox">
+                  <span>Ralph loop</span>
                 </label>
               </div>
             </div>

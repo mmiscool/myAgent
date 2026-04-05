@@ -1,5 +1,20 @@
 [
   {
+    "id": "b909be2a-7b35-4414-b2e3-70e9e1c7885a",
+    "name": "BREP_from_Book",
+    "description": "",
+    "cwd": "/home/user/projects/BREP_from_Book",
+    "defaultModel": "",
+    "defaultEffort": "medium",
+    "defaultSummary": "auto",
+    "defaultPersonality": "pragmatic",
+    "approvalPolicy": "on-request",
+    "sandboxMode": "workspace-write",
+    "networkAccess": true,
+    "createdAt": 1775327770311,
+    "updatedAt": 1775327770311
+  },
+  {
     "id": "551d85cb-bd39-4a14-9215-096af923860d",
     "name": "BREP",
     "description": "",
