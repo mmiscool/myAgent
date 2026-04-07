@@ -6,7 +6,7 @@ import { Terminal } from "@xterm/xterm";
 import { buildAutoApprovalResult, composerApprovalPolicyOverride } from "./approval-utils.mjs";
 import { sortProjectsByRecentConversationActivity } from "./project-activity-utils.mjs";
 import { RALPH_LOOP_DELAY_SECONDS, startRalphLoopCountdown } from "./ralph-loop-countdown.mjs";
-import { findLatestRalphLoopInput, normalizeRalphLoopInput } from "./ralph-loop-utils.mjs";
+import { normalizeRalphLoopInput } from "./ralph-loop-utils.mjs";
 
 marked.setOptions({
   gfm: true,
@@ -41,9 +41,9 @@ const state = {
   composerAttachments: [],
   pendingServerRequests: [],
   autoApprovalInFlight: new Set(),
-  ralphLoopInputByThreadId: {},
   ralphLoopLastCompletedTurnId: "",
   ralphLoopPendingReplay: null,
+  ralphLoopAutoCompactThreadId: "",
   terminalSessionByProjectId: {},
   terminalClient: null,
   terminalConnectInFlight: false,
@@ -385,34 +385,30 @@ function composerRequestOverrides() {
   return overrides;
 }
 
-function storeRalphLoopInput(threadId, input) {
-  const normalizedThreadId = String(threadId || "");
-  const normalizedInput = normalizeRalphLoopInput(input);
-
-  if (!normalizedThreadId || (!normalizedInput.text && normalizedInput.images.length === 0)) {
-    return;
-  }
-
-  state.ralphLoopInputByThreadId[normalizedThreadId] = normalizedInput;
+function currentComposerInput() {
+  return normalizeRalphLoopInput({
+    text: elements.promptInput.value,
+    images: state.composerAttachments.map((attachment) => ({
+      type: "image",
+      url: attachment.url,
+      name: attachment.name,
+    })),
+  });
 }
 
 function currentRalphLoopInput(threadId) {
   const normalizedThreadId = String(threadId || "");
 
-  if (!normalizedThreadId) {
+  if (!normalizedThreadId || normalizedThreadId !== state.selectedThreadId) {
     return null;
   }
 
-  const stored = state.ralphLoopInputByThreadId[normalizedThreadId];
-  if (stored?.text || stored?.images?.length) {
-    return normalizeRalphLoopInput(stored);
+  const currentInput = currentComposerInput();
+  if (!currentInput.text && currentInput.images.length === 0) {
+    return null;
   }
 
-  if (state.selectedThread?.id === normalizedThreadId) {
-    return findLatestRalphLoopInput(state.selectedThread);
-  }
-
-  return null;
+  return currentInput;
 }
 
 function isRalphLoopActiveForThread(threadId) {
@@ -434,9 +430,13 @@ function currentPendingRalphLoopReplay(threadId) {
   return pendingReplay;
 }
 
-function cancelPendingRalphLoop({ disableLoop = false, render = true } = {}) {
+function cancelPendingRalphLoop({ disableLoop = false, render = true, cancelAutoCompact = false } = {}) {
   const pendingReplay = state.ralphLoopPendingReplay;
   state.ralphLoopPendingReplay = null;
+
+  if (cancelAutoCompact) {
+    state.ralphLoopAutoCompactThreadId = "";
+  }
 
   if (pendingReplay?.cancel) {
     pendingReplay.cancel();
@@ -460,7 +460,86 @@ function syncPendingRalphLoopReplay() {
   }
 
   if (!isRalphLoopActiveForThread(pendingReplay.threadId)) {
-    cancelPendingRalphLoop({ render: false });
+    cancelPendingRalphLoop({ render: false, cancelAutoCompact: true });
+  }
+}
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
+async function readThreadSnapshot(threadId) {
+  const payload = await api(`/api/threads/${encodeURIComponent(threadId)}`);
+  return payload.data?.thread || payload.data || null;
+}
+
+function threadHasLiveWork(thread) {
+  return isLiveStatus(thread?.status) || isLiveStatus(latestTurn(thread)?.status);
+}
+
+async function autoCompactRalphLoopThread(threadId, previousTurnId = "") {
+  const normalizedThreadId = String(threadId || "");
+
+  if (!normalizedThreadId) {
+    return false;
+  }
+
+  state.ralphLoopAutoCompactThreadId = normalizedThreadId;
+
+  try {
+    await api(`/api/threads/${encodeURIComponent(normalizedThreadId)}/compact`, {
+      method: "POST",
+      body: {},
+    });
+
+    const startDeadline = Date.now() + 5000;
+    const completionDeadline = Date.now() + 60000;
+    let compactStarted = false;
+
+    while (Date.now() < completionDeadline) {
+      if (state.ralphLoopAutoCompactThreadId !== normalizedThreadId) {
+        return false;
+      }
+
+      if (!isRalphLoopActiveForThread(normalizedThreadId)) {
+        return false;
+      }
+
+      const thread = await readThreadSnapshot(normalizedThreadId);
+      const latest = latestTurn(thread);
+      const latestTurnChanged = Boolean(latest?.id) && latest.id !== previousTurnId;
+      const liveWork = threadHasLiveWork(thread);
+
+      compactStarted = compactStarted || latestTurnChanged || liveWork;
+
+      if (compactStarted && !liveWork) {
+        if (state.selectedThreadId === normalizedThreadId) {
+          await loadThread(normalizedThreadId);
+        }
+        return true;
+      }
+
+      if (!compactStarted && Date.now() >= startDeadline) {
+        if (state.selectedThreadId === normalizedThreadId) {
+          await loadThread(normalizedThreadId);
+        }
+        return true;
+      }
+
+      await sleep(400);
+    }
+
+    if (state.selectedThreadId === normalizedThreadId) {
+      await loadThread(normalizedThreadId);
+    }
+
+    return true;
+  } finally {
+    if (state.ralphLoopAutoCompactThreadId === normalizedThreadId) {
+      state.ralphLoopAutoCompactThreadId = "";
+    }
   }
 }
 
@@ -519,7 +598,7 @@ async function sendConversationMessage(input, options = {}) {
   }
 
   if (!fromRalphLoop) {
-    cancelPendingRalphLoop({ render: false });
+    cancelPendingRalphLoop({ render: false, cancelAutoCompact: true });
   }
 
   ensureProjectVisible(project.id);
@@ -538,7 +617,6 @@ async function sendConversationMessage(input, options = {}) {
     state.selectedThreadId = created.data?.thread?.id || "";
   }
 
-  storeRalphLoopInput(state.selectedThreadId, normalizedInput);
   persistSelection();
   await loadAllProjectThreads();
   renderProjects();
@@ -569,6 +647,15 @@ async function maybeRunRalphLoop(threadId, completedTurnId = "") {
     const shouldReplay = await waitForRalphLoopReplay(threadId, completedTurnId);
 
     if (!shouldReplay || !isRalphLoopActiveForThread(threadId)) {
+      return;
+    }
+
+    if (!currentRalphLoopInput(threadId)) {
+      return;
+    }
+
+    const compacted = await autoCompactRalphLoopThread(threadId, completedTurnId);
+    if (!compacted || !isRalphLoopActiveForThread(threadId)) {
       return;
     }
 
@@ -1187,7 +1274,9 @@ function applyStreamingNotification(message) {
     state.selectedThread.status = completedTurn.status || state.selectedThread.status || "completed";
     syncThreadSummary(state.selectedThread);
     renderSelectedThread();
-    void maybeRunRalphLoop(threadId, completedTurn.id || turn?.id || "");
+    if (state.ralphLoopAutoCompactThreadId !== threadId) {
+      void maybeRunRalphLoop(threadId, completedTurn.id || turn?.id || "");
+    }
     return true;
   }
 
@@ -2226,7 +2315,7 @@ function connectEvents() {
   elements.ralphLoopToggle.addEventListener("change", (event) => {
     state.composerRalphLoop = event.target.checked;
     if (!state.composerRalphLoop) {
-      cancelPendingRalphLoop();
+      cancelPendingRalphLoop({ cancelAutoCompact: true });
     }
   });
   elements.imageEditorOverlayCanvas.addEventListener("pointerdown", handleImageEditorPointerDown);
@@ -2882,7 +2971,7 @@ document.addEventListener("click", async (event) => {
     }
 
     if (action === "cancel-ralph-loop") {
-      cancelPendingRalphLoop({ disableLoop: true });
+      cancelPendingRalphLoop({ disableLoop: true, cancelAutoCompact: true });
       return;
     }
 
@@ -3179,19 +3268,16 @@ document.addEventListener("submit", async (event) => {
     }
 
     if (form === elements.composerForm) {
-      const text = elements.promptInput.value;
-      const images = state.composerAttachments.map((attachment) => ({
-        type: "image",
-        url: attachment.url,
-        name: attachment.name,
-      }));
+      await sendConversationMessage(currentComposerInput());
 
-      await sendConversationMessage({ text, images });
-
-      elements.promptInput.value = "";
-      clearComposerDraft();
-      state.composerAttachments = [];
-      renderComposerAttachments();
+      if (state.composerRalphLoop) {
+        persistComposerDraft();
+      } else {
+        elements.promptInput.value = "";
+        clearComposerDraft();
+        state.composerAttachments = [];
+        renderComposerAttachments();
+      }
       return;
     }
 
