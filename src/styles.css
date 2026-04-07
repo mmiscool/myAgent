@@ -680,12 +680,34 @@ textarea {
 .conversation-activity-banner {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   padding: 12px 14px;
   border-radius: 16px;
   border: 1px solid rgba(74, 163, 255, 0.28);
   background: rgba(74, 163, 255, 0.08);
   color: #d7e9ff;
+}
+
+.conversation-ralph-loop-banner {
+  border-color: rgba(116, 197, 143, 0.34);
+  background: rgba(116, 197, 143, 0.12);
+  color: #dcf6e5;
+}
+
+.conversation-banner-action {
+  margin-left: auto;
+  flex: 0 0 auto;
+  padding-block: 6px;
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(16, 17, 18, 0.28);
+  color: inherit;
+}
+
+.conversation-banner-action:hover,
+.conversation-banner-action:focus-visible {
+  border-color: rgba(255, 255, 255, 0.24);
+  background: rgba(16, 17, 18, 0.42);
 }
 
 .turn-status-wrap {

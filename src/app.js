@@ -5,6 +5,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { buildAutoApprovalResult, composerApprovalPolicyOverride } from "./approval-utils.mjs";
 import { sortProjectsByRecentConversationActivity } from "./project-activity-utils.mjs";
+import { RALPH_LOOP_DELAY_SECONDS, startRalphLoopCountdown } from "./ralph-loop-countdown.mjs";
 import { findLatestRalphLoopInput, normalizeRalphLoopInput } from "./ralph-loop-utils.mjs";
 
 marked.setOptions({
@@ -42,6 +43,7 @@ const state = {
   autoApprovalInFlight: new Set(),
   ralphLoopInputByThreadId: {},
   ralphLoopLastCompletedTurnId: "",
+  ralphLoopPendingReplay: null,
   terminalSessionByProjectId: {},
   terminalClient: null,
   terminalConnectInFlight: false,
@@ -98,6 +100,7 @@ const DEFAULT_VISIBLE_THREADS = 6;
 const COMPOSER_DRAFT_STORAGE_KEY = "composerDraft";
 let terminalResizeObserver = null;
 let terminalFitTimer = null;
+let projectThreadsRenderScheduled = false;
 let conversationSocket = null;
 let conversationSocketRetryTimer = null;
 let conversationSocketShouldReconnect = true;
@@ -111,6 +114,7 @@ async function boot() {
   if (!["chat", "terminal"].includes(state.activeThreadTab)) {
     state.activeThreadTab = "chat";
   }
+  setInitialProjectVisibility(state.selectedProjectId);
   normalizeComposerSettings();
   elements.autoscrollToggle.checked = state.autoscroll;
   elements.approveAllDangerousToggle.checked = state.composerApproveAllDangerous;
@@ -124,9 +128,12 @@ async function boot() {
 
   connectEvents();
   void maybeAutoApprovePendingRequests();
-
-  await loadAllProjectThreads();
-  renderProjects();
+  void loadModels().catch((error) => {
+    console.error("Failed to load models", error);
+  });
+  void loadAllProjectThreads().catch((error) => {
+    console.error("Failed to load project threads", error);
+  });
 
   if (state.selectedThreadId) {
     await loadThread(state.selectedThreadId);
@@ -155,7 +162,7 @@ async function api(path, options = {}) {
 }
 
 async function loadBoot() {
-  const payload = await api("/api/boot");
+  const payload = await api("/api/boot?includeModels=false");
   state.app = payload.app;
   state.projects = payload.projects;
   state.models = payload.models?.data || [];
@@ -164,6 +171,32 @@ async function loadBoot() {
     state.selectedProjectId = state.projects[0]?.id || "";
     persistSelection();
   }
+}
+
+function setInitialProjectVisibility(projectId) {
+  const visibleProjectId = projectId || state.projects[0]?.id || "";
+
+  state.collapsedProjectIds = new Set(
+    state.projects
+      .map((project) => project.id)
+      .filter((id) => id !== visibleProjectId),
+  );
+  state.expandedProjectIds = new Set();
+}
+
+function ensureProjectVisible(projectId) {
+  if (!projectId) {
+    return;
+  }
+
+  state.collapsedProjectIds.delete(projectId);
+}
+
+async function loadModels() {
+  const payload = await api("/api/models");
+  state.models = payload.data || [];
+  normalizeComposerSettings();
+  renderComposerControls();
 }
 
 function persistComposerSettings() {
@@ -201,11 +234,14 @@ function supportedEffortsForModel(model) {
 
 function normalizeComposerSettings() {
   const model = currentComposerModel() || fallbackComposerModel();
-  state.composerModel = model?.id || "";
 
-  const supportedEfforts = supportedEffortsForModel(model);
-  if (!supportedEfforts.includes(state.composerEffort)) {
-    state.composerEffort = model?.defaultReasoningEffort || supportedEfforts[0] || "medium";
+  if (model) {
+    state.composerModel = model?.id || "";
+
+    const supportedEfforts = supportedEffortsForModel(model);
+    if (!supportedEfforts.includes(state.composerEffort)) {
+      state.composerEffort = model?.defaultReasoningEffort || supportedEfforts[0] || "medium";
+    }
   }
 
   if (!["default", "plan"].includes(state.composerMode)) {
@@ -252,8 +288,8 @@ function renderComposerControls() {
 
   const model = currentComposerModel();
   const supportedEfforts = supportedEffortsForModel(model);
-  elements.composerModelLabel.textContent = model?.displayName || model?.id || "Select Model";
-  elements.composerEffortLabel.textContent = formatEffortLabel(state.composerEffort);
+  elements.composerModelLabel.textContent = model?.displayName || model?.id || state.composerModel || "Select Model";
+  elements.composerEffortLabel.textContent = formatEffortLabel(state.composerEffort) || "Reasoning";
 
   elements.composerModelMenu.innerHTML = state.models.map((entry) => `
     <button
@@ -324,22 +360,24 @@ function renderComposerControls() {
 
 function composerRequestOverrides() {
   const model = currentComposerModel() || fallbackComposerModel();
+  const modelId = model?.id || state.composerModel || undefined;
+  const reasoningEffort = state.composerEffort || model?.defaultReasoningEffort || undefined;
   const overrides = {
     approvalPolicy: composerApprovalPolicyOverride(
       selectedProject()?.approvalPolicy,
       state.composerApproveAllDangerous,
     ),
-    model: model?.id || undefined,
-    effort: state.composerEffort || undefined,
+    model: modelId,
+    effort: reasoningEffort,
     serviceTier: state.composerServiceTier || undefined,
   };
 
-  if (model?.id) {
+  if (modelId) {
     overrides.collaborationMode = {
       mode: state.composerMode === "plan" ? "plan" : "default",
       settings: {
-        model: model.id,
-        reasoning_effort: state.composerEffort || null,
+        model: modelId,
+        reasoning_effort: reasoningEffort || null,
       },
     };
   }
@@ -385,10 +423,92 @@ function isRalphLoopActiveForThread(threadId) {
     && Boolean(state.selectedThread?.id);
 }
 
-async function sendConversationMessage(input) {
+function currentPendingRalphLoopReplay(threadId) {
+  const normalizedThreadId = String(threadId || "");
+  const pendingReplay = state.ralphLoopPendingReplay;
+
+  if (!pendingReplay || pendingReplay.threadId !== normalizedThreadId) {
+    return null;
+  }
+
+  return pendingReplay;
+}
+
+function cancelPendingRalphLoop({ disableLoop = false, render = true } = {}) {
+  const pendingReplay = state.ralphLoopPendingReplay;
+  state.ralphLoopPendingReplay = null;
+
+  if (pendingReplay?.cancel) {
+    pendingReplay.cancel();
+  }
+
+  if (disableLoop) {
+    state.composerRalphLoop = false;
+    elements.ralphLoopToggle.checked = false;
+  }
+
+  if (render) {
+    renderConversation();
+  }
+}
+
+function syncPendingRalphLoopReplay() {
+  const pendingReplay = state.ralphLoopPendingReplay;
+
+  if (!pendingReplay) {
+    return;
+  }
+
+  if (!isRalphLoopActiveForThread(pendingReplay.threadId)) {
+    cancelPendingRalphLoop({ render: false });
+  }
+}
+
+async function waitForRalphLoopReplay(threadId, completedTurnId = "") {
+  cancelPendingRalphLoop({ render: false });
+
+  const normalizedThreadId = String(threadId || "");
+  if (!normalizedThreadId) {
+    return false;
+  }
+
+  const replayKey = `${normalizedThreadId}:${completedTurnId || "latest"}:${Date.now()}`;
+  const countdown = startRalphLoopCountdown({
+    seconds: RALPH_LOOP_DELAY_SECONDS,
+    onTick: (remainingSeconds) => {
+      if (state.ralphLoopPendingReplay?.key !== replayKey) {
+        return;
+      }
+
+      state.ralphLoopPendingReplay.remainingSeconds = remainingSeconds;
+      renderConversation();
+    },
+  });
+
+  state.ralphLoopPendingReplay = {
+    key: replayKey,
+    threadId: normalizedThreadId,
+    completedTurnId: completedTurnId || "",
+    remainingSeconds: RALPH_LOOP_DELAY_SECONDS,
+    cancel: countdown.cancel,
+  };
+  renderConversation();
+
+  const completed = await countdown.done;
+
+  if (state.ralphLoopPendingReplay?.key === replayKey) {
+    state.ralphLoopPendingReplay = null;
+    renderConversation();
+  }
+
+  return completed;
+}
+
+async function sendConversationMessage(input, options = {}) {
   const project = selectedProject();
   const normalizedInput = normalizeRalphLoopInput(input);
   const overrides = composerRequestOverrides();
+  const fromRalphLoop = options.fromRalphLoop === true;
 
   if (!project) {
     throw new Error("Select a project first");
@@ -397,6 +517,12 @@ async function sendConversationMessage(input) {
   if (!normalizedInput.text && normalizedInput.images.length === 0) {
     throw new Error("Enter a prompt or paste an image");
   }
+
+  if (!fromRalphLoop) {
+    cancelPendingRalphLoop({ render: false });
+  }
+
+  ensureProjectVisible(project.id);
 
   if (state.selectedThreadId) {
     await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/message`, {
@@ -433,15 +559,25 @@ async function maybeRunRalphLoop(threadId, completedTurnId = "") {
     return;
   }
 
-  const replayInput = currentRalphLoopInput(threadId);
-  if (!replayInput) {
+  if (!currentRalphLoopInput(threadId)) {
     return;
   }
 
   state.ralphLoopLastCompletedTurnId = completedTurnId || state.ralphLoopLastCompletedTurnId;
 
   try {
-    await sendConversationMessage(replayInput);
+    const shouldReplay = await waitForRalphLoopReplay(threadId, completedTurnId);
+
+    if (!shouldReplay || !isRalphLoopActiveForThread(threadId)) {
+      return;
+    }
+
+    const replayInput = currentRalphLoopInput(threadId);
+    if (!replayInput) {
+      return;
+    }
+
+    await sendConversationMessage(replayInput, { fromRalphLoop: true });
   } catch (error) {
     console.error("Ralph loop failed", error);
   }
@@ -456,6 +592,7 @@ async function loadThreads() {
     return;
   }
 
+  ensureProjectVisible(project.id);
   const payload = await api(`/api/projects/${encodeURIComponent(project.id)}/threads?archived=${state.archived}`);
   state.threads = payload.data?.data || payload.data?.threads || [];
   state.projectThreads[project.id] = state.threads;
@@ -478,28 +615,46 @@ async function loadThreads() {
 }
 
 async function loadProjectThreads(projectId) {
-  const payload = await api(`/api/projects/${encodeURIComponent(projectId)}/threads?archived=${state.archived}`);
-  state.projectThreads[projectId] = payload.data?.data || payload.data?.threads || [];
+  try {
+    const payload = await api(`/api/projects/${encodeURIComponent(projectId)}/threads?archived=${state.archived}`);
+    state.projectThreads[projectId] = payload.data?.data || payload.data?.threads || [];
+  } catch (error) {
+    state.projectThreads[projectId] = [];
+    throw error;
+  } finally {
+    if (projectId === state.selectedProjectId) {
+      state.threads = state.projectThreads[projectId];
+      renderComposerControls();
+    }
 
-  if (projectId === state.selectedProjectId) {
-    state.threads = state.projectThreads[projectId];
-    renderComposerControls();
+    scheduleProjectsRender();
   }
 }
 
 async function loadAllProjectThreads() {
-  await Promise.all(state.projects.map((project) => loadProjectThreads(project.id).catch(() => {
-    state.projectThreads[project.id] = [];
-  })));
+  const visibleProjectIds = state.projects
+    .filter((project) => !state.collapsedProjectIds.has(project.id))
+    .map((project) => project.id);
 
+  await Promise.all(visibleProjectIds.map((projectId) => loadProjectThreads(projectId).catch((error) => {
+    console.error(`Failed to load threads for project ${projectId}`, error);
+  })));
   state.threads = state.projectThreads[state.selectedProjectId] || [];
+  renderProjects();
 }
 
 async function loadThread(threadId) {
-  const payload = await api(`/api/threads/${encodeURIComponent(threadId)}`);
+  const requestedThreadId = String(threadId || "");
+  const payload = await api(`/api/threads/${encodeURIComponent(requestedThreadId)}`);
+
+  if (state.selectedThreadId !== requestedThreadId) {
+    return;
+  }
+
   state.selectedThread = payload.data?.thread || payload.data;
-  state.selectedThreadId = state.selectedThread?.id || threadId;
+  state.selectedThreadId = state.selectedThread?.id || requestedThreadId;
   state.currentTurnId = findLatestTurnId(state.selectedThread);
+  syncThreadSummary(state.selectedThread);
   renderComposerControls();
   persistSelection();
   renderProjects();
@@ -1009,6 +1164,7 @@ function applyStreamingNotification(message) {
   state.selectedThread.updatedAt = now;
 
   if (method === "turn/started") {
+    cancelPendingRalphLoop({ render: false });
     const turn = params.turn || {};
     ensureSelectedTurn(turn.id, turn.status || "inProgress");
     if (turn.id) {
@@ -1168,6 +1324,10 @@ function selectedProject() {
   return state.projects.find((project) => project.id === state.selectedProjectId) || null;
 }
 
+function isSelectedThreadLoading() {
+  return Boolean(state.selectedThreadId) && state.selectedThread?.id !== state.selectedThreadId;
+}
+
 function projectDisplayName(project) {
   const cwd = String(project?.cwd || "").trim();
   if (!cwd) {
@@ -1267,6 +1427,12 @@ function renderThreadActionMenu() {
 
 function renderProjects() {
   const projects = sortProjectsByRecentConversationActivity(state.projects, state.projectThreads);
+  const selectedIndex = projects.findIndex((project) => project.id === state.selectedProjectId);
+
+  if (selectedIndex > 0) {
+    const [selectedProject] = projects.splice(selectedIndex, 1);
+    projects.unshift(selectedProject);
+  }
 
   elements.archivedToggle.textContent = state.archived ? "Archived" : "Active";
   elements.archivedToggle.setAttribute("aria-pressed", state.archived ? "true" : "false");
@@ -1283,16 +1449,42 @@ function renderProjects() {
   }
 
   elements.projectList.innerHTML = projects.map((project) => {
-    const threads = state.projectThreads[project.id] || [];
+    const threadsLoaded = Object.prototype.hasOwnProperty.call(state.projectThreads, project.id);
+    const threads = threadsLoaded ? (state.projectThreads[project.id] || []) : [];
     const collapsedVisibleCount = collapsedVisibleThreadCount(threads);
     const projectCollapsed = state.collapsedProjectIds.has(project.id);
     const expanded = state.expandedProjectIds.has(project.id);
-    const visibleThreads = expanded ? threads : threads.slice(0, collapsedVisibleCount);
-    const moreCount = Math.max(0, threads.length - collapsedVisibleCount);
+    const visibleThreads = threadsLoaded ? (expanded ? threads : threads.slice(0, collapsedVisibleCount)) : [];
+    const moreCount = threadsLoaded ? Math.max(0, threads.length - collapsedVisibleCount) : 0;
     const projectStackId = `project-stack-${project.id}`;
     const projectName = projectDisplayName(project);
     const projectPath = project.cwd || projectName;
     const caretLabel = `${projectCollapsed ? "Expand" : "Collapse"} ${projectName}`;
+    const conversationsHtml = !threadsLoaded
+      ? `<div class="conversation-empty loading">Loading conversations...</div>`
+      : visibleThreads.length
+        ? visibleThreads.map((thread) => {
+          const preview = (thread.preview || thread.name || "New conversation").replace(/\s+/g, " ").trim();
+          const timeText = relativeTime(thread.updatedAt || thread.createdAt);
+          const activity = describeThreadActivity(thread);
+          const rowClasses = ["conversation-row"];
+          if (thread.id === state.selectedThreadId) {
+            rowClasses.push("selected");
+          }
+          if (activity.isWorking) {
+            rowClasses.push("working");
+          }
+          return `
+            <button class="${rowClasses.join(" ")}" data-action="select-thread" data-project-id="${escapeHtml(project.id)}" data-id="${escapeHtml(thread.id)}">
+              <span class="conversation-primary">
+                <span class="conversation-title">${escapeHtml(preview)}</span>
+                ${activity.isWorking ? `<span class="conversation-status">${renderActivityBadge(activity.label, activity.statusText, "sidebar")}</span>` : ""}
+              </span>
+              <span class="conversation-time">${escapeHtml(timeText)}</span>
+            </button>
+          `;
+        }).join("")
+        : `<div class="conversation-empty">No conversations yet</div>`;
 
     return `
       <section class="project-node ${project.id === state.selectedProjectId ? "active" : ""}">
@@ -1329,27 +1521,7 @@ function renderProjects() {
           ` : ""}
         </div>
         <div id="${escapeHtml(projectStackId)}" class="conversation-stack${projectCollapsed ? " hidden" : ""}">
-          ${visibleThreads.length ? visibleThreads.map((thread) => {
-            const preview = (thread.preview || thread.name || "New conversation").replace(/\s+/g, " ").trim();
-            const timeText = relativeTime(thread.updatedAt || thread.createdAt);
-            const activity = describeThreadActivity(thread);
-            const rowClasses = ["conversation-row"];
-            if (thread.id === state.selectedThreadId) {
-              rowClasses.push("selected");
-            }
-            if (activity.isWorking) {
-              rowClasses.push("working");
-            }
-            return `
-              <button class="${rowClasses.join(" ")}" data-action="select-thread" data-project-id="${escapeHtml(project.id)}" data-id="${escapeHtml(thread.id)}">
-                <span class="conversation-primary">
-                  <span class="conversation-title">${escapeHtml(preview)}</span>
-                  ${activity.isWorking ? `<span class="conversation-status">${renderActivityBadge(activity.label, activity.statusText, "sidebar")}</span>` : ""}
-                </span>
-                <span class="conversation-time">${escapeHtml(timeText)}</span>
-              </button>
-            `;
-          }).join("") : `<div class="conversation-empty">No conversations yet</div>`}
+          ${conversationsHtml}
           ${!projectCollapsed && moreCount > 0 ? `
             <button
               type="button"
@@ -1379,7 +1551,9 @@ function renderThreadHeader() {
   const thread = state.selectedThread;
   const project = selectedProject();
   const projectName = project ? projectDisplayName(project) : "";
-  const emptyStateSubtitle = state.activeThreadTab === "terminal"
+  const emptyStateSubtitle = isSelectedThreadLoading()
+    ? "Loading conversation..."
+    : state.activeThreadTab === "terminal"
     ? "Open a shell in the selected project on the host."
     : "Start a new conversation below. The first prompt creates the thread.";
 
@@ -1457,6 +1631,8 @@ function renderThreadHeader() {
 }
 
 function renderThreadPane() {
+  syncPendingRalphLoopReplay();
+
   const terminalVisible = state.activeThreadTab === "terminal";
   const conversationVisible = !terminalVisible;
 
@@ -1465,6 +1641,31 @@ function renderThreadPane() {
   elements.threadTerminal.classList.toggle("hidden", !terminalVisible);
   elements.threadTerminal.setAttribute("aria-hidden", terminalVisible ? "false" : "true");
   renderTerminalPane(terminalVisible);
+}
+
+function scheduleProjectsRender() {
+  if (projectThreadsRenderScheduled) {
+    return;
+  }
+
+  projectThreadsRenderScheduled = true;
+  requestAnimationFrame(() => {
+    projectThreadsRenderScheduled = false;
+    renderProjects();
+  });
+}
+
+function focusActiveThreadPane(tab = state.activeThreadTab) {
+  requestAnimationFrame(() => {
+    if (tab === "terminal") {
+      state.terminalEmulator?.terminal.focus();
+      return;
+    }
+
+    if (tab === "chat") {
+      elements.promptInput.focus();
+    }
+  });
 }
 
 function renderTerminalPane(terminalVisible) {
@@ -1514,8 +1715,17 @@ function renderTerminalPane(terminalVisible) {
 }
 
 function renderConversation() {
+  syncPendingRalphLoopReplay();
+
   const thread = state.selectedThread;
+  if (isSelectedThreadLoading()) {
+    elements.conversation.innerHTML = `<div class="empty loading">Loading conversation...</div>`;
+    scrollConversationToBottom();
+    return;
+  }
+
   const pendingRequests = pendingServerRequestsForThread(thread?.id);
+  const pendingRalphLoopReplay = currentPendingRalphLoopReplay(thread?.id);
   const latestCollapsibleItemId = findLatestCollapsibleItemId(thread);
 
   if (!thread?.turns?.length && pendingRequests.length === 0) {
@@ -1537,8 +1747,15 @@ function renderConversation() {
       <span>Conversation is actively working.</span>
     </section>
   ` : "";
+  const ralphLoopBanner = pendingRalphLoopReplay ? `
+    <section class="conversation-activity-banner conversation-ralph-loop-banner" aria-live="polite">
+      ${renderActivityBadge("Ralph Loop", "waiting", "live")}
+      <span>Continuing in ${escapeHtml(String(pendingRalphLoopReplay.remainingSeconds))} second${pendingRalphLoopReplay.remainingSeconds === 1 ? "" : "s"}.</span>
+      <button type="button" class="ghost-button conversation-banner-action" data-action="cancel-ralph-loop">Cancel Ralph loop</button>
+    </section>
+  ` : "";
 
-  elements.conversation.innerHTML = `${pendingBanner}${activityBanner}${thread.turns.map((turn) => {
+  elements.conversation.innerHTML = `${pendingBanner}${activityBanner}${ralphLoopBanner}${thread.turns.map((turn) => {
     const items = renderTurnItems(turn, latestCollapsibleItemId);
     const turnWorking = isLiveStatus(turn.status);
 
@@ -2008,6 +2225,9 @@ function connectEvents() {
   });
   elements.ralphLoopToggle.addEventListener("change", (event) => {
     state.composerRalphLoop = event.target.checked;
+    if (!state.composerRalphLoop) {
+      cancelPendingRalphLoop();
+    }
   });
   elements.imageEditorOverlayCanvas.addEventListener("pointerdown", handleImageEditorPointerDown);
   elements.imageEditorOverlayCanvas.addEventListener("pointermove", handleImageEditorPointerMove);
@@ -2661,6 +2881,11 @@ document.addEventListener("click", async (event) => {
       return;
     }
 
+    if (action === "cancel-ralph-loop") {
+      cancelPendingRalphLoop({ disableLoop: true });
+      return;
+    }
+
     if (action === "open-composer-attachment") {
       await openImageEditor(button.dataset.id);
       return;
@@ -2689,6 +2914,10 @@ document.addEventListener("click", async (event) => {
 
     if (action === "refresh-all-projects") {
       state.projects = await api("/api/projects").then((result) => result.data);
+      if (!state.selectedProjectId || !state.projects.some((project) => project.id === state.selectedProjectId)) {
+        state.selectedProjectId = state.projects[0]?.id || "";
+      }
+      ensureProjectVisible(state.selectedProjectId);
       await loadAllProjectThreads();
       renderProjects();
       return;
@@ -2729,18 +2958,26 @@ document.addEventListener("click", async (event) => {
         return;
       }
 
+      const wasCollapsed = state.collapsedProjectIds.has(projectId);
       toggleProjectCollapsed(projectId);
       renderProjects();
+      if (wasCollapsed) {
+        void loadAllProjectThreads().catch((error) => {
+          console.error(`Failed to load threads for project ${projectId}`, error);
+        });
+      }
       return;
     }
 
     if (action === "select-thread-tab") {
-      state.activeThreadTab = button.dataset.tab === "terminal" ? "terminal" : "chat";
+      const nextTab = button.dataset.tab === "terminal" ? "terminal" : "chat";
+      state.activeThreadTab = nextTab;
       state.threadActionMenuOpen = false;
       persistSelection();
       renderThreadHeader();
       renderThreadPane();
-      if (state.activeThreadTab === "terminal") {
+      focusActiveThreadPane(nextTab);
+      if (nextTab === "terminal") {
         await ensureProjectTerminal();
       }
       return;
@@ -2767,12 +3004,33 @@ document.addEventListener("click", async (event) => {
     }
 
     if (action === "select-thread") {
-      if (button.dataset.projectId && button.dataset.projectId !== state.selectedProjectId) {
-        state.selectedProjectId = button.dataset.projectId;
-        await disconnectTerminalClient();
+      const threadId = button.dataset.id || "";
+      const projectId = button.dataset.projectId || state.selectedProjectId;
+
+      if (!threadId) {
+        return;
+      }
+
+      if (projectId && projectId !== state.selectedProjectId) {
+        state.selectedProjectId = projectId;
+        ensureProjectVisible(projectId);
+        void disconnectTerminalClient();
+        if (!state.projectThreads[projectId]) {
+          void loadProjectThreads(projectId).catch((error) => {
+            console.error(`Failed to load threads for project ${projectId}`, error);
+          });
+        }
       }
       state.threadActionMenuOpen = false;
-      await loadThread(button.dataset.id);
+      state.selectedThreadId = threadId;
+      state.selectedThread = null;
+      state.currentTurnId = "";
+      persistSelection();
+      renderProjects();
+      renderThreadHeader();
+      renderConversation();
+      renderThreadPane();
+      await loadThread(threadId);
       return;
     }
 
@@ -2915,8 +3173,8 @@ document.addEventListener("submit", async (event) => {
       form.reset();
       elements.projectQuickAddForm.classList.add("hidden");
       persistSelection();
-      await loadAllProjectThreads();
-      renderProjects();
+      setInitialProjectVisibility(created.id);
+      await loadThreads();
       return;
     }
 

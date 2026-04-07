@@ -9,6 +9,7 @@ const { WebSocketServer } = require("ws");
 const { TerminalManager } = require("./terminal-manager");
 const { ServerRequestTracker } = require("./server-request-tracker");
 const { dedupeProjectsByPath, projectPathKey } = require("./project-store-utils");
+const { createThreadActionHelpers } = require("./thread-action-utils");
 
 const ROOT_DIR = __dirname;
 const DIST_DIR = path.join(ROOT_DIR, "dist");
@@ -348,6 +349,13 @@ class CodexBridge extends EventEmitter {
 }
 
 const bridge = new CodexBridge();
+const threadActionHelpers = createThreadActionHelpers({
+  bridge,
+  findProjectByCwd,
+  buildThreadConfig,
+  cleanString,
+  compactObject,
+});
 
 bridge.on("event", (payload) => {
   if (payload?.type === "notification") {
@@ -711,9 +719,9 @@ function buildTurnInput(body, textFieldName) {
   return items;
 }
 
-async function getBootState() {
+async function getBootState({ includeModels = true } = {}) {
   const projects = await listProjects();
-  const models = await getModels();
+  const models = includeModels ? await getModels() : { ok: true, data: [] };
 
   return {
     ok: true,
@@ -1087,7 +1095,14 @@ async function handleApi(request, response, url) {
   const parts = pathname.split("/").filter(Boolean);
 
   if (request.method === "GET" && pathname === "/api/boot") {
-    sendJson(response, 200, await getBootState());
+    sendJson(response, 200, await getBootState({
+      includeModels: searchParams.get("includeModels") !== "false",
+    }));
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/models") {
+    sendJson(response, 200, await getModels());
     return;
   }
 
@@ -1343,7 +1358,7 @@ async function handleApi(request, response, url) {
   if (request.method === "POST" && parts[1] === "threads" && parts[3] === "compact") {
     sendJson(response, 200, {
       ok: true,
-      data: await bridge.request("thread/compact/start", {
+      data: await threadActionHelpers.requestThreadActionWithResumeRetry("thread/compact/start", {
         threadId: decodeURIComponent(parts[2]),
       }),
     });
@@ -1366,7 +1381,7 @@ async function handleApi(request, response, url) {
     const body = await readJsonBody(request);
     sendJson(response, 200, {
       ok: true,
-      data: await bridge.request("review/start", {
+      data: await threadActionHelpers.requestThreadActionWithResumeRetry("review/start", {
         threadId: decodeURIComponent(parts[2]),
         target: parseReviewTarget(body),
         delivery: body.delivery === "detached" ? "detached" : "inline",
