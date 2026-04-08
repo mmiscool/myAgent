@@ -1,9 +1,17 @@
 import "./styles.css";
 import "@xterm/xterm/css/xterm.css";
+import "monaco-editor/min/vs/editor/editor.main.css";
 import { marked } from "marked";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import { buildAutoApprovalResult, composerApprovalPolicyOverride } from "./approval-utils.mjs";
+import { parseLocalFileLinkHref } from "./file-link-utils.mjs";
+import {
+  formatServiceTierLabel,
+  resolveComposerSelection,
+  supportedReasoningEffortsForModel,
+  supportedServiceTiersForModel,
+} from "./model-capabilities.mjs";
 import { sortProjectsByRecentConversationActivity } from "./project-activity-utils.mjs";
 import { RALPH_LOOP_DELAY_SECONDS, startRalphLoopCountdown } from "./ralph-loop-countdown.mjs";
 import { normalizeRalphLoopInput } from "./ralph-loop-utils.mjs";
@@ -12,6 +20,8 @@ marked.setOptions({
   gfm: true,
   breaks: true,
 });
+
+let monacoLoadPromise = null;
 
 const state = {
   app: null,
@@ -27,6 +37,7 @@ const state = {
   expandedProjectIds: new Set(),
   currentTurnId: "",
   activeThreadTab: localStorage.getItem("activeThreadTab") || "chat",
+  threadTabByProjectId: {},
   threadActionMenuOpen: false,
   composerMenuOpen: "",
   sidebarCollapsed: localStorage.getItem("sidebarCollapsed") === "true",
@@ -34,7 +45,8 @@ const state = {
   sidebarWidth: Number(localStorage.getItem("sidebarWidth")) || 305,
   composerModel: localStorage.getItem("composerModel") || "",
   composerEffort: localStorage.getItem("composerEffort") || "",
-  composerServiceTier: localStorage.getItem("composerServiceTier") || "flex",
+  composerServiceTier: localStorage.getItem("composerServiceTier") || "",
+  composerCapabilities: { serviceTiers: [], defaultServiceTier: "" },
   composerMode: localStorage.getItem("composerMode") || "default",
   composerApproveAllDangerous: localStorage.getItem("composerApproveAllDangerous") === "true",
   composerRalphLoop: false,
@@ -44,10 +56,13 @@ const state = {
   ralphLoopLastCompletedTurnId: "",
   ralphLoopPendingReplay: null,
   ralphLoopAutoCompactThreadId: "",
+  resourceTabsByProjectId: {},
+  activeResourceIdByProjectId: {},
   terminalSessionByProjectId: {},
   terminalClient: null,
   terminalConnectInFlight: false,
   terminalEmulator: null,
+  resourceEditor: createResourceEditorState(),
   imageEditor: createImageEditorState(),
 };
 
@@ -70,6 +85,15 @@ const elements = {
   threadTerminalClear: document.getElementById("threadTerminalClear"),
   threadTerminalStop: document.getElementById("threadTerminalStop"),
   threadTerminalViewport: document.getElementById("threadTerminalViewport"),
+  threadResourcePane: document.getElementById("threadResourcePane"),
+  threadResourceTitle: document.getElementById("threadResourceTitle"),
+  threadResourceStatus: document.getElementById("threadResourceStatus"),
+  threadResourceOpenRaw: document.getElementById("threadResourceOpenRaw"),
+  threadResourceReload: document.getElementById("threadResourceReload"),
+  threadResourceClose: document.getElementById("threadResourceClose"),
+  threadResourceEmpty: document.getElementById("threadResourceEmpty"),
+  threadResourceEditor: document.getElementById("threadResourceEditor"),
+  threadResourcePreview: document.getElementById("threadResourcePreview"),
   composerForm: document.getElementById("composerForm"),
   autoscrollToggle: document.getElementById("autoscrollToggle"),
   approveAllDangerousToggle: document.getElementById("approveAllDangerousToggle"),
@@ -90,10 +114,6 @@ const elements = {
   imageEditorColor: document.getElementById("imageEditorColor"),
 };
 
-const EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
-const SUMMARIES = ["auto", "concise", "detailed", "none"];
-const PERSONALITIES = ["none", "friendly", "pragmatic"];
-const SANDBOXES = ["read-only", "workspace-write", "danger-full-access"];
 const MIN_SIDEBAR_WIDTH = 240;
 const MAX_SIDEBAR_WIDTH = 560;
 const DEFAULT_VISIBLE_THREADS = 6;
@@ -111,10 +131,12 @@ boot().catch(showFatalError);
 async function boot() {
   applySidebarLayout();
   await loadBoot();
-  if (!["chat", "terminal"].includes(state.activeThreadTab)) {
+  if (!["chat", "terminal", "resource"].includes(state.activeThreadTab)) {
     state.activeThreadTab = "chat";
   }
   setInitialProjectVisibility(state.selectedProjectId);
+  setProjectThreadTab(state.activeThreadTab, state.selectedProjectId);
+  syncSelectedProjectThreadTab();
   normalizeComposerSettings();
   elements.autoscrollToggle.checked = state.autoscroll;
   elements.approveAllDangerousToggle.checked = state.composerApproveAllDangerous;
@@ -128,9 +150,6 @@ async function boot() {
 
   connectEvents();
   void maybeAutoApprovePendingRequests();
-  void loadModels().catch((error) => {
-    console.error("Failed to load models", error);
-  });
   void loadAllProjectThreads().catch((error) => {
     console.error("Failed to load project threads", error);
   });
@@ -162,10 +181,11 @@ async function api(path, options = {}) {
 }
 
 async function loadBoot() {
-  const payload = await api("/api/boot?includeModels=false");
+  const payload = await api("/api/boot");
   state.app = payload.app;
   state.projects = payload.projects;
   state.models = payload.models?.data || [];
+  state.composerCapabilities = payload.models?.capabilities || { serviceTiers: [], defaultServiceTier: "" };
   state.pendingServerRequests = Array.isArray(payload.pendingRequests) ? payload.pendingRequests : [];
   if (!state.selectedProjectId || !state.projects.some((project) => project.id === state.selectedProjectId)) {
     state.selectedProjectId = state.projects[0]?.id || "";
@@ -192,17 +212,10 @@ function ensureProjectVisible(projectId) {
   state.collapsedProjectIds.delete(projectId);
 }
 
-async function loadModels() {
-  const payload = await api("/api/models");
-  state.models = payload.data || [];
-  normalizeComposerSettings();
-  renderComposerControls();
-}
-
 function persistComposerSettings() {
   localStorage.setItem("composerModel", state.composerModel || "");
   localStorage.setItem("composerEffort", state.composerEffort || "");
-  localStorage.setItem("composerServiceTier", state.composerServiceTier || "flex");
+  localStorage.setItem("composerServiceTier", state.composerServiceTier || "");
   localStorage.setItem("composerMode", state.composerMode || "default");
   localStorage.setItem("composerApproveAllDangerous", String(state.composerApproveAllDangerous));
 }
@@ -227,29 +240,22 @@ function fallbackComposerModel() {
     || null;
 }
 
-function supportedEffortsForModel(model) {
-  const efforts = model?.supportedReasoningEfforts?.map((entry) => entry.reasoningEffort).filter(Boolean) || [];
-  return efforts.length ? efforts : EFFORTS.slice();
-}
-
 function normalizeComposerSettings() {
-  const model = currentComposerModel() || fallbackComposerModel();
+  const selection = resolveComposerSelection({
+    models: state.models,
+    requestedModelId: state.composerModel,
+    fallbackModelId: selectedProject()?.defaultModel || "",
+    requestedEffort: state.composerEffort,
+    requestedServiceTier: state.composerServiceTier,
+    capabilities: state.composerCapabilities,
+  });
 
-  if (model) {
-    state.composerModel = model?.id || "";
-
-    const supportedEfforts = supportedEffortsForModel(model);
-    if (!supportedEfforts.includes(state.composerEffort)) {
-      state.composerEffort = model?.defaultReasoningEffort || supportedEfforts[0] || "medium";
-    }
-  }
+  state.composerModel = selection.modelId;
+  state.composerEffort = selection.effort;
+  state.composerServiceTier = selection.serviceTier;
 
   if (!["default", "plan"].includes(state.composerMode)) {
     state.composerMode = "default";
-  }
-
-  if (!["flex", "fast"].includes(state.composerServiceTier)) {
-    state.composerServiceTier = "flex";
   }
 
   persistComposerSettings();
@@ -283,66 +289,97 @@ function formatEffortLabel(effort) {
   return effort;
 }
 
+function formatComposerSettingsLabel(reasoningEffort, serviceTier) {
+  const labels = [];
+
+  if (reasoningEffort) {
+    labels.push(formatEffortLabel(reasoningEffort));
+  }
+
+  if (serviceTier) {
+    labels.push(formatServiceTierLabel(serviceTier));
+  }
+
+  return labels.join(" · ") || "Reasoning";
+}
+
 function renderComposerControls() {
   normalizeComposerSettings();
 
   const model = currentComposerModel();
-  const supportedEfforts = supportedEffortsForModel(model);
+  const reasoningOptions = supportedReasoningEffortsForModel(model);
+  const supportedEfforts = reasoningOptions.map((entry) => entry.reasoningEffort);
+  const supportedServiceTiers = supportedServiceTiersForModel(model, state.composerCapabilities);
+  const hasModelOptions = state.models.length > 0;
+  const hasEffortOptions = supportedEfforts.length > 0 || supportedServiceTiers.length > 0;
   elements.composerModelLabel.textContent = model?.displayName || model?.id || state.composerModel || "Select Model";
-  elements.composerEffortLabel.textContent = formatEffortLabel(state.composerEffort) || "Reasoning";
+  elements.composerEffortLabel.textContent = formatComposerSettingsLabel(state.composerEffort, state.composerServiceTier);
+  elements.composerModelButton.disabled = !hasModelOptions;
+  elements.composerEffortButton.disabled = !hasEffortOptions;
 
-  elements.composerModelMenu.innerHTML = state.models.map((entry) => `
+  elements.composerModelMenu.innerHTML = hasModelOptions
+    ? state.models.map((entry) => `
+      <button
+        type="button"
+        class="composer-picker-item${entry.id === state.composerModel ? " active" : ""}"
+        data-action="select-composer-model"
+        data-value="${escapeHtml(entry.id)}"
+        role="option"
+        aria-selected="${entry.id === state.composerModel ? "true" : "false"}"
+      >
+        <span class="composer-picker-check" aria-hidden="true">${entry.id === state.composerModel ? "✓" : ""}</span>
+        <span class="composer-picker-item-label">${escapeHtml(entry.displayName || entry.id)}</span>
+      </button>
+    `).join("")
+    : '<div class="composer-picker-empty">No models available</div>';
+
+  const reasoningMarkup = reasoningOptions.map((entry) => `
     <button
       type="button"
-      class="composer-picker-item${entry.id === state.composerModel ? " active" : ""}"
-      data-action="select-composer-model"
-      data-value="${escapeHtml(entry.id)}"
+      class="composer-picker-item${entry.reasoningEffort === state.composerEffort ? " active" : ""}"
+      data-action="select-composer-effort"
+      data-value="${escapeHtml(entry.reasoningEffort)}"
       role="option"
-      aria-selected="${entry.id === state.composerModel ? "true" : "false"}"
+      aria-selected="${entry.reasoningEffort === state.composerEffort ? "true" : "false"}"
     >
-      <span class="composer-picker-check" aria-hidden="true">${entry.id === state.composerModel ? "✓" : ""}</span>
-      <span class="composer-picker-item-label">${escapeHtml(entry.displayName || entry.id)}</span>
+      <span class="composer-picker-check" aria-hidden="true">${entry.reasoningEffort === state.composerEffort ? "✓" : ""}</span>
+      <span class="composer-picker-item-label">${escapeHtml(formatEffortLabel(entry.reasoningEffort))}${entry.reasoningEffort === model?.defaultReasoningEffort ? " (default)" : ""}</span>
     </button>
   `).join("");
+  const serviceTierMarkup = supportedServiceTiers.length > 0
+    ? `
+      ${reasoningMarkup ? '<div class="composer-picker-divider" aria-hidden="true"></div>' : ""}
+      <div class="composer-picker-section">Service Tier</div>
+      <button
+        type="button"
+        class="composer-picker-item${!state.composerServiceTier ? " active" : ""}"
+        data-action="select-composer-service-tier"
+        data-value=""
+        role="option"
+        aria-selected="${!state.composerServiceTier ? "true" : "false"}"
+      >
+        <span class="composer-picker-check" aria-hidden="true">${!state.composerServiceTier ? "✓" : ""}</span>
+        <span class="composer-picker-item-label">Auto</span>
+      </button>
+      ${supportedServiceTiers.map((serviceTier) => `
+        <button
+          type="button"
+          class="composer-picker-item${serviceTier === state.composerServiceTier ? " active" : ""}"
+          data-action="select-composer-service-tier"
+          data-value="${escapeHtml(serviceTier)}"
+          role="option"
+          aria-selected="${serviceTier === state.composerServiceTier ? "true" : "false"}"
+        >
+          <span class="composer-picker-check" aria-hidden="true">${serviceTier === state.composerServiceTier ? "✓" : ""}</span>
+          <span class="composer-picker-item-label">${escapeHtml(formatServiceTierLabel(serviceTier))}</span>
+        </button>
+      `).join("")}
+    `
+    : "";
 
-  elements.composerEffortMenu.innerHTML = supportedEfforts.map((effort) => `
-    <button
-      type="button"
-      class="composer-picker-item${effort === state.composerEffort ? " active" : ""}"
-      data-action="select-composer-effort"
-      data-value="${escapeHtml(effort)}"
-      role="option"
-      aria-selected="${effort === state.composerEffort ? "true" : "false"}"
-    >
-      <span class="composer-picker-check" aria-hidden="true">${effort === state.composerEffort ? "✓" : ""}</span>
-      <span class="composer-picker-item-label">${escapeHtml(formatEffortLabel(effort))}${effort === model?.defaultReasoningEffort ? " (default)" : ""}</span>
-    </button>
-  `).join("") + `
-    <div class="composer-picker-divider" aria-hidden="true"></div>
-    <div class="composer-picker-section">Fast Mode</div>
-    <button
-      type="button"
-      class="composer-picker-item${state.composerServiceTier !== "fast" ? " active" : ""}"
-      data-action="select-composer-fast-mode"
-      data-value="off"
-      role="option"
-      aria-selected="${state.composerServiceTier !== "fast" ? "true" : "false"}"
-    >
-      <span class="composer-picker-check" aria-hidden="true">${state.composerServiceTier !== "fast" ? "✓" : ""}</span>
-      <span class="composer-picker-item-label">off</span>
-    </button>
-    <button
-      type="button"
-      class="composer-picker-item${state.composerServiceTier === "fast" ? " active" : ""}"
-      data-action="select-composer-fast-mode"
-      data-value="on"
-      role="option"
-      aria-selected="${state.composerServiceTier === "fast" ? "true" : "false"}"
-    >
-      <span class="composer-picker-check" aria-hidden="true">${state.composerServiceTier === "fast" ? "✓" : ""}</span>
-      <span class="composer-picker-item-label">on</span>
-    </button>
-  `;
+  elements.composerEffortMenu.innerHTML = reasoningMarkup || serviceTierMarkup
+    ? `${reasoningMarkup}${serviceTierMarkup}`
+    : '<div class="composer-picker-empty">No settings available for this model</div>';
 
   const modelMenuOpen = state.composerMenuOpen === "model";
   const effortMenuOpen = state.composerMenuOpen === "effort";
@@ -1460,6 +1497,197 @@ function optionHtml(value, label) {
   return `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`;
 }
 
+function createResourceEditorState() {
+  return {
+    monaco: null,
+    editor: null,
+    editorPromise: null,
+  };
+}
+
+function createResourceTab(pathname, position = {}) {
+  return {
+    id: createAttachmentId(),
+    projectId: cleanString(position.projectId),
+    path: pathname,
+    name: fileNameFromPath(pathname),
+    kind: "loading",
+    mimeType: "",
+    size: 0,
+    mtimeMs: 0,
+    writable: false,
+    viewUrl: "",
+    loading: true,
+    error: "",
+    saveState: "idle",
+    saveTimer: 0,
+    saveInFlight: false,
+    saveQueued: false,
+    pendingSelection: normalizeResourceSelection(position),
+    model: null,
+    viewState: null,
+    suppressModelChange: false,
+  };
+}
+
+function normalizeResourceSelection(position = {}) {
+  const line = Number(position.line) || 0;
+  const column = Number(position.column) || 0;
+  return line > 0 || column > 0
+    ? { line: Math.max(1, line || 1), column: Math.max(1, column || 1) }
+    : null;
+}
+
+function ensureProjectResourceState(projectId = state.selectedProjectId) {
+  const normalizedProjectId = cleanString(projectId);
+
+  if (!normalizedProjectId) {
+    return { resources: [], activeResourceId: "" };
+  }
+
+  if (!Array.isArray(state.resourceTabsByProjectId[normalizedProjectId])) {
+    state.resourceTabsByProjectId[normalizedProjectId] = [];
+  }
+
+  if (typeof state.activeResourceIdByProjectId[normalizedProjectId] !== "string") {
+    state.activeResourceIdByProjectId[normalizedProjectId] = "";
+  }
+
+  return {
+    resources: state.resourceTabsByProjectId[normalizedProjectId],
+    activeResourceId: state.activeResourceIdByProjectId[normalizedProjectId],
+  };
+}
+
+function projectResources(projectId = state.selectedProjectId) {
+  return ensureProjectResourceState(projectId).resources;
+}
+
+function projectActiveResourceId(projectId = state.selectedProjectId) {
+  return ensureProjectResourceState(projectId).activeResourceId;
+}
+
+function setProjectActiveResource(projectId, resourceId = "") {
+  const normalizedProjectId = cleanString(projectId);
+
+  if (!normalizedProjectId) {
+    return;
+  }
+
+  ensureProjectResourceState(normalizedProjectId);
+  state.activeResourceIdByProjectId[normalizedProjectId] = cleanString(resourceId);
+}
+
+function normalizeThreadTab(tab) {
+  return ["chat", "terminal", "resource"].includes(tab) ? tab : "chat";
+}
+
+function projectThreadTab(projectId = state.selectedProjectId) {
+  const normalizedProjectId = cleanString(projectId);
+  return normalizeThreadTab(state.threadTabByProjectId[normalizedProjectId] || "chat");
+}
+
+function setProjectThreadTab(tab, projectId = state.selectedProjectId) {
+  const normalizedProjectId = cleanString(projectId);
+  const nextTab = normalizeThreadTab(tab);
+
+  if (normalizedProjectId) {
+    state.threadTabByProjectId[normalizedProjectId] = nextTab;
+  }
+
+  state.activeThreadTab = nextTab;
+}
+
+function syncSelectedProjectThreadTab() {
+  const projectId = cleanString(state.selectedProjectId);
+  state.activeThreadTab = projectId ? projectThreadTab(projectId) : normalizeThreadTab(state.activeThreadTab);
+  normalizeSelectedProjectResourceTab();
+}
+
+function normalizeSelectedProjectResourceTab() {
+  const projectId = cleanString(state.selectedProjectId);
+  const resources = projectResources(projectId);
+  const activeResourceId = projectActiveResourceId(projectId);
+  const hasActiveResource = resources.some((resource) => resource.id === activeResourceId);
+
+  if (!hasActiveResource) {
+    setProjectActiveResource(projectId, resources[0]?.id || "");
+  }
+
+  if (state.activeThreadTab === "resource" && !activeResource(projectId)) {
+    setProjectThreadTab("chat", projectId);
+  }
+}
+
+function allProjectResources() {
+  return Object.values(state.resourceTabsByProjectId).flatMap((resources) => Array.isArray(resources) ? resources : []);
+}
+
+function activeResource(projectId = state.selectedProjectId) {
+  const activeId = projectActiveResourceId(projectId);
+  return projectResources(projectId).find((resource) => resource.id === activeId) || null;
+}
+
+function findResource(resourceId) {
+  return allProjectResources().find((resource) => resource.id === resourceId) || null;
+}
+
+function findResourceByModel(model) {
+  return allProjectResources().find((resource) => resource.model === model) || null;
+}
+
+function fileNameFromPath(pathname) {
+  const value = String(pathname || "").replace(/[\\/]+$/g, "");
+  return value.split(/[\\/]/).filter(Boolean).at(-1) || value || "file";
+}
+
+function renderThreadTabs() {
+  const resources = projectResources();
+  const activeResourceId = projectActiveResourceId();
+
+  return `
+    <div class="thread-tabbar" role="tablist" aria-label="Thread view">
+      <button
+        class="thread-tab ${state.activeThreadTab === "chat" ? "active" : ""}"
+        data-action="select-thread-tab"
+        data-tab="chat"
+        role="tab"
+        aria-selected="${state.activeThreadTab === "chat" ? "true" : "false"}"
+      >Chat</button>
+      <button
+        class="thread-tab ${state.activeThreadTab === "terminal" ? "active" : ""}"
+        data-action="select-thread-tab"
+        data-tab="terminal"
+        role="tab"
+        aria-selected="${state.activeThreadTab === "terminal" ? "true" : "false"}"
+      >Terminal</button>
+      ${resources.map((resource) => {
+        const active = state.activeThreadTab === "resource" && activeResourceId === resource.id;
+        return `
+          <span class="thread-resource-tab ${active ? "active" : ""}">
+            <button
+              class="thread-tab thread-resource-tab-button ${active ? "active" : ""}"
+              data-action="select-resource-tab"
+              data-id="${escapeHtml(resource.id)}"
+              role="tab"
+              aria-selected="${active ? "true" : "false"}"
+              title="${escapeHtml(resource.path)}"
+            >${escapeHtml(resource.name)}</button>
+            <button
+              type="button"
+              class="thread-resource-tab-close"
+              data-action="close-resource-tab"
+              data-id="${escapeHtml(resource.id)}"
+              aria-label="${escapeHtml(`Close ${resource.name}`)}"
+              title="${escapeHtml(`Close ${resource.name}`)}"
+            >×</button>
+          </span>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
 function renderThreadActionMenu() {
   const menuExpanded = state.threadActionMenuOpen ? "true" : "false";
   const menuItem = (action, label, icon, extraClass = "") => `
@@ -1599,15 +1827,14 @@ function renderProjects() {
           >
             <span class="project-name">${escapeHtml(projectName)}</span>
           </button>
-          ${project.id === state.selectedProjectId ? `
-            <button
-              type="button"
-              class="project-row-new-thread"
-              data-action="new-thread"
-              aria-label="New thread"
-              title="New Thread"
-            >+</button>
-          ` : ""}
+          <button
+            type="button"
+            class="project-row-new-thread"
+            data-action="new-thread"
+            data-project-id="${escapeHtml(project.id)}"
+            aria-label="${escapeHtml(`New thread in ${projectName}`)}"
+            title="${escapeHtml(`New Thread in ${projectName}`)}"
+          >+</button>
         </div>
         <div id="${escapeHtml(projectStackId)}" class="conversation-stack${projectCollapsed ? " hidden" : ""}">
           ${conversationsHtml}
@@ -1637,44 +1864,36 @@ function collapsedVisibleThreadCount(threads) {
 }
 
 function renderThreadHeader() {
+  normalizeSelectedProjectResourceTab();
+
   const thread = state.selectedThread;
   const project = selectedProject();
+  const compactHeaderOnly = state.activeThreadTab === "resource" || state.activeThreadTab === "terminal";
   const projectName = project ? projectDisplayName(project) : "";
   const emptyStateSubtitle = isSelectedThreadLoading()
     ? "Loading conversation..."
     : state.activeThreadTab === "terminal"
     ? "Open a shell in the selected project on the host."
+    : state.activeThreadTab === "resource"
+    ? "Open a file link in the conversation to inspect it here."
     : "Start a new conversation below. The first prompt creates the thread.";
 
   if (!thread) {
     elements.threadHeader.innerHTML = `
       <div class="thread-toolbar-controls">
         <div class="thread-toolbar-top">
-          <div class="thread-tabbar" role="tablist" aria-label="Thread view">
-            <button
-              class="thread-tab ${state.activeThreadTab === "chat" ? "active" : ""}"
-              data-action="select-thread-tab"
-              data-tab="chat"
-              role="tab"
-              aria-selected="${state.activeThreadTab === "chat" ? "true" : "false"}"
-            >Chat</button>
-            <button
-              class="thread-tab ${state.activeThreadTab === "terminal" ? "active" : ""}"
-              data-action="select-thread-tab"
-              data-tab="terminal"
-              role="tab"
-              aria-selected="${state.activeThreadTab === "terminal" ? "true" : "false"}"
-            >Terminal</button>
-          </div>
+          ${renderThreadTabs()}
           ${renderThreadActionMenu()}
         </div>
       </div>
-      <div class="thread-toolbar">
-        <div class="thread-title-wrap">
-          <h2 class="thread-title" title="${escapeHtml(project?.cwd || projectName || "No project selected")}">${escapeHtml(projectName || "No project selected")}</h2>
-          <p class="meta">${escapeHtml(emptyStateSubtitle)}</p>
+      ${compactHeaderOnly ? "" : `
+        <div class="thread-toolbar">
+          <div class="thread-title-wrap">
+            <h2 class="thread-title" title="${escapeHtml(project?.cwd || projectName || "No project selected")}">${escapeHtml(projectName || "No project selected")}</h2>
+            <p class="meta">${escapeHtml(emptyStateSubtitle)}</p>
+          </div>
         </div>
-      </div>
+      `}
     `;
     return;
   }
@@ -1685,51 +1904,43 @@ function renderThreadHeader() {
   elements.threadHeader.innerHTML = `
     <div class="thread-toolbar-controls">
       <div class="thread-toolbar-top">
-        <div class="thread-tabbar" role="tablist" aria-label="Thread view">
-          <button
-            class="thread-tab ${state.activeThreadTab === "chat" ? "active" : ""}"
-            data-action="select-thread-tab"
-            data-tab="chat"
-            role="tab"
-            aria-selected="${state.activeThreadTab === "chat" ? "true" : "false"}"
-          >Chat</button>
-          <button
-            class="thread-tab ${state.activeThreadTab === "terminal" ? "active" : ""}"
-            data-action="select-thread-tab"
-            data-tab="terminal"
-            role="tab"
-            aria-selected="${state.activeThreadTab === "terminal" ? "true" : "false"}"
-          >Terminal</button>
-        </div>
+        ${renderThreadTabs()}
         ${renderThreadActionMenu()}
       </div>
     </div>
-    <div class="thread-toolbar">
-      <div class="thread-title-wrap">
-        <h2 class="thread-title" title="${escapeHtml(thread.name || thread.preview || "Untitled thread")}">${escapeHtml(thread.name || thread.preview || "Untitled thread")}</h2>
-        <div class="meta thread-meta">
-          <span>${escapeHtml(projectName)}</span>
-          <span>·</span>
-          ${renderActivityBadge(activity.isWorking ? activity.label : threadStatusText, threadStatusText, activity.isWorking ? "live" : "idle")}
-          <span>·</span>
-          <span>${escapeHtml(thread.cwd || "")}</span>
+    ${compactHeaderOnly ? "" : `
+      <div class="thread-toolbar">
+        <div class="thread-title-wrap">
+          <h2 class="thread-title" title="${escapeHtml(thread.name || thread.preview || "Untitled thread")}">${escapeHtml(thread.name || thread.preview || "Untitled thread")}</h2>
+          <div class="meta thread-meta">
+            <span>${escapeHtml(projectName)}</span>
+            <span>·</span>
+            ${renderActivityBadge(activity.isWorking ? activity.label : threadStatusText, threadStatusText, activity.isWorking ? "live" : "idle")}
+            <span>·</span>
+            <span>${escapeHtml(thread.cwd || "")}</span>
+          </div>
         </div>
       </div>
-    </div>
+    `}
   `;
 }
 
 function renderThreadPane() {
+  normalizeSelectedProjectResourceTab();
   syncPendingRalphLoopReplay();
 
   const terminalVisible = state.activeThreadTab === "terminal";
-  const conversationVisible = !terminalVisible;
+  const resourceVisible = state.activeThreadTab === "resource";
+  const conversationVisible = state.activeThreadTab === "chat";
 
   elements.conversation.classList.toggle("hidden", !conversationVisible);
   elements.composerForm.classList.toggle("hidden", !conversationVisible);
   elements.threadTerminal.classList.toggle("hidden", !terminalVisible);
   elements.threadTerminal.setAttribute("aria-hidden", terminalVisible ? "false" : "true");
+  elements.threadResourcePane.classList.toggle("hidden", !resourceVisible);
+  elements.threadResourcePane.setAttribute("aria-hidden", resourceVisible ? "false" : "true");
   renderTerminalPane(terminalVisible);
+  renderResourcePane(resourceVisible);
 }
 
 function scheduleProjectsRender() {
@@ -1748,6 +1959,11 @@ function focusActiveThreadPane(tab = state.activeThreadTab) {
   requestAnimationFrame(() => {
     if (tab === "terminal") {
       state.terminalEmulator?.terminal.focus();
+      return;
+    }
+
+    if (tab === "resource") {
+      void focusActiveResource();
       return;
     }
 
@@ -1801,6 +2017,457 @@ function renderTerminalPane(terminalVisible) {
       ? `signal ${session.signal}`
       : "stopped";
   elements.threadTerminalStatus.textContent = `${session.locationLabel || "host"} · ${exitDetails}`;
+}
+
+function renderResourcePane(resourceVisible) {
+  const resource = activeResource();
+  const hasResource = resourceVisible && resource;
+  const statusText = describeResourceStatus(resource);
+
+  elements.threadResourceOpenRaw.disabled = !hasResource || !resource.viewUrl;
+  elements.threadResourceReload.disabled = !hasResource;
+  elements.threadResourceClose.disabled = !hasResource;
+
+  if (!resource) {
+    elements.threadResourceTitle.textContent = "Open a file link to preview it here.";
+    elements.threadResourceStatus.textContent = "";
+    elements.threadResourceStatus.classList.add("hidden");
+    elements.threadResourceStatus.classList.remove("error");
+    elements.threadResourceEmpty.textContent = "Open a file link in the conversation to view it here.";
+    elements.threadResourceEmpty.classList.remove("hidden");
+    elements.threadResourceEditor.classList.add("hidden");
+    elements.threadResourcePreview.classList.add("hidden");
+    elements.threadResourcePreview.innerHTML = "";
+    state.resourceEditor.editor?.setModel(null);
+    return;
+  }
+
+  elements.threadResourceTitle.textContent = resource.path;
+  elements.threadResourceStatus.textContent = statusText;
+  elements.threadResourceStatus.classList.toggle("hidden", !statusText);
+  elements.threadResourceStatus.classList.toggle(
+    "error",
+    Boolean(resource.error) && (resource.kind === "loading" || resource.saveState === "error"),
+  );
+
+  if (resource.loading && resource.kind === "loading") {
+    elements.threadResourceEmpty.textContent = "Loading file…";
+    elements.threadResourceEmpty.classList.remove("hidden");
+    elements.threadResourceEditor.classList.add("hidden");
+    elements.threadResourcePreview.classList.add("hidden");
+    elements.threadResourcePreview.innerHTML = "";
+    return;
+  }
+
+  if (resource.kind === "loading" && resource.error) {
+    elements.threadResourceEmpty.textContent = resource.error;
+    elements.threadResourceEmpty.classList.remove("hidden");
+    elements.threadResourceEditor.classList.add("hidden");
+    elements.threadResourcePreview.classList.add("hidden");
+    elements.threadResourcePreview.innerHTML = "";
+    return;
+  }
+
+  if (resource.kind === "image") {
+    elements.threadResourceEmpty.classList.add("hidden");
+    elements.threadResourceEditor.classList.add("hidden");
+    elements.threadResourcePreview.classList.remove("hidden");
+    elements.threadResourcePreview.innerHTML = `
+      <img
+        class="thread-resource-preview-image"
+        src="${escapeHtml(resource.viewUrl)}"
+        alt="${escapeHtml(resource.name)}"
+      >
+    `;
+    return;
+  }
+
+  if (resource.kind === "binary") {
+    elements.threadResourceEmpty.classList.add("hidden");
+    elements.threadResourceEditor.classList.add("hidden");
+    elements.threadResourcePreview.classList.remove("hidden");
+    elements.threadResourcePreview.innerHTML = `
+      <div class="thread-resource-binary">
+        <p>This file can’t be edited as text in Monaco.</p>
+        ${resource.viewUrl ? `<a href="${escapeHtml(resource.viewUrl)}" target="_blank" rel="noreferrer">Open the raw file in a new tab</a>` : ""}
+      </div>
+    `;
+    return;
+  }
+
+  elements.threadResourceEmpty.classList.add("hidden");
+  elements.threadResourcePreview.classList.add("hidden");
+  elements.threadResourcePreview.innerHTML = "";
+  elements.threadResourceEditor.classList.remove("hidden");
+  void syncActiveResourceEditor();
+}
+
+function describeResourceStatus(resource) {
+  if (!resource) {
+    return "";
+  }
+
+  if (resource.loading && resource.kind === "loading") {
+    return "Loading file…";
+  }
+
+  if (resource.loading) {
+    return "Reloading from disk…";
+  }
+
+  if (!resource.writable) {
+    return "Read-only text file";
+  }
+
+  if (resource.saveState === "error") {
+    return `Save failed: ${resource.error || "unknown error"}`;
+  }
+
+  return "";
+}
+
+async function openResourceFromFileLink(reference) {
+  if (!reference?.path) {
+    return;
+  }
+
+  const projectId = cleanString(state.selectedProjectId);
+  const resources = projectResources(projectId);
+  let resource = resources.find((entry) => entry.path === reference.path);
+
+  if (!resource) {
+    resource = createResourceTab(reference.path, { ...reference, projectId });
+    resources.push(resource);
+  } else if (reference.line || reference.column) {
+    resource.pendingSelection = normalizeResourceSelection(reference);
+  }
+
+  setProjectThreadTab("resource", projectId);
+  setProjectActiveResource(projectId, resource.id);
+  persistSelection();
+  renderThreadHeader();
+  renderThreadPane();
+
+  if (resource.kind === "loading" || (resource.error && !resource.model && !resource.viewUrl)) {
+    await loadResource(resource.id);
+    return;
+  }
+
+  await focusActiveResource();
+}
+
+async function loadResource(resourceId) {
+  const resource = findResource(resourceId);
+
+  if (!resource) {
+    return;
+  }
+
+  resource.loading = true;
+  if (resource.kind === "loading") {
+    resource.error = "";
+  }
+  renderThreadPane();
+
+  try {
+    const payload = await api(`/api/file?path=${encodeURIComponent(resource.path)}`);
+    const data = payload.data || {};
+
+    resource.name = data.name || resource.name;
+    resource.kind = data.kind || "binary";
+    resource.mimeType = data.mimeType || "";
+    resource.size = Number(data.size) || 0;
+    resource.mtimeMs = Number(data.mtimeMs) || 0;
+    resource.writable = data.writable === true;
+    resource.viewUrl = data.viewUrl || "";
+    resource.loading = false;
+    resource.error = "";
+
+    if (resource.kind === "text") {
+      await upsertResourceModel(resource, data.text ?? "");
+    } else if (resource.model) {
+      resource.model.dispose();
+      resource.model = null;
+    }
+
+    renderThreadHeader();
+    renderThreadPane();
+    await focusActiveResource();
+  } catch (error) {
+    resource.loading = false;
+    resource.error = error.message;
+    renderThreadPane();
+  }
+}
+
+async function upsertResourceModel(resource, text) {
+  const monaco = await ensureMonaco();
+  const uri = monaco.Uri.file(resource.path);
+  const existingModel = resource.model || monaco.editor.getModel(uri);
+
+  if (!existingModel) {
+    resource.model = monaco.editor.createModel(String(text || ""), undefined, uri);
+  } else {
+    resource.suppressModelChange = true;
+    existingModel.setValue(String(text || ""));
+    resource.suppressModelChange = false;
+    resource.model = existingModel;
+  }
+
+  resource.saveState = "idle";
+}
+
+async function focusActiveResource() {
+  const resource = activeResource();
+
+  if (!resource || state.activeThreadTab !== "resource") {
+    return;
+  }
+
+  if (resource.kind === "text") {
+    await syncActiveResourceEditor();
+    state.resourceEditor.editor?.focus();
+    return;
+  }
+
+  elements.threadResourcePane.focus?.();
+}
+
+async function syncActiveResourceEditor() {
+  const resource = activeResource();
+
+  if (!resource || state.activeThreadTab !== "resource" || resource.kind !== "text" || !resource.model) {
+    return;
+  }
+
+  const editor = await ensureResourceEditor();
+  const previousModel = editor.getModel();
+  const previousResource = findResourceByModel(previousModel);
+
+  if (previousResource && previousResource !== resource) {
+    previousResource.viewState = editor.saveViewState();
+  }
+
+  if (previousModel !== resource.model) {
+    editor.setModel(resource.model);
+    if (resource.viewState) {
+      editor.restoreViewState(resource.viewState);
+    }
+  }
+
+  editor.updateOptions({ readOnly: !resource.writable });
+  applyPendingResourceSelection(resource, editor);
+  editor.layout();
+}
+
+function applyPendingResourceSelection(resource, editor) {
+  if (!resource?.pendingSelection || !resource.model) {
+    return;
+  }
+
+  const lineNumber = clamp(resource.pendingSelection.line || 1, 1, resource.model.getLineCount());
+  const column = clamp(resource.pendingSelection.column || 1, 1, resource.model.getLineMaxColumn(lineNumber));
+  const position = { lineNumber, column };
+
+  editor.setPosition(position);
+  editor.revealPositionInCenter(position);
+  resource.pendingSelection = null;
+}
+
+async function ensureMonaco() {
+  if (state.resourceEditor.monaco) {
+    return state.resourceEditor.monaco;
+  }
+
+  if (!monacoLoadPromise) {
+    monacoLoadPromise = Promise.all([
+      import("monaco-editor"),
+      import("monaco-editor/esm/vs/editor/editor.worker?worker"),
+      import("monaco-editor/esm/vs/language/json/json.worker?worker"),
+      import("monaco-editor/esm/vs/language/css/css.worker?worker"),
+      import("monaco-editor/esm/vs/language/html/html.worker?worker"),
+      import("monaco-editor/esm/vs/language/typescript/ts.worker?worker"),
+    ]).then(([
+      monaco,
+      editorWorkerModule,
+      jsonWorkerModule,
+      cssWorkerModule,
+      htmlWorkerModule,
+      tsWorkerModule,
+    ]) => {
+      const editorWorker = editorWorkerModule.default || editorWorkerModule;
+      const jsonWorker = jsonWorkerModule.default || jsonWorkerModule;
+      const cssWorker = cssWorkerModule.default || cssWorkerModule;
+      const htmlWorker = htmlWorkerModule.default || htmlWorkerModule;
+      const tsWorker = tsWorkerModule.default || tsWorkerModule;
+
+      globalThis.MonacoEnvironment = {
+        getWorker(_workerId, label) {
+          if (label === "json") {
+            return new jsonWorker();
+          }
+
+          if (label === "css" || label === "scss" || label === "less") {
+            return new cssWorker();
+          }
+
+          if (label === "html" || label === "handlebars" || label === "razor") {
+            return new htmlWorker();
+          }
+
+          if (label === "typescript" || label === "javascript") {
+            return new tsWorker();
+          }
+
+          return new editorWorker();
+        },
+      };
+
+      state.resourceEditor.monaco = monaco;
+      return monaco;
+    });
+  }
+
+  return monacoLoadPromise;
+}
+
+async function ensureResourceEditor() {
+  if (state.resourceEditor.editor) {
+    return state.resourceEditor.editor;
+  }
+
+  if (!state.resourceEditor.editorPromise) {
+    state.resourceEditor.editorPromise = (async () => {
+      const monaco = await ensureMonaco();
+      const editor = monaco.editor.create(elements.threadResourceEditor, {
+        automaticLayout: true,
+        fontFamily: "\"SFMono-Regular\", Menlo, Consolas, monospace",
+        fontSize: 13,
+        lineNumbersMinChars: 4,
+        minimap: { enabled: false },
+        readOnly: true,
+        scrollBeyondLastLine: false,
+        theme: "vs-dark",
+      });
+
+      editor.onDidChangeModelContent(() => {
+        const model = editor.getModel();
+        const resource = findResourceByModel(model);
+
+        if (!resource || resource.suppressModelChange || !resource.writable) {
+          return;
+        }
+
+        scheduleResourceSave(resource);
+      });
+
+      state.resourceEditor.editor = editor;
+      return editor;
+    })().finally(() => {
+      state.resourceEditor.editorPromise = null;
+    });
+  }
+
+  return state.resourceEditor.editorPromise;
+}
+
+function scheduleResourceSave(resource) {
+  if (!resource?.model || !resource.writable) {
+    return;
+  }
+
+  clearTimeout(resource.saveTimer);
+  resource.saveState = "dirty";
+  renderResourcePane(state.activeThreadTab === "resource");
+  resource.saveTimer = window.setTimeout(() => {
+    void flushResourceSave(resource.id);
+  }, 250);
+}
+
+async function flushResourceSave(resourceId) {
+  const resource = findResource(resourceId);
+
+  if (!resource?.model || !resource.writable) {
+    return;
+  }
+
+  clearTimeout(resource.saveTimer);
+  resource.saveTimer = 0;
+
+  if (resource.saveInFlight) {
+    resource.saveQueued = true;
+    return;
+  }
+
+  resource.saveInFlight = true;
+  resource.saveState = "saving";
+  resource.error = "";
+  renderResourcePane(state.activeThreadTab === "resource");
+
+  try {
+    const payload = await api("/api/file", {
+      method: "PUT",
+      body: {
+        path: resource.path,
+        text: resource.model.getValue(),
+        expectedMtimeMs: resource.mtimeMs,
+      },
+    });
+
+    resource.mtimeMs = Number(payload.data?.mtimeMs) || resource.mtimeMs;
+    resource.size = Number(payload.data?.size) || resource.size;
+    resource.saveState = "saved";
+  } catch (error) {
+    resource.saveState = "error";
+    resource.error = error.message;
+  } finally {
+    resource.saveInFlight = false;
+    renderResourcePane(state.activeThreadTab === "resource");
+  }
+
+  if (resource.saveQueued) {
+    resource.saveQueued = false;
+    void flushResourceSave(resourceId);
+  }
+}
+
+function closeResourceTab(resourceId) {
+  const resource = findResource(resourceId);
+
+  if (!resource) {
+    return;
+  }
+
+  const resources = projectResources(resource.projectId);
+  const index = resources.findIndex((entry) => entry.id === resourceId);
+
+  if (index < 0) {
+    return;
+  }
+
+  resources.splice(index, 1);
+  clearTimeout(resource.saveTimer);
+  if (state.resourceEditor.editor?.getModel() === resource.model) {
+    state.resourceEditor.editor.setModel(null);
+  }
+  resource.model?.dispose();
+
+  if (projectActiveResourceId(resource.projectId) === resourceId) {
+    const nextActive = resources[index] || resources[index - 1] || null;
+    setProjectActiveResource(resource.projectId, nextActive?.id || "");
+  }
+
+  if (cleanString(resource.projectId) === cleanString(state.selectedProjectId)) {
+    normalizeSelectedProjectResourceTab();
+  }
+
+  if (projectThreadTab(resource.projectId) === "resource" && !activeResource(resource.projectId)) {
+    setProjectThreadTab("chat", resource.projectId);
+  }
+
+  persistSelection();
+  renderThreadHeader();
+  renderThreadPane();
 }
 
 function renderConversation() {
@@ -2376,6 +3043,27 @@ function connectEvents() {
     void stopProjectTerminal();
   });
 
+  elements.threadResourceOpenRaw.addEventListener("click", () => {
+    const resource = activeResource();
+    if (resource?.viewUrl) {
+      window.open(resource.viewUrl, "_blank", "noopener,noreferrer");
+    }
+  });
+
+  elements.threadResourceReload.addEventListener("click", () => {
+    const resource = activeResource();
+    if (resource?.id) {
+      void loadResource(resource.id);
+    }
+  });
+
+  elements.threadResourceClose.addEventListener("click", () => {
+    const resource = activeResource();
+    if (resource?.id) {
+      closeResourceTab(resource.id);
+    }
+  });
+
   terminalResizeObserver = new ResizeObserver(() => {
     scheduleTerminalFit();
   });
@@ -2894,6 +3582,17 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
+  const anchor = event.target.closest(".message-body a[href]");
+  if (anchor instanceof HTMLAnchorElement) {
+    const fileReference = parseLocalFileLinkHref(anchor.getAttribute("href"));
+
+    if (fileReference) {
+      event.preventDefault();
+      await openResourceFromFileLink(fileReference);
+      return;
+    }
+  }
+
   if (state.threadActionMenuOpen && !event.target.closest(".thread-action-menu")) {
     state.threadActionMenuOpen = false;
     renderThreadHeader();
@@ -2950,15 +3649,15 @@ document.addEventListener("click", async (event) => {
     if (action === "select-composer-effort") {
       state.composerEffort = button.dataset.value || "";
       state.composerMenuOpen = "";
-      persistComposerSettings();
+      normalizeComposerSettings();
       renderComposerControls();
       return;
     }
 
-    if (action === "select-composer-fast-mode") {
-      state.composerServiceTier = button.dataset.value === "on" ? "fast" : "flex";
+    if (action === "select-composer-service-tier") {
+      state.composerServiceTier = button.dataset.value || "";
       state.composerMenuOpen = "";
-      persistComposerSettings();
+      normalizeComposerSettings();
       renderComposerControls();
       return;
     }
@@ -3007,6 +3706,7 @@ document.addEventListener("click", async (event) => {
         state.selectedProjectId = state.projects[0]?.id || "";
       }
       ensureProjectVisible(state.selectedProjectId);
+      syncSelectedProjectThreadTab();
       await loadAllProjectThreads();
       renderProjects();
       return;
@@ -3017,6 +3717,7 @@ document.addEventListener("click", async (event) => {
       state.selectedThreadId = "";
       state.selectedThread = null;
       state.threadActionMenuOpen = false;
+      syncSelectedProjectThreadTab();
       await disconnectTerminalClient();
       persistSelection();
       renderProjects();
@@ -3060,7 +3761,7 @@ document.addEventListener("click", async (event) => {
 
     if (action === "select-thread-tab") {
       const nextTab = button.dataset.tab === "terminal" ? "terminal" : "chat";
-      state.activeThreadTab = nextTab;
+      setProjectThreadTab(nextTab);
       state.threadActionMenuOpen = false;
       persistSelection();
       renderThreadHeader();
@@ -3069,6 +3770,32 @@ document.addEventListener("click", async (event) => {
       if (nextTab === "terminal") {
         await ensureProjectTerminal();
       }
+      return;
+    }
+
+    if (action === "select-resource-tab") {
+      const resourceId = button.dataset.id || "";
+      const resource = findResource(resourceId);
+      if (!resource) {
+        return;
+      }
+
+      if (cleanString(resource.projectId) !== cleanString(state.selectedProjectId)) {
+        state.selectedProjectId = resource.projectId;
+      }
+      setProjectActiveResource(resource.projectId, resourceId);
+      setProjectThreadTab("resource", resource.projectId);
+      syncSelectedProjectThreadTab();
+      state.threadActionMenuOpen = false;
+      persistSelection();
+      renderThreadHeader();
+      renderThreadPane();
+      focusActiveThreadPane("resource");
+      return;
+    }
+
+    if (action === "close-resource-tab") {
+      closeResourceTab(button.dataset.id || "");
       return;
     }
 
@@ -3081,14 +3808,41 @@ document.addEventListener("click", async (event) => {
     }
 
     if (action === "new-thread") {
+      const projectId = button.dataset.projectId || state.selectedProjectId;
+      const projectChanged = Boolean(projectId) && projectId !== state.selectedProjectId;
+
+      if (projectId) {
+        state.selectedProjectId = projectId;
+      }
+
       state.selectedThreadId = "";
       state.selectedThread = null;
       state.currentTurnId = "";
       state.threadActionMenuOpen = false;
+      syncSelectedProjectThreadTab();
+
+      if (projectChanged) {
+        await disconnectTerminalClient();
+      }
+
+      state.threads = state.projectThreads[state.selectedProjectId] || [];
       persistSelection();
+      renderProjects();
       renderThreadHeader();
       renderConversation();
+      renderComposerControls();
       renderThreadPane();
+
+      if (projectChanged && state.activeThreadTab === "terminal" && selectedProject()) {
+        await ensureProjectTerminal();
+      }
+
+      if (projectId && !Object.prototype.hasOwnProperty.call(state.projectThreads, projectId)) {
+        void loadProjectThreads(projectId).catch((error) => {
+          console.error(`Failed to load threads for project ${projectId}`, error);
+        });
+      }
+
       return;
     }
 
@@ -3103,6 +3857,7 @@ document.addEventListener("click", async (event) => {
       if (projectId && projectId !== state.selectedProjectId) {
         state.selectedProjectId = projectId;
         ensureProjectVisible(projectId);
+        syncSelectedProjectThreadTab();
         void disconnectTerminalClient();
         if (!state.projectThreads[projectId]) {
           void loadProjectThreads(projectId).catch((error) => {
@@ -4046,6 +4801,10 @@ function relativeTime(unixSeconds) {
 
 function oneLine(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function cleanString(value) {
+  return typeof value === "string" ? value.trim() : "";
 }
 
 function latestTurn(thread) {

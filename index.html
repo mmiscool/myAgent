@@ -74,6 +74,24 @@
               <div id="threadTerminalViewport" class="thread-terminal-viewport" aria-label="Project terminal"></div>
             </div>
           </section>
+          <section id="threadResourcePane" class="thread-resource hidden" aria-hidden="true">
+            <div class="thread-resource-bar">
+              <div class="thread-resource-meta">
+                <div id="threadResourceTitle" class="thread-resource-title">Open a file link to preview it here.</div>
+                <div id="threadResourceStatus" class="thread-resource-status">Text files open in Monaco and save as you type. Images render inline.</div>
+              </div>
+              <div class="thread-resource-actions">
+                <button id="threadResourceOpenRaw" type="button" class="ghost-button">Open Raw</button>
+                <button id="threadResourceReload" type="button" class="ghost-button">Reload</button>
+                <button id="threadResourceClose" type="button" class="ghost-button">Close Tab</button>
+              </div>
+            </div>
+            <div class="thread-resource-surface">
+              <div id="threadResourceEmpty" class="thread-resource-empty">Open a file link in the conversation to view it here.</div>
+              <div id="threadResourceEditor" class="thread-resource-editor hidden" aria-label="File editor"></div>
+              <div id="threadResourcePreview" class="thread-resource-preview hidden"></div>
+            </div>
+          </section>
           <form id="composerForm" class="composer">
             <div id="composerAttachments" class="composer-attachments hidden"></div>
             <textarea id="promptInput" name="text" rows="5" placeholder="Ask Codex to inspect, edit, review, search, run commands, or delegate inside the selected project."></textarea>

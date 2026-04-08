@@ -8,6 +8,13 @@ const { spawn } = require("child_process");
 const { WebSocketServer } = require("ws");
 const { TerminalManager } = require("./terminal-manager");
 const { ServerRequestTracker } = require("./server-request-tracker");
+const {
+  canWriteFile,
+  guessMimeType,
+  isBinaryBuffer,
+  isImageFilePath,
+  isPathInsideRoot,
+} = require("./file-resource-utils");
 const { dedupeProjectsByPath, projectPathKey } = require("./project-store-utils");
 const { createThreadActionHelpers } = require("./thread-action-utils");
 
@@ -45,6 +52,7 @@ const THREAD_SOURCE_KINDS = [
 const eventSocketClients = new Set();
 const terminalSocketClientsByProjectId = new Map();
 const terminalManager = new TerminalManager();
+let modelCapabilitiesModulePromise = null;
 
 function formatBridgePayload(value) {
   try {
@@ -124,6 +132,14 @@ function logTurnStart(params) {
 
   lines.push(...summarizeTurnInput(params?.input));
   writeConsoleSection("User Message", lines);
+}
+
+function loadModelCapabilitiesModule() {
+  if (!modelCapabilitiesModulePromise) {
+    modelCapabilitiesModulePromise = import("./src/model-capabilities.mjs");
+  }
+
+  return modelCapabilitiesModulePromise;
 }
 class CodexBridge extends EventEmitter {
   constructor() {
@@ -615,9 +631,11 @@ function buildSandboxPolicy(project, overrides = {}) {
   };
 }
 
-function buildThreadConfig(project, overrides = {}) {
+function buildThreadConfig(project, overrides = {}, selection = {}) {
+  const modelId = cleanString(selection.modelId) || cleanString(project.defaultModel);
+
   return compactObject({
-    model: cleanString(overrides.model) || cleanString(project.defaultModel) || undefined,
+    model: modelId || undefined,
     cwd: project.cwd,
     approvalPolicy: pickApprovalPolicy(overrides.approvalPolicy, project.approvalPolicy),
     sandbox: pickEnum(overrides.sandboxMode || project.sandboxMode, ["read-only", "workspace-write", "danger-full-access"], project.sandboxMode),
@@ -625,46 +643,55 @@ function buildThreadConfig(project, overrides = {}) {
   });
 }
 
-function buildTurnConfig(project, overrides = {}) {
+function buildTurnConfig(project, overrides = {}, selection = {}) {
+  const modelId = cleanString(selection.modelId) || cleanString(project.defaultModel);
+
   return compactObject({
     cwd: project.cwd,
     approvalPolicy: pickApprovalPolicy(overrides.approvalPolicy, project.approvalPolicy),
     sandboxPolicy: buildSandboxPolicy(project, overrides),
-    model: cleanString(overrides.model) || cleanString(project.defaultModel) || undefined,
-    effort: pickEnum(overrides.effort || project.defaultEffort, ["none", "minimal", "low", "medium", "high", "xhigh"], project.defaultEffort),
-    serviceTier: pickEnum(overrides.serviceTier, ["flex", "fast"], undefined),
-    collaborationMode: normalizeCollaborationMode(overrides),
+    model: modelId || undefined,
+    effort: cleanString(selection.effort) || undefined,
+    serviceTier: cleanString(selection.serviceTier) || undefined,
+    collaborationMode: normalizeCollaborationMode(overrides, { ...selection, modelId }),
     summary: pickEnum(overrides.summary || project.defaultSummary, ["auto", "concise", "detailed", "none"], project.defaultSummary),
     personality: pickEnum(overrides.personality || project.defaultPersonality, ["none", "friendly", "pragmatic"], project.defaultPersonality),
   });
 }
 
-function normalizeCollaborationMode(overrides = {}) {
+function normalizeCollaborationMode(overrides = {}, selection = {}) {
   const mode = cleanString(overrides?.collaborationMode?.mode);
   if (!["default", "plan"].includes(mode)) {
     return undefined;
   }
 
-  const settings = overrides?.collaborationMode?.settings && typeof overrides.collaborationMode.settings === "object"
-    ? overrides.collaborationMode.settings
-    : {};
-  const model = cleanString(settings.model) || cleanString(overrides.model);
-
-  if (!model) {
+  if (!cleanString(selection.modelId)) {
     return undefined;
   }
 
   return {
     mode,
     settings: compactObject({
-      model,
-      reasoning_effort: pickEnum(
-        settings.reasoning_effort || overrides.effort,
-        ["none", "minimal", "low", "medium", "high", "xhigh"],
-        undefined,
-      ),
+      model: cleanString(selection.modelId),
+      reasoning_effort: cleanString(selection.effort) || undefined,
     }),
   };
+}
+
+async function resolveComposerSelection(project, overrides = {}) {
+  const [models, modelCapabilities] = await Promise.all([
+    getModels(),
+    loadModelCapabilitiesModule(),
+  ]);
+
+  return modelCapabilities.resolveComposerSelection({
+    models: models.data || [],
+    requestedModelId: cleanString(overrides.model),
+    fallbackModelId: cleanString(project.defaultModel),
+    requestedEffort: cleanString(overrides.effort) || cleanString(project.defaultEffort),
+    requestedServiceTier: cleanString(overrides.serviceTier),
+    capabilities: models.capabilities || { serviceTiers: [], defaultServiceTier: "" },
+  });
 }
 
 function normalizeImageInput(image) {
@@ -757,12 +784,39 @@ async function getAccountState() {
   }
 }
 
+async function getConfigState() {
+  try {
+    return { ok: true, data: await bridge.request("config/read", {}) };
+  } catch (error) {
+    return { ok: false, error: error.message, data: null };
+  }
+}
+
 async function getModels() {
   try {
-    const result = await bridge.request("model/list", { includeHidden: false });
-    return { ok: true, data: result.data || result.models || [] };
+    const [result, configState, modelCapabilities] = await Promise.all([
+      bridge.request("model/list", { includeHidden: false }),
+      getConfigState(),
+      loadModelCapabilitiesModule(),
+    ]);
+    const data = result.data || result.models || [];
+    const defaultServiceTier = cleanString(configState.data?.config?.service_tier);
+
+    return {
+      ok: true,
+      data,
+      capabilities: {
+        defaultServiceTier,
+        serviceTiers: modelCapabilities.collectSupportedServiceTiers(data, { defaultServiceTier }),
+      },
+    };
   } catch (error) {
-    return { ok: false, error: error.message, data: [] };
+    return {
+      ok: false,
+      error: error.message,
+      data: [],
+      capabilities: { defaultServiceTier: "", serviceTiers: [] },
+    };
   }
 }
 
@@ -859,6 +913,94 @@ function sendError(response, statusCode, error) {
     ok: false,
     error: error instanceof Error ? error.message : String(error),
   });
+}
+
+function createHttpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function buildInlineFileUrl(filePath, version) {
+  const url = new URL("/api/file/content", "http://localhost");
+  url.searchParams.set("path", filePath);
+  if (version) {
+    url.searchParams.set("v", String(version));
+  }
+  return `${url.pathname}${url.search}`;
+}
+
+async function listAllowedFileRoots() {
+  const projects = await listProjects();
+  return Array.from(new Set(projects.map((project) => path.resolve(project.cwd))));
+}
+
+async function resolveAllowedFilePath(requestedPath) {
+  const rawPath = cleanString(requestedPath);
+
+  if (!rawPath) {
+    throw createHttpError(400, "path is required");
+  }
+
+  if (!path.isAbsolute(rawPath)) {
+    throw createHttpError(400, "path must be absolute");
+  }
+
+  const resolvedPath = path.resolve(rawPath);
+  const realPath = await fsp.realpath(resolvedPath).catch((error) => {
+    if (error.code === "ENOENT") {
+      throw createHttpError(404, "File not found");
+    }
+
+    throw error;
+  });
+  const stats = await fsp.stat(realPath);
+
+  if (!stats.isFile()) {
+    throw createHttpError(400, "Path must point to a file");
+  }
+
+  const allowedRoots = await listAllowedFileRoots();
+  if (!allowedRoots.some((root) => isPathInsideRoot(realPath, root))) {
+    throw createHttpError(403, "File is outside the available project roots");
+  }
+
+  return { filePath: realPath, stats };
+}
+
+async function readFileResource(filePath, stats) {
+  const fileStats = stats || await fsp.stat(filePath);
+  const mimeType = guessMimeType(filePath);
+  const writable = await canWriteFile(filePath);
+  const viewUrl = buildInlineFileUrl(filePath, Math.round(fileStats.mtimeMs));
+
+  if (isImageFilePath(filePath)) {
+    return {
+      path: filePath,
+      name: path.basename(filePath),
+      kind: "image",
+      mimeType,
+      size: fileStats.size,
+      mtimeMs: fileStats.mtimeMs,
+      writable,
+      viewUrl,
+    };
+  }
+
+  const buffer = await fsp.readFile(filePath);
+  const text = isBinaryBuffer(buffer) ? null : buffer.toString("utf8");
+
+  return {
+    path: filePath,
+    name: path.basename(filePath),
+    kind: text === null ? "binary" : "text",
+    mimeType,
+    size: fileStats.size,
+    mtimeMs: fileStats.mtimeMs,
+    writable,
+    text,
+    viewUrl,
+  };
 }
 
 function handleEventSocketConnection(socket) {
@@ -1167,6 +1309,59 @@ async function handleApi(request, response, url) {
     return;
   }
 
+  if (request.method === "GET" && pathname === "/api/file") {
+    const { filePath, stats } = await resolveAllowedFilePath(searchParams.get("path"));
+    sendJson(response, 200, { ok: true, data: await readFileResource(filePath, stats) });
+    return;
+  }
+
+  if (request.method === "PUT" && pathname === "/api/file") {
+    const body = await readJsonBody(request);
+    const { filePath, stats } = await resolveAllowedFilePath(body.path);
+    const expectedMtimeMs = Number(body.expectedMtimeMs);
+
+    if (isImageFilePath(filePath)) {
+      throw createHttpError(400, "Image files are preview-only in this pane");
+    }
+
+    const currentBuffer = await fsp.readFile(filePath);
+    if (isBinaryBuffer(currentBuffer)) {
+      throw createHttpError(400, "Binary files cannot be edited in the text editor");
+    }
+
+    if (Number.isFinite(expectedMtimeMs) && Math.round(stats.mtimeMs) !== Math.round(expectedMtimeMs)) {
+      throw createHttpError(409, "File changed on disk. Reload it before saving.");
+    }
+
+    if (!(await canWriteFile(filePath))) {
+      throw createHttpError(403, "File is not writable");
+    }
+
+    await fsp.writeFile(filePath, typeof body.text === "string" ? body.text : "", "utf8");
+    const nextStats = await fsp.stat(filePath);
+    sendJson(response, 200, {
+      ok: true,
+      data: {
+        path: filePath,
+        mtimeMs: nextStats.mtimeMs,
+        size: nextStats.size,
+      },
+    });
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/file/content") {
+    const { filePath } = await resolveAllowedFilePath(searchParams.get("path"));
+    const contents = await fsp.readFile(filePath);
+    response.writeHead(200, {
+      "Cache-Control": "no-store",
+      "Content-Disposition": `inline; filename="${path.basename(filePath).replaceAll('"', "")}"`,
+      "Content-Type": guessMimeType(filePath),
+    });
+    response.end(contents);
+    return;
+  }
+
   if (request.method === "GET" && parts[1] === "projects" && parts.length === 2) {
     sendJson(response, 200, { ok: true, data: await listProjects() });
     return;
@@ -1239,7 +1434,8 @@ async function handleApi(request, response, url) {
   if (request.method === "POST" && pathname === "/api/threads") {
     const body = await readJsonBody(request);
     const project = await requireProject(cleanString(body.projectId));
-    const threadConfig = buildThreadConfig(project, body);
+    const selection = await resolveComposerSelection(project, body);
+    const threadConfig = buildThreadConfig(project, body, selection);
 
     const threadResult = await bridge.request("thread/start", {
       ...threadConfig,
@@ -1259,7 +1455,7 @@ async function handleApi(request, response, url) {
       await bridge.request("turn/start", {
         threadId: threadResult.thread.id,
         input: buildTurnInput(body, "prompt"),
-        ...buildTurnConfig(project, body),
+        ...buildTurnConfig(project, body, selection),
       });
     }
 
@@ -1296,9 +1492,10 @@ async function handleApi(request, response, url) {
     const body = await readJsonBody(request);
     const threadId = decodeURIComponent(parts[2]);
     const project = await requireProject(cleanString(body.projectId));
+    const selection = await resolveComposerSelection(project, body);
     await bridge.request("thread/resume", {
       threadId,
-      ...buildThreadConfig(project, body),
+      ...buildThreadConfig(project, body, selection),
       persistExtendedHistory: true,
     });
 
@@ -1307,7 +1504,7 @@ async function handleApi(request, response, url) {
       data: await bridge.request("turn/start", {
         threadId,
         input: buildTurnInput(body, "text"),
-        ...buildTurnConfig(project, body),
+        ...buildTurnConfig(project, body, selection),
       }),
     });
     return;
@@ -1419,7 +1616,7 @@ const server = http.createServer(async (request, response) => {
     await serveStatic(url.pathname, response);
   } catch (error) {
     console.error(error);
-    sendError(response, 500, error);
+    sendError(response, error?.statusCode || 500, error);
   }
 });
 
