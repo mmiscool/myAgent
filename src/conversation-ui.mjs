@@ -28,6 +28,18 @@ export function commandApprovalDecisionLabel(decision) {
 }
 
 export function createConversationUi({ renderMarkdown, renderCollapsibleItem, normalizeCommandApprovalDecisions }) {
+  function renderGenericPendingRequest(request) {
+    return `
+      <article class="bubble agent pending-request-card">
+        <strong>Pending Request</strong>
+        <div class="message-body">
+          <p>${escapeHtml(request?.method || "Unknown request")}</p>
+          <pre>${escapeHtml(JSON.stringify(request, null, 2))}</pre>
+        </div>
+      </article>
+    `;
+  }
+
   function renderContentEntry(entry) {
     if (typeof entry === "string") {
       return renderMarkdown(entry);
@@ -215,14 +227,18 @@ export function createConversationUi({ renderMarkdown, renderCollapsibleItem, no
       `;
     }
 
-    return renderCollapsibleItem({
-      id: request.id || request.method,
-      type: "pendingRequest",
-    }, {
-      title: "Pending Request",
-      summary: request.method,
-      body: JSON.stringify(request, null, 2),
-    });
+    if (typeof renderCollapsibleItem === "function") {
+      return renderCollapsibleItem({
+        id: request.id || request.method,
+        type: "pendingRequest",
+      }, {
+        title: "Pending Request",
+        summary: request.method,
+        body: JSON.stringify(request, null, 2),
+      });
+    }
+
+    return renderGenericPendingRequest(request);
   }
 
   return {
