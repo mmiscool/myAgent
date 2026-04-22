@@ -1,0 +1,257 @@
+.thread-terminal-bar,
+.thread-terminal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.thread-terminal-actions {
+  flex: 0 1 auto;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.thread-terminal-status {
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  box-shadow: var(--shadow);
+  overflow-wrap: anywhere;
+}
+
+.thread-terminal-surface {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background:
+    radial-gradient(circle at top left, rgba(74, 163, 255, 0.12), transparent 32%),
+    #0d0f12;
+  box-shadow: var(--shadow);
+}
+
+.thread-resource-bar,
+.thread-resource-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.thread-resource-actions {
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.thread-resource-meta {
+  min-width: 0;
+  flex: 1 1 auto;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  box-shadow: var(--shadow);
+}
+
+.thread-resource-title {
+  color: var(--text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-resource-status {
+  margin-top: 4px;
+  font-size: 0.92rem;
+  overflow-wrap: anywhere;
+}
+
+.thread-resource-status.error {
+  color: #f3b2b2;
+}
+
+.thread-resource-surface {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background:
+    radial-gradient(circle at top left, rgba(74, 163, 255, 0.08), transparent 30%),
+    #0f1114;
+  box-shadow: var(--shadow);
+}
+
+.thread-resource-empty,
+.thread-resource-preview,
+.thread-resource-editor {
+  width: 100%;
+  height: 100%;
+}
+
+.thread-resource-empty,
+.thread-resource-binary {
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.thread-resource-binary {
+  gap: 12px;
+}
+
+.thread-resource-binary p {
+  margin: 0;
+}
+
+.thread-resource-binary a {
+  color: #9ec8ff;
+}
+
+.thread-resource-preview {
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  overflow: auto;
+}
+
+.thread-resource-preview-image {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 14px;
+  border: 1px solid #2d3035;
+  background: #111214;
+}
+
+.thread-resource-editor {
+  min-height: 0;
+}
+
+.thread-terminal-viewport {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 12px;
+}
+
+.thread-terminal-viewport .xterm {
+  height: 100%;
+}
+
+.thread-terminal-viewport .xterm-screen,
+.thread-terminal-viewport .xterm-viewport {
+  border-radius: 12px;
+}
+
+.turn-card {
+  background: #191a1c;
+  display: grid;
+  gap: 10px;
+}
+
+.turn-topline {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.bubble.user {
+  border-left: 4px solid var(--green);
+}
+
+.bubble.agent {
+  border-left: 4px solid var(--accent);
+}
+
+.bubble {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.collapsed-item {
+  padding: 0;
+  overflow: hidden;
+}
+
+.collapsed-item details {
+  display: block;
+}
+
+.collapsed-summary {
+  list-style: none;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 14px;
+  cursor: pointer;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.collapsed-summary::-webkit-details-marker {
+  display: none;
+}
+
+.collapsed-title {
+  flex: 0 0 auto;
+  font-weight: 700;
+  color: #f1f2f4;
+}
+
+.collapsed-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: #cfd1d4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collapsed-meta {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.82rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.collapsed-body {
+  border-top: 1px solid var(--border);
+  padding: 0 14px 14px;
+}
+
+.tool-call-body {
+  display: grid;
+  gap: 12px;
+}
+
+.tool-call-content {
+  margin-top: 0;
+}
+
+.tool-call-content > :last-child {
+  margin-bottom: 0;
+}
+
+.turn-steps-body {
+  display: grid;
+  gap: 10px;
+}
+

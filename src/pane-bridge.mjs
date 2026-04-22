@@ -1,64 +1,11 @@
-export function cleanString(value) {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-export function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-export function oneLine(value) {
-  return String(value || "").replace(/\s+/g, " ").trim();
-}
-
-export function relativeTime(unixSeconds) {
-  if (!unixSeconds) {
-    return "";
-  }
-
-  const diffSeconds = Math.max(0, Math.floor(Date.now() / 1000) - unixSeconds);
-
-  if (diffSeconds < 60) {
-    return "just now";
-  }
-
-  const minutes = Math.floor(diffSeconds / 60);
-  if (minutes < 60) {
-    return `${minutes}m ago`;
-  }
-
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) {
-    return `${hours}h ago`;
-  }
-
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
-
-export function formatStatus(status) {
-  if (!status) {
-    return "unknown";
-  }
-
-  if (typeof status === "string") {
-    return status
-      .replace(/([a-z])([A-Z])/g, "$1 $2")
-      .replace(/[_-]+/g, " ")
-      .trim();
-  }
-
-  return String(status);
-}
-
-export function isLiveStatus(status) {
-  const text = formatStatus(status).toLowerCase();
-  return text.includes("progress") || text.includes("running") || text.includes("working") || text.includes("thinking");
-}
+export {
+  cleanString,
+  escapeHtml,
+  oneLine,
+  relativeTime,
+  formatStatus,
+  isLiveStatus,
+} from "./ui-formatters.mjs";
 
 export async function api(path, options = {}) {
   const response = await fetch(path, {

@@ -17,6 +17,8 @@ const {
 } = require("./file-resource-utils");
 const { dedupeProjectsByPath, projectPathKey } = require("./project-store-utils");
 const { createThreadActionHelpers } = require("./thread-action-utils");
+const { createStaticAssetHandler } = require("./server/static-assets");
+const { createHttpError, readJsonBody, sendError, sendJson } = require("./server/http-utils");
 
 const ROOT_DIR = __dirname;
 const DIST_DIR = path.join(ROOT_DIR, "dist");
@@ -53,6 +55,18 @@ const eventSocketClients = new Set();
 const terminalSocketClientsByProjectId = new Map();
 const terminalManager = new TerminalManager();
 let modelCapabilitiesModulePromise = null;
+
+const serveStatic = createStaticAssetHandler({
+  contentTypes: CONTENT_TYPES,
+  distDir: DIST_DIR,
+  fs,
+  fsp,
+  path,
+  rootDir: ROOT_DIR,
+  sendError,
+});
+
+const parseJsonBody = (request) => readJsonBody(request, { maxBodyBytes: MAX_BODY_BYTES });
 
 function formatBridgePayload(value) {
   try {
@@ -880,51 +894,6 @@ function broadcastProjectTerminal(projectId, payload) {
   }
 }
 
-async function readJsonBody(request) {
-  const chunks = [];
-  let size = 0;
-
-  for await (const chunk of request) {
-    size += chunk.length;
-
-    if (size > MAX_BODY_BYTES) {
-      throw new Error("Request body is too large");
-    }
-
-    chunks.push(chunk);
-  }
-
-  if (chunks.length === 0) {
-    return {};
-  }
-
-  const body = Buffer.concat(chunks).toString("utf8");
-
-  try {
-    return JSON.parse(body);
-  } catch {
-    throw new Error("Invalid JSON request body");
-  }
-}
-
-function sendJson(response, statusCode, payload) {
-  response.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
-  response.end(JSON.stringify(payload));
-}
-
-function sendError(response, statusCode, error) {
-  sendJson(response, statusCode, {
-    ok: false,
-    error: error instanceof Error ? error.message : String(error),
-  });
-}
-
-function createHttpError(statusCode, message) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  return error;
-}
-
 function buildInlineFileUrl(filePath, version) {
   const url = new URL("/api/file/content", "http://localhost");
   url.searchParams.set("path", filePath);
@@ -1099,69 +1068,6 @@ function handleTerminalSocketConnection(socket, projectId) {
   });
 }
 
-async function serveStatic(pathname, response) {
-  const requestedPath = pathname === "/" ? "/index.html" : pathname;
-  const safePath = path.normalize(requestedPath).replace(/^(\.\.[/\\])+/, "");
-  const distExists = fs.existsSync(DIST_DIR);
-  let filePath;
-
-  if (distExists) {
-    filePath = path.join(DIST_DIR, safePath);
-
-    if (!filePath.startsWith(DIST_DIR)) {
-      sendError(response, 403, "Forbidden");
-      return;
-    }
-  } else if (safePath === "/index.html") {
-    filePath = path.join(ROOT_DIR, "index.html");
-  } else if (safePath.startsWith("/src/")) {
-    filePath = path.join(ROOT_DIR, safePath);
-
-    if (!filePath.startsWith(path.join(ROOT_DIR, "src"))) {
-      sendError(response, 403, "Forbidden");
-      return;
-    }
-  } else if (safePath.startsWith("/packages/")) {
-    filePath = path.join(ROOT_DIR, safePath);
-
-    if (!filePath.startsWith(path.join(ROOT_DIR, "packages"))) {
-      sendError(response, 403, "Forbidden");
-      return;
-    }
-  } else if (safePath.startsWith("/public/")) {
-    filePath = path.join(ROOT_DIR, safePath);
-
-    if (!filePath.startsWith(path.join(ROOT_DIR, "public"))) {
-      sendError(response, 403, "Forbidden");
-      return;
-    }
-  } else if (safePath.startsWith("/panes/")) {
-    filePath = path.join(ROOT_DIR, safePath);
-
-    if (!filePath.startsWith(path.join(ROOT_DIR, "panes"))) {
-      sendError(response, 403, "Forbidden");
-      return;
-    }
-  } else {
-    sendError(response, 404, "Not found");
-    return;
-  }
-
-  try {
-    const contents = await fsp.readFile(filePath);
-    const contentType = CONTENT_TYPES[path.extname(filePath)] || "application/octet-stream";
-    response.writeHead(200, { "Content-Type": contentType });
-    response.end(contents);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      sendError(response, 404, "Not found");
-      return;
-    }
-
-    throw error;
-  }
-}
-
 function parseReviewTarget(body) {
   if (body.targetType === "baseBranch") {
     return { type: "baseBranch", branch: cleanString(body.branch) || "main" };
@@ -1270,7 +1176,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "POST" && pathname === "/api/auth/login") {
-    const body = await readJsonBody(request);
+    const body = await parseJsonBody(request);
     const loginType = body.type === "apiKey" ? "apiKey" : "chatgpt";
     const params = loginType === "apiKey"
       ? { type: "apiKey", apiKey: cleanString(body.apiKey) }
@@ -1286,7 +1192,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "POST" && pathname === "/api/rpc") {
-    const body = await readJsonBody(request);
+    const body = await parseJsonBody(request);
 
     if (!cleanString(body.method) || body.method === "initialize") {
       throw new Error("method is required");
@@ -1300,7 +1206,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "POST" && pathname === "/api/command") {
-    const body = await readJsonBody(request);
+    const body = await parseJsonBody(request);
     const project = await requireProject(cleanString(body.projectId));
     const command = cleanString(body.command);
 
@@ -1327,7 +1233,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "PUT" && pathname === "/api/file") {
-    const body = await readJsonBody(request);
+    const body = await parseJsonBody(request);
     const { filePath, stats } = await resolveAllowedFilePath(body.path);
     const expectedMtimeMs = Number(body.expectedMtimeMs);
 
@@ -1379,7 +1285,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "POST" && parts[1] === "projects" && parts.length === 2) {
-    const body = await readJsonBody(request);
+    const body = await parseJsonBody(request);
     sendJson(response, 200, { ok: true, data: await saveProject(body) });
     return;
   }
@@ -1429,7 +1335,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "POST" && parts[1] === "projects" && parts[3] === "terminal" && parts.length === 4) {
-    const body = await readJsonBody(request);
+    const body = await parseJsonBody(request);
     const session = await ensureProjectTerminalSession(decodeURIComponent(parts[2]), body);
     sendJson(response, 200, { ok: true, data: session });
     return;
@@ -1443,7 +1349,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "POST" && pathname === "/api/threads") {
-    const body = await readJsonBody(request);
+    const body = await parseJsonBody(request);
     const project = await requireProject(cleanString(body.projectId));
     const selection = await resolveComposerSelection(project, body);
     const threadConfig = buildThreadConfig(project, body, selection);
@@ -1500,7 +1406,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "POST" && parts[1] === "threads" && parts[3] === "message") {
-    const body = await readJsonBody(request);
+    const body = await parseJsonBody(request);
     const threadId = decodeURIComponent(parts[2]);
     const project = await requireProject(cleanString(body.projectId));
     const selection = await resolveComposerSelection(project, body);
@@ -1522,7 +1428,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "POST" && parts[1] === "threads" && parts[3] === "name") {
-    const body = await readJsonBody(request);
+    const body = await parseJsonBody(request);
     sendJson(response, 200, {
       ok: true,
       data: await bridge.request("thread/name/set", {
@@ -1574,7 +1480,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "POST" && parts[1] === "threads" && parts[3] === "interrupt") {
-    const body = await readJsonBody(request);
+    const body = await parseJsonBody(request);
     sendJson(response, 200, {
       ok: true,
       data: await bridge.request("turn/interrupt", {
@@ -1586,7 +1492,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "POST" && parts[1] === "threads" && parts[3] === "review") {
-    const body = await readJsonBody(request);
+    const body = await parseJsonBody(request);
     sendJson(response, 200, {
       ok: true,
       data: await threadActionHelpers.requestThreadActionWithResumeRetry("review/start", {
@@ -1599,7 +1505,7 @@ async function handleApi(request, response, url) {
   }
 
   if (request.method === "POST" && parts[1] === "server-requests" && parts[3] === "respond") {
-    const body = await readJsonBody(request);
+    const body = await parseJsonBody(request);
     const requestId = decodeURIComponent(parts[2]);
     const pendingRequest = bridge.listPendingServerRequests().find((item) => String(item.id) === requestId);
 

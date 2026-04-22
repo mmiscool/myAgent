@@ -12,6 +12,8 @@ import {
   supportedReasoningEffortsForModel,
   supportedServiceTiersForModel,
 } from "./model-capabilities.mjs";
+import { createConversationUi } from "./conversation-ui.mjs";
+import { api } from "./pane-bridge.mjs";
 import { RALPH_LOOP_DELAY_SECONDS, startRalphLoopCountdown } from "./ralph-loop-countdown.mjs";
 import {
   consumeRalphLoopBudget,
@@ -21,6 +23,19 @@ import {
   normalizeRalphLoopInput,
   normalizeRalphLoopLimit,
 } from "./ralph-loop-utils.mjs";
+import {
+  cleanString,
+  describeStatusActivity,
+  describeThreadActivity,
+  escapeHtml,
+  formatStatus,
+  isLiveStatus,
+  latestTurn,
+  oneLine,
+  parsePendingDecision,
+  relativeTime,
+  renderActivityBadge,
+} from "./ui-formatters.mjs";
 
 marked.setOptions({
   gfm: true,
@@ -28,6 +43,18 @@ marked.setOptions({
 });
 
 const markdownHtmlCache = new Map();
+
+const conversationUi = createConversationUi({
+  normalizeCommandApprovalDecisions,
+  renderCollapsibleItem,
+  renderMarkdown,
+});
+const {
+  renderContentEntry,
+  renderMessageContent,
+  renderPendingServerRequest,
+  renderToolCallBody,
+} = conversationUi;
 
 const state = {
   app: null,
@@ -161,25 +188,6 @@ async function boot() {
   if (state.selectedThreadId) {
     await loadThread(state.selectedThreadId);
   }
-}
-
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    method: options.method || "GET",
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
-
-  const payload = await response.json();
-
-  if (!response.ok || payload.ok === false) {
-    throw new Error(payload.error || `Request failed: ${response.status}`);
-  }
-
-  return payload;
 }
 
 async function loadBoot({ includeModels = true } = {}) {
@@ -3455,192 +3463,6 @@ function renderCollapsibleItem(item, display, latestCollapsibleItemId = "") {
   });
 }
 
-function renderToolCallBody(item) {
-  const metadata = [];
-
-  if (item?.id) {
-    metadata.push(`id: ${item.id}`);
-  }
-
-  if (item?.tool) {
-    metadata.push(`tool: ${item.tool}`);
-  }
-
-  if (item?.status) {
-    metadata.push(`status: ${item.status}`);
-  }
-
-  if (item?.arguments && Object.keys(item.arguments).length > 0) {
-    metadata.push(`arguments:\n${JSON.stringify(item.arguments, null, 2)}`);
-  }
-
-  const contentItems = Array.isArray(item?.contentItems) ? item.contentItems : [];
-  const sections = [];
-
-  if (metadata.length > 0) {
-    sections.push(`<pre data-role="body">${escapeHtml(metadata.join("\n\n"))}</pre>`);
-  }
-
-  if (contentItems.length > 0) {
-    sections.push(`<div class="message-body tool-call-content">${renderMessageContent(contentItems)}</div>`);
-  }
-
-  if (!sections.length) {
-    sections.push(`<pre data-role="body">${escapeHtml(JSON.stringify(item, null, 2))}</pre>`);
-  }
-
-  return `<div class="tool-call-body">${sections.join("")}</div>`;
-}
-
-function renderPendingServerRequest(request) {
-  if (!request?.method) {
-    return "";
-  }
-
-  if (request.method === "item/tool/requestUserInput") {
-    const questions = Array.isArray(request.params?.questions) ? request.params.questions : [];
-    const body = questions.map((question, index) => {
-      const options = Array.isArray(question.options) ? question.options : [];
-      const fieldId = `pending-${escapeHtml(String(request.id))}-${escapeHtml(question.id || String(index))}`;
-      const useSelect = options.length > 0;
-      const allowOther = Boolean(question.isOther);
-
-      return `
-        <label class="pending-request-field" for="${fieldId}">
-          <span class="pending-request-label">${escapeHtml(question.header || question.id || `Question ${index + 1}`)}</span>
-          <span class="pending-request-help">${escapeHtml(question.question || "")}</span>
-          ${useSelect ? `
-            <select id="${fieldId}" name="${escapeHtml(question.id || `question_${index}`)}" class="pending-request-input" ${allowOther ? `data-has-other="true" data-other-target="${fieldId}-other"` : ""}>
-              <option value="">Select an answer</option>
-              ${options.map((option) => `<option value="${escapeHtml(option.label || "")}">${escapeHtml(option.label || "")}</option>`).join("")}
-              ${allowOther ? `<option value="__other__">Other</option>` : ""}
-            </select>
-          ` : `
-            <input id="${fieldId}" name="${escapeHtml(question.id || `question_${index}`)}" class="pending-request-input" type="${question.isSecret ? "password" : "text"}" autocomplete="off">
-          `}
-          ${allowOther ? `<input id="${fieldId}-other" name="${escapeHtml(question.id || `question_${index}`)}__other" class="pending-request-input hidden" type="${question.isSecret ? "password" : "text"}" autocomplete="off" placeholder="Enter another answer">` : ""}
-        </label>
-      `;
-    }).join("");
-
-    return `
-      <article class="bubble agent pending-request-card">
-        <strong>Input Required</strong>
-        <div class="message-body">
-          <form data-action="respond-tool-request-user-input" data-request-id="${escapeHtml(String(request.id))}">
-            ${body}
-            <div class="pending-request-actions">
-              <button type="submit">Send Response</button>
-            </div>
-          </form>
-        </div>
-      </article>
-    `;
-  }
-
-  if (request.method === "item/commandExecution/requestApproval") {
-    const decisions = normalizeCommandApprovalDecisions(request.params?.availableDecisions);
-    const reason = request.params?.reason || "";
-    const command = request.params?.command || "";
-    const cwd = request.params?.cwd || "";
-    const hasDetails = Boolean(reason || command || cwd);
-
-    return `
-      <article class="bubble agent pending-request-card">
-        <strong>Command Approval</strong>
-        <div class="message-body">
-          ${hasDetails ? "" : "<p>This approval request arrived without command details. You can still allow or decline it.</p>"}
-          ${reason ? `<p>${escapeHtml(reason)}</p>` : ""}
-          ${command ? `<pre>${escapeHtml(command)}</pre>` : ""}
-          ${cwd ? `<p><strong>cwd</strong> ${escapeHtml(cwd)}</p>` : ""}
-          <div class="pending-request-actions">
-            ${decisions.map((decision) => {
-              const value = typeof decision === "string" ? decision : JSON.stringify(decision);
-              return `<button type="button" data-action="respond-command-approval" data-request-id="${escapeHtml(String(request.id))}" data-decision="${escapeHtml(value)}">${escapeHtml(commandApprovalDecisionLabel(decision))}</button>`;
-            }).join("")}
-          </div>
-        </div>
-      </article>
-    `;
-  }
-
-  if (request.method === "item/fileChange/requestApproval") {
-    const reason = request.params?.reason || "Approve file changes?";
-    const grantRoot = request.params?.grantRoot || "";
-
-    return `
-      <article class="bubble agent pending-request-card">
-        <strong>File Change Approval</strong>
-        <div class="message-body">
-          <p>${escapeHtml(reason)}</p>
-          ${grantRoot ? `<p><strong>root</strong> ${escapeHtml(grantRoot)}</p>` : ""}
-          <div class="pending-request-actions">
-            <button type="button" data-action="respond-file-change-approval" data-request-id="${escapeHtml(String(request.id))}" data-decision="accept">Allow</button>
-            <button type="button" data-action="respond-file-change-approval" data-request-id="${escapeHtml(String(request.id))}" data-decision="acceptForSession">Allow For Session</button>
-            <button type="button" data-action="respond-file-change-approval" data-request-id="${escapeHtml(String(request.id))}" data-decision="decline">Decline</button>
-            <button type="button" data-action="respond-file-change-approval" data-request-id="${escapeHtml(String(request.id))}" data-decision="cancel">Cancel</button>
-          </div>
-        </div>
-      </article>
-    `;
-  }
-
-  if (request.method === "item/permissions/requestApproval") {
-    const reason = request.params?.reason || "Grant additional permissions?";
-    const details = request.params?.permissions ? escapeHtml(JSON.stringify(request.params.permissions, null, 2)) : "";
-
-    return `
-      <article class="bubble agent pending-request-card">
-        <strong>Permissions Approval</strong>
-        <div class="message-body">
-          <p>${escapeHtml(reason)}</p>
-          ${details ? `<pre>${details}</pre>` : ""}
-          <div class="pending-request-actions">
-            <button type="button" data-action="respond-permissions-approval" data-request-id="${escapeHtml(String(request.id))}" data-scope="turn">Grant For Turn</button>
-            <button type="button" data-action="respond-permissions-approval" data-request-id="${escapeHtml(String(request.id))}" data-scope="session">Grant For Session</button>
-          </div>
-        </div>
-      </article>
-    `;
-  }
-
-  return renderCollapsibleItem({
-    id: request.id || request.method,
-    type: "pendingRequest",
-  }, {
-    title: "Pending Request",
-    summary: request.method,
-    body: JSON.stringify(request, null, 2),
-  });
-}
-
-function commandApprovalDecisionLabel(decision) {
-  if (typeof decision === "string") {
-    switch (decision) {
-      case "accept":
-        return "Allow";
-      case "acceptForSession":
-        return "Allow For Session";
-      case "decline":
-        return "Decline";
-      case "cancel":
-        return "Cancel";
-      default:
-        return decision;
-    }
-  }
-
-  if (decision?.acceptWithExecpolicyAmendment) {
-    return "Allow With Policy";
-  }
-
-  if (decision?.applyNetworkPolicyAmendment) {
-    return "Allow Network Policy";
-  }
-
-  return "Respond";
-}
-
 function renderMarkdown(text) {
   const key = String(text || "");
   const cached = markdownHtmlCache.get(key);
@@ -3658,44 +3480,6 @@ function renderMarkdown(text) {
   }
 
   return html;
-}
-
-function renderMessageContent(items, fallbackText = "") {
-  if (!Array.isArray(items) || items.length === 0) {
-    return renderMarkdown(fallbackText || "");
-  }
-
-  return items.map((entry) => renderContentEntry(entry)).join("");
-}
-
-function renderContentEntry(entry) {
-  if (typeof entry === "string") {
-    return renderMarkdown(entry);
-  }
-
-  if (!entry || typeof entry !== "object") {
-    return "";
-  }
-
-  if (entry.type === "text") {
-    return renderMarkdown(entry.text || "");
-  }
-
-  if (entry.type === "inputText") {
-    return `<pre>${escapeHtml(entry.text || "")}</pre>`;
-  }
-
-  const imageUrl = entry.url || entry.imageUrl || entry.image_url || entry.data;
-
-  if ((entry.type === "image" || entry.type === "local_image" || entry.type === "localImage" || entry.type === "inputImage") && imageUrl) {
-    return `
-      <figure class="message-image-wrap">
-        <img class="message-image" src="${escapeHtml(imageUrl)}" alt="${escapeHtml(entry.alt || entry.name || "Attached image")}">
-      </figure>
-    `;
-  }
-
-  return `<pre>${escapeHtml(`[${entry.type || "content"}] ${entry.path || imageUrl || entry.name || ""}`)}</pre>`;
 }
 
 function connectEvents() {
@@ -5196,131 +4980,6 @@ function loadImage(src) {
     image.onerror = () => reject(new Error("Failed to load image"));
     image.src = src;
   });
-}
-
-function relativeTime(unixSeconds) {
-  if (!unixSeconds) {
-    return "";
-  }
-
-  const diffSeconds = Math.max(0, Math.floor(Date.now() / 1000) - unixSeconds);
-
-  if (diffSeconds < 60) {
-    return "just now";
-  }
-
-  const minutes = Math.floor(diffSeconds / 60);
-  if (minutes < 60) {
-    return `${minutes}m ago`;
-  }
-
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) {
-    return `${hours}h ago`;
-  }
-
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
-
-function oneLine(value) {
-  return String(value || "").replace(/\s+/g, " ").trim();
-}
-
-function cleanString(value) {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function latestTurn(thread) {
-  const turns = thread?.turns || [];
-  return turns.length ? turns[turns.length - 1] : null;
-}
-
-function describeStatusActivity(status) {
-  const text = formatStatus(status).toLowerCase();
-
-  if (text.includes("think")) {
-    return "Thinking";
-  }
-
-  return "Working";
-}
-
-function describeThreadActivity(thread) {
-  const turn = latestTurn(thread);
-  const activeStatus = isLiveStatus(turn?.status) ? turn.status : thread?.status;
-  const isWorking = isLiveStatus(activeStatus);
-
-  return {
-    isWorking,
-    label: isWorking ? describeStatusActivity(activeStatus) : "Idle",
-    statusText: formatStatus(activeStatus || thread?.status),
-    turnId: turn?.id || "",
-  };
-}
-
-function renderActivityBadge(label, statusText = "", tone = "idle") {
-  const classNames = ["status-badge"];
-  if (tone === "live" || tone === "small" || tone === "sidebar") {
-    classNames.push("live");
-  }
-  if (tone === "small") {
-    classNames.push("small");
-  }
-  if (tone === "sidebar") {
-    classNames.push("sidebar");
-  }
-  const title = statusText ? ` title="${escapeHtml(statusText)}"` : "";
-  return `<span class="${classNames.join(" ")}"${title}><span class="status-dot" aria-hidden="true"></span>${escapeHtml(label)}</span>`;
-}
-
-function formatStatus(status) {
-  if (!status) {
-    return "unknown";
-  }
-
-  if (typeof status === "string") {
-    return status;
-  }
-
-  if (typeof status === "object" && status.type) {
-    return status.type;
-  }
-
-  return JSON.stringify(status);
-}
-
-function isLiveStatus(status) {
-  const text = formatStatus(status).toLowerCase();
-  return text.includes("progress")
-    || text.includes("active")
-    || text.includes("running")
-    || text.includes("working")
-    || text.includes("thinking")
-    || text.includes("stream")
-    || text.includes("respond");
-}
-
-function parsePendingDecision(rawDecision) {
-  const value = String(rawDecision || "");
-  if (!value) {
-    return "decline";
-  }
-
-  if (value.startsWith("{")) {
-    return JSON.parse(value);
-  }
-
-  return value;
-}
-
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
 }
 
 function showFatalError(error) {

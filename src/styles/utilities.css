@@ -1,0 +1,137 @@
+.status-live {
+  color: var(--accent);
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid #37393d;
+  background: rgba(255, 255, 255, 0.04);
+  color: #c7c9cd;
+  font-size: 0.78rem;
+  line-height: 1;
+}
+
+.status-badge.live {
+  border-color: rgba(74, 163, 255, 0.35);
+  background: rgba(74, 163, 255, 0.14);
+  color: #e4f1ff;
+}
+
+.status-badge.small {
+  padding: 4px 8px;
+  font-size: 0.72rem;
+}
+
+.status-badge.sidebar {
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #9fcbff;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #7d828a;
+}
+
+.status-badge.live .status-dot {
+  background: var(--accent);
+  box-shadow: 0 0 0 6px rgba(74, 163, 255, 0.12);
+  animation: status-pulse 1.6s ease-in-out infinite;
+}
+
+.status-badge.sidebar.live .status-dot {
+  width: 6px;
+  height: 6px;
+  box-shadow: 0 0 0 4px rgba(74, 163, 255, 0.14);
+  animation: none;
+}
+
+@keyframes status-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+
+  50% {
+    transform: scale(0.78);
+    opacity: 0.72;
+  }
+}
+
+.actions-row {
+  flex-wrap: wrap;
+}
+
+.empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
+@media (max-width: 1320px) {
+  .layout {
+    grid-template-columns: min(var(--sidebar-width-active), 290px) var(--sidebar-handle-width) minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 980px) {
+  .shell {
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .layout {
+    grid-template-columns: min(var(--sidebar-width-active), 290px) var(--sidebar-handle-width) minmax(720px, 1fr);
+    min-width: calc(min(var(--sidebar-width-active), 290px) + var(--sidebar-handle-width) + 720px);
+    height: 100vh;
+  }
+
+  .panel-conversation {
+    overflow: hidden;
+  }
+
+  .conversation {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .composer-attachment {
+    width: 92px;
+    height: 92px;
+  }
+
+  .image-editor-modal {
+    padding: 16px;
+  }
+
+  .ralph-loop-modal {
+    padding: 16px;
+  }
+
+  .ralph-loop-dialog {
+    width: calc(100vw - 32px);
+    padding: 20px;
+    border-radius: 22px;
+  }
+
+  .image-editor-shell {
+    width: calc(100vw - 32px);
+  }
+
+  .image-editor-toolbar {
+    border-radius: 24px;
+  }
+}
