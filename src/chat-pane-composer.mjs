@@ -444,3 +444,62 @@ export function createChatPaneComposer({
     updateComposerSetting,
   };
 }
+
+function normalizeComposerAttachment(attachment = {}) {
+  return {
+    id: attachment?.id || "",
+    name: attachment?.name || "",
+    url: attachment?.url || "",
+  };
+}
+
+export function normalizeComposerAttachments(attachments = []) {
+  if (!Array.isArray(attachments)) {
+    return [];
+  }
+
+  return attachments.map((attachment) => normalizeComposerAttachment(attachment));
+}
+
+export function mergeIncomingHostComposerState(currentComposer = {}, incomingComposer = {}, { draftTextOverride } = {}) {
+  const nextComposer = {
+    ...currentComposer,
+    ...(incomingComposer && typeof incomingComposer === "object" ? incomingComposer : {}),
+  };
+
+  nextComposer.attachments = Array.isArray(incomingComposer?.attachments)
+    ? normalizeComposerAttachments(incomingComposer.attachments)
+    : normalizeComposerAttachments(currentComposer.attachments);
+
+  if (typeof draftTextOverride === "string") {
+    nextComposer.draftText = draftTextOverride;
+  }
+
+  return nextComposer;
+}
+
+export function captureHostComposerRenderState(state = {}) {
+  const composer = state?.composer || {};
+
+  return {
+    projectId: state?.projectId || "",
+    threadId: state?.threadId || "",
+    autoscroll: state?.autoscroll !== false,
+    composer: {
+      draftText: composer.draftText || "",
+      attachments: normalizeComposerAttachments(composer.attachments),
+      sendInFlight: composer.sendInFlight === true,
+      modelLabel: composer.modelLabel || "",
+      effortLabel: composer.effortLabel || "",
+      hasModelOptions: composer.hasModelOptions === true,
+      hasEffortOptions: composer.hasEffortOptions === true,
+      modelMenuHtml: composer.modelMenuHtml || "",
+      effortMenuHtml: composer.effortMenuHtml || "",
+      mode: composer.mode === "plan" ? "plan" : "default",
+      modeLabel: composer.modeLabel || "",
+      approveAllDangerous: composer.approveAllDangerous === true,
+      ralphLoop: composer.ralphLoop === true,
+      ralphLoopLimit: String(composer.ralphLoopLimit ?? ""),
+    },
+  };
+}

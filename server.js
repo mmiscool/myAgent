@@ -19,6 +19,7 @@ const { dedupeProjectsByPath, projectPathKey } = require("./project-store-utils"
 const { createThreadActionHelpers } = require("./thread-action-utils");
 const { createApiHandler } = require("./server/api-handler");
 const { createFileResourceHandlers } = require("./server/file-resources");
+const { createModelStateHelpers } = require("./server/model-state");
 const { createStaticAssetHandler } = require("./server/static-assets");
 const { createHttpError, readJsonBody, sendError, sendJson } = require("./server/http-utils");
 const { createSocketHub } = require("./server/socket-hub");
@@ -180,6 +181,7 @@ function loadModelCapabilitiesModule() {
 
   return modelCapabilitiesModulePromise;
 }
+
 class CodexBridge extends EventEmitter {
   constructor() {
     super();
@@ -406,6 +408,11 @@ class CodexBridge extends EventEmitter {
 }
 
 const bridge = new CodexBridge();
+const { getModels } = createModelStateHelpers({
+  bridge,
+  cleanString,
+  loadModelCapabilitiesModule,
+});
 const threadActionHelpers = createThreadActionHelpers({
   bridge,
   findProjectByCwd,
@@ -427,6 +434,7 @@ const handleApi = createApiHandler({
   CODEX_BIN,
   ROOT_DIR,
   THREAD_SOURCE_KINDS,
+  getModels,
   bridge,
   terminalManager,
   threadActionHelpers,
@@ -453,7 +461,6 @@ const handleApi = createApiHandler({
   isImageFilePath,
   fsp,
   path,
-  loadModelCapabilitiesModule,
 });
 
 async function assertCodexInstalled() {

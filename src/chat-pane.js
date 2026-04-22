@@ -8,7 +8,11 @@ import {
   supportedReasoningEffortsForModel,
   supportedServiceTiersForModel,
 } from "./model-capabilities.mjs";
-import { createChatPaneComposer } from "./chat-pane-composer.mjs";
+import {
+  captureHostComposerRenderState,
+  createChatPaneComposer,
+  mergeIncomingHostComposerState,
+} from "./chat-pane-composer.mjs";
 import { createChatPaneConversation } from "./chat-pane-conversation.mjs";
 import { createConversationUi } from "./conversation-ui.mjs";
 import {
@@ -149,7 +153,6 @@ const {
   api,
   buildAutoApprovalResult,
   renderChatHeader,
-  renderComposer,
   findLatestTurnId,
   ensureSelectedTurn,
   ensureTurnItem,
@@ -483,9 +486,25 @@ async function bootstrapStandalone() {
   connectConversationSocket();
 }
 
+function activeComposerDraftText() {
+  const input = document.getElementById("chatPromptInput");
+
+  if (!(input instanceof HTMLTextAreaElement) || document.activeElement !== input) {
+    return undefined;
+  }
+
+  return input.value || "";
+}
+
+function composerRenderSignature() {
+  return JSON.stringify(captureHostComposerRenderState(state));
+}
+
 async function applyHostState(payload = {}) {
   const nextThreadId = cleanString(payload.threadId);
   const previousThreadId = state.threadId;
+  const previousComposerSignature = composerRenderSignature();
+  const focusedDraftText = activeComposerDraftText();
 
   state.active = payload.active === true;
   state.projectId = cleanString(payload.projectId);
@@ -496,18 +515,20 @@ async function applyHostState(payload = {}) {
   state.pendingRalphLoopReplay = payload.pendingRalphLoopReplay || null;
   state.pendingNewThread = payload.pendingNewThread || null;
   if (payload.composer && typeof payload.composer === "object") {
-    state.composer = {
-      ...state.composer,
-      ...payload.composer,
-      attachments: Array.isArray(payload.composer.attachments) ? payload.composer.attachments : [],
-    };
+    state.composer = mergeIncomingHostComposerState(state.composer, payload.composer, {
+      draftTextOverride: focusedDraftText,
+    });
   }
+  state.threadId = nextThreadId;
+  const shouldRenderComposer = previousComposerSignature !== composerRenderSignature();
 
   if (nextThreadId !== previousThreadId) {
-    state.threadId = nextThreadId;
     state.thread = null;
     state.pendingRequests = [];
     disconnectConversationSocket();
+    if (shouldRenderComposer) {
+      renderComposer();
+    }
     renderConversation();
 
     if (!state.threadId) {
@@ -523,8 +544,9 @@ async function applyHostState(payload = {}) {
     return;
   }
 
-  renderChatHeader();
-  renderComposer();
+  if (shouldRenderComposer) {
+    renderComposer();
+  }
   renderConversation();
   await maybeAutoApprovePendingRequests();
 

@@ -5,7 +5,6 @@ export function createChatPaneConversation({
   api,
   buildAutoApprovalResult,
   renderChatHeader,
-  renderComposer,
   findLatestTurnId,
   ensureSelectedTurn,
   ensureTurnItem,
@@ -738,7 +737,6 @@ export function createChatPaneConversation({
       : null;
 
     renderChatHeader();
-    renderComposer();
 
     if (!state.threadId) {
       if (pendingNewThread) {
