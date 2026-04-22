@@ -3,6 +3,7 @@ import {
   buildAutoApprovalResult,
   composerApprovalPolicyOverride,
   isAutoApprovableRequest,
+  normalizeCommandApprovalDecisions,
   selectAutoApprovalCommandDecision,
 } from "../../src/approval-utils.mjs";
 
@@ -32,6 +33,12 @@ describe("approval utils", () => {
       method: "item/commandExecution/requestApproval",
       params: { availableDecisions: ["decline", decision] },
     })).toEqual({ decision });
+  });
+
+  test("sanitizes malformed command approval decisions", () => {
+    expect(normalizeCommandApprovalDecisions(["", "accept"])).toEqual(["accept"]);
+    expect(normalizeCommandApprovalDecisions([null, undefined, ""])).toEqual(["accept", "decline"]);
+    expect(normalizeCommandApprovalDecisions([{}])).toEqual(["accept", "decline"]);
   });
 
   test("builds session-scoped auto-approval results for file changes and permissions", () => {

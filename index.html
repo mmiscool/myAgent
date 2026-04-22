@@ -19,6 +19,7 @@
               aria-label="Collapse sidebar"
               title="Collapse sidebar"
             ><span aria-hidden="true">&lt;</span></button>
+            <button data-action="toggle-project-adder" class="icon-button" title="Add project">+</button>
             <button
               data-action="toggle-archived"
               class="ghost-button small sidebar-filter-button"
@@ -26,8 +27,6 @@
               type="button"
               aria-pressed="false"
             >Active</button>
-            <button data-action="refresh-all-projects" class="icon-button" title="Refresh">↻</button>
-            <button data-action="toggle-project-adder" class="icon-button" title="Add project">+</button>
           </div>
 
           <form id="projectQuickAddForm" class="sidebar-adder hidden">
@@ -35,7 +34,17 @@
             <button type="submit" class="ghost-button">Add Project</button>
           </form>
 
-          <div id="projectList" class="project-tree"></div>
+          <div class="sidebar-project-selector">
+            <label class="sidebar-section-label" for="projectSelect">Project</label>
+            <select id="projectSelect" class="sidebar-project-select" aria-label="Active project"></select>
+          </div>
+
+          <div class="sidebar-conversations-wrap">
+            <div class="sidebar-list-header">
+              <span class="sidebar-section-label">Conversations</span>
+            </div>
+            <div id="projectList" class="sidebar-conversations"></div>
+          </div>
         </aside>
 
         <div
@@ -59,77 +68,79 @@
 
         <section class="panel panel-conversation">
           <div id="threadHeader" class="thread-header"></div>
-          <div id="conversation" class="conversation"></div>
-          <section id="threadTerminal" class="thread-terminal hidden" aria-hidden="true">
-            <div class="thread-terminal-bar">
-              <div id="threadTerminalStatus" class="thread-terminal-status">Select a project and open Terminal.</div>
-              <div class="thread-terminal-actions">
-                <button id="threadTerminalReconnect" type="button" class="ghost-button">Reconnect</button>
-                <button id="threadTerminalInterrupt" type="button" class="ghost-button">Ctrl+C</button>
-                <button id="threadTerminalClear" type="button" class="ghost-button">Clear</button>
-                <button id="threadTerminalStop" type="button" class="danger-button">Stop Terminal</button>
-              </div>
-            </div>
-            <div class="thread-terminal-surface">
-              <div id="threadTerminalViewport" class="thread-terminal-viewport" aria-label="Project terminal"></div>
-            </div>
-          </section>
-          <section id="threadResourcePane" class="thread-resource hidden" aria-hidden="true">
-            <div class="thread-resource-bar">
-              <div class="thread-resource-meta">
-                <div id="threadResourceTitle" class="thread-resource-title">Open a file link to preview it here.</div>
-                <div id="threadResourceStatus" class="thread-resource-status">Text files open in Monaco and save as you type. Images render inline.</div>
-              </div>
-              <div class="thread-resource-actions">
-                <button id="threadResourceOpenRaw" type="button" class="ghost-button">Open Raw</button>
-                <button id="threadResourceReload" type="button" class="ghost-button">Reload</button>
-                <button id="threadResourceClose" type="button" class="ghost-button">Close Tab</button>
-              </div>
-            </div>
-            <div class="thread-resource-surface">
-              <div id="threadResourceEmpty" class="thread-resource-empty">Open a file link in the conversation to view it here.</div>
-              <div id="threadResourceEditor" class="thread-resource-editor hidden" aria-label="File editor"></div>
-              <div id="threadResourcePreview" class="thread-resource-preview hidden"></div>
-            </div>
-          </section>
-          <form id="composerForm" class="composer">
+          <div id="conversation" class="thread-pane-host" aria-live="polite"></div>
+          <form id="composerForm" class="composer hidden" aria-hidden="true">
             <div id="composerAttachments" class="composer-attachments hidden"></div>
             <textarea id="promptInput" name="text" rows="5" placeholder="Ask Codex to inspect, edit, review, search, run commands, or delegate inside the selected project."></textarea>
             <div class="composer-row composer-footer">
               <button type="submit" class="primary-button">Send</button>
-              <div class="composer-controls" aria-label="Composer settings">
-                <div class="composer-picker">
-                  <button id="composerModelButton" type="button" class="composer-picker-trigger" data-action="toggle-composer-menu" data-menu="model" aria-haspopup="listbox" aria-expanded="false">
-                    <span class="composer-picker-icon" aria-hidden="true">◎</span>
-                    <span id="composerModelLabel" class="composer-picker-label">Model</span>
-                  </button>
-                  <div id="composerModelMenu" class="composer-picker-menu hidden" role="listbox" aria-label="Model"></div>
+              <div class="composer-settings">
+                <button
+                  id="composerSettingsButton"
+                  type="button"
+                  class="ghost-button composer-settings-button"
+                  data-action="toggle-composer-settings"
+                  aria-haspopup="menu"
+                  aria-expanded="false"
+                >Settings</button>
+                <div id="composerSettingsMenu" class="composer-settings-menu hidden" aria-label="Composer settings">
+                  <div class="composer-controls">
+                    <div class="composer-picker">
+                      <button id="composerModelButton" type="button" class="composer-picker-trigger" data-action="toggle-composer-menu" data-menu="model" aria-haspopup="listbox" aria-expanded="false">
+                        <span class="composer-picker-icon" aria-hidden="true">◎</span>
+                        <span id="composerModelLabel" class="composer-picker-label">Model</span>
+                      </button>
+                      <div id="composerModelMenu" class="composer-picker-menu hidden" role="listbox" aria-label="Model"></div>
+                    </div>
+                    <div class="composer-picker">
+                      <button id="composerEffortButton" type="button" class="composer-picker-trigger" data-action="toggle-composer-menu" data-menu="effort" aria-haspopup="listbox" aria-expanded="false">
+                        <span id="composerEffortLabel" class="composer-picker-label">Reasoning</span>
+                      </button>
+                      <div id="composerEffortMenu" class="composer-picker-menu hidden" role="listbox" aria-label="Reasoning"></div>
+                    </div>
+                    <button id="composerModeButton" type="button" class="composer-mode-button" data-action="toggle-composer-mode" aria-pressed="false">Chat</button>
+                    <label class="composer-toggle composer-toggle-inline">
+                      <input id="autoscrollToggle" type="checkbox" checked>
+                      <span>Autoscroll</span>
+                    </label>
+                    <label class="composer-toggle composer-toggle-inline composer-dangerous-toggle">
+                      <input id="approveAllDangerousToggle" type="checkbox">
+                      <span>Approve all dangerous</span>
+                    </label>
+                    <label class="composer-toggle composer-toggle-inline composer-ralph-loop-toggle">
+                      <input id="ralphLoopToggle" type="checkbox">
+                      <span>Ralph loop</span>
+                    </label>
+                    <label class="composer-number-control composer-ralph-loop-limit" for="ralphLoopLimitInput">
+                      <span class="composer-number-control-copy">
+                        <span class="composer-number-control-label">Ralph loop count</span>
+                        <span class="composer-number-control-hint">0 keeps looping until you stop it</span>
+                      </span>
+                      <input id="ralphLoopLimitInput" class="composer-number-input" type="number" min="0" step="1" inputmode="numeric" value="0">
+                    </label>
+                  </div>
                 </div>
-                <div class="composer-picker">
-                  <button id="composerEffortButton" type="button" class="composer-picker-trigger" data-action="toggle-composer-menu" data-menu="effort" aria-haspopup="listbox" aria-expanded="false">
-                    <span id="composerEffortLabel" class="composer-picker-label">Reasoning</span>
-                  </button>
-                  <div id="composerEffortMenu" class="composer-picker-menu hidden" role="listbox" aria-label="Reasoning"></div>
-                </div>
-                <button id="composerModeButton" type="button" class="composer-mode-button" data-action="toggle-composer-mode" aria-pressed="false">Chat</button>
-                <label class="composer-toggle composer-toggle-inline">
-                  <input id="autoscrollToggle" type="checkbox" checked>
-                  <span>Autoscroll</span>
-                </label>
-                <label class="composer-toggle composer-toggle-inline composer-dangerous-toggle">
-                  <input id="approveAllDangerousToggle" type="checkbox">
-                  <span>Approve all dangerous</span>
-                </label>
-                <label class="composer-toggle composer-toggle-inline composer-ralph-loop-toggle">
-                  <input id="ralphLoopToggle" type="checkbox">
-                  <span>Ralph loop</span>
-                </label>
               </div>
             </div>
           </form>
         </section>
 
       </main>
+    </div>
+
+    <div id="ralphLoopModal" class="ralph-loop-modal hidden" aria-hidden="true">
+      <div class="ralph-loop-dialog" role="dialog" aria-modal="true" aria-labelledby="ralphLoopDialogTitle" aria-describedby="ralphLoopDialogDescription">
+        <div class="ralph-loop-dialog-mark">Ralph Loop</div>
+        <h2 id="ralphLoopDialogTitle" class="ralph-loop-dialog-title">Continuing in <span id="ralphLoopCountdownValue">15 seconds</span></h2>
+        <p id="ralphLoopDialogDescription" class="ralph-loop-dialog-description">The next loop will start automatically when the countdown finishes.</p>
+        <div class="ralph-loop-countdown" aria-live="polite" aria-atomic="true">
+          <span id="ralphLoopCountdownNumber" class="ralph-loop-countdown-number">15</span>
+          <span id="ralphLoopCountdownLabel" class="ralph-loop-countdown-label">seconds remaining</span>
+        </div>
+        <div class="ralph-loop-dialog-actions">
+          <button type="button" class="ghost-button" data-action="cancel-ralph-loop">Cancel Ralph loop</button>
+        </div>
+      </div>
     </div>
 
     <div id="imageEditorModal" class="image-editor-modal hidden" aria-hidden="true">

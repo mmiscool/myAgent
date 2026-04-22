@@ -20,10 +20,16 @@ export function isAutoApprovableRequest(request) {
   return AUTO_APPROVABLE_REQUEST_METHODS.has(request?.method);
 }
 
+export function normalizeCommandApprovalDecisions(availableDecisions) {
+  const normalized = Array.isArray(availableDecisions)
+    ? availableDecisions.filter((decision) => isRenderableCommandDecision(decision))
+    : [];
+
+  return normalized.length > 0 ? normalized : ["accept", "decline"];
+}
+
 export function selectAutoApprovalCommandDecision(availableDecisions) {
-  const decisions = Array.isArray(availableDecisions) && availableDecisions.length
-    ? availableDecisions
-    : ["accept", "decline"];
+  const decisions = normalizeCommandApprovalDecisions(availableDecisions);
 
   let bestDecision = null;
   let bestPriority = 0;
@@ -38,6 +44,14 @@ export function selectAutoApprovalCommandDecision(availableDecisions) {
   }
 
   return bestDecision;
+}
+
+function isRenderableCommandDecision(decision) {
+  if (typeof decision === "string") {
+    return decision.trim().length > 0;
+  }
+
+  return Boolean(decision && typeof decision === "object" && Object.keys(decision).length > 0);
 }
 
 export function buildAutoApprovalResult(request) {

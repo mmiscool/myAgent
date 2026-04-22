@@ -1,5 +1,20 @@
 [
   {
+    "id": "633bd9cd-7683-42a7-86f5-bfaca92a0acf",
+    "name": "OCCT",
+    "description": "",
+    "cwd": "/home/user/projects/OCCT",
+    "defaultModel": "",
+    "defaultEffort": "medium",
+    "defaultSummary": "auto",
+    "defaultPersonality": "pragmatic",
+    "approvalPolicy": "on-request",
+    "sandboxMode": "workspace-write",
+    "networkAccess": true,
+    "createdAt": 1776146048767,
+    "updatedAt": 1776146048767
+  },
+  {
     "id": "b909be2a-7b35-4414-b2e3-70e9e1c7885a",
     "name": "BREP_from_Book",
     "description": "",

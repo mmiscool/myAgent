@@ -5,6 +5,12 @@ class ServerRequestTracker {
     this.requestObservations = new Map();
   }
 
+  reset() {
+    this.turnToThread.clear();
+    this.itemToThread.clear();
+    this.requestObservations.clear();
+  }
+
   observeNotification(message) {
     const params = message?.params || {};
     const threadId = this.extractThreadId(params);

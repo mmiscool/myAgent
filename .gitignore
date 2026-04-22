@@ -24,4 +24,5 @@ Thumbs.db
 .codex
 .codex-schema-json/
 .codex-schema-ts/
+.playwright-mcp/
 log.txt

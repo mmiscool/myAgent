@@ -216,6 +216,8 @@ class CodexBridge extends EventEmitter {
     }
 
     this.pending.clear();
+    this.pendingServerRequests.clear();
+    this.serverRequestTracker.reset();
     this.ready = false;
     this.child = null;
     this.stdoutBuffer = "";
@@ -747,8 +749,10 @@ function buildTurnInput(body, textFieldName) {
 }
 
 async function getBootState({ includeModels = true } = {}) {
-  const projects = await listProjects();
-  const models = includeModels ? await getModels() : { ok: true, data: [] };
+  const [projects, models] = await Promise.all([
+    listProjects(),
+    includeModels ? getModels() : Promise.resolve({ ok: true, data: [] }),
+  ]);
 
   return {
     ok: true,
@@ -1128,6 +1132,13 @@ async function serveStatic(pathname, response) {
     filePath = path.join(ROOT_DIR, safePath);
 
     if (!filePath.startsWith(path.join(ROOT_DIR, "public"))) {
+      sendError(response, 403, "Forbidden");
+      return;
+    }
+  } else if (safePath.startsWith("/panes/")) {
+    filePath = path.join(ROOT_DIR, safePath);
+
+    if (!filePath.startsWith(path.join(ROOT_DIR, "panes"))) {
       sendError(response, 403, "Forbidden");
       return;
     }

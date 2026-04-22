@@ -98,4 +98,36 @@ describe("ServerRequestTracker", () => {
       wasResolved: true,
     });
   });
+
+  test("resets inferred thread mappings and request observations", () => {
+    const tracker = new ServerRequestTracker();
+
+    tracker.observeNotification({
+      method: "turn/started",
+      params: {
+        threadId: "thread-before-reset",
+        turn: { id: "turn-before-reset" },
+      },
+    });
+    tracker.observeRequest({ id: 7 });
+
+    tracker.reset();
+
+    const normalized = tracker.normalizeRequest({
+      id: 8,
+      method: "item/commandExecution/requestApproval",
+      params: {
+        turnId: "turn-before-reset",
+      },
+    });
+
+    expect(normalized.params?.threadId).toBeUndefined();
+    expect(tracker.observeRequest({ id: 7 })).toMatchObject({
+      requestId: "7",
+      occurrence: 1,
+      isDuplicate: false,
+      isPendingReplay: false,
+      wasResolved: false,
+    });
+  });
 });

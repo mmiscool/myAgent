@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Terminal</title>
+    <style>
+      html, body {
+        height: 100%;
+      }
+
+      body {
+        margin: 0;
+      }
+
+      .pane-frame-shell {
+        height: 100%;
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+        gap: 12px;
+        padding: 5px;
+        background:
+          radial-gradient(circle at top right, rgba(74, 163, 255, 0.08), transparent 25%),
+          linear-gradient(180deg, #161718 0%, #111213 100%);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="pane-frame-shell">
+      <div class="thread-terminal-bar">
+        <div id="threadTerminalStatus" class="thread-terminal-status">Select a project and open Terminal.</div>
+        <div class="thread-terminal-actions">
+          <button id="threadTerminalReconnect" type="button" class="ghost-button">Reconnect</button>
+          <button id="threadTerminalInterrupt" type="button" class="ghost-button">Ctrl+C</button>
+          <button id="threadTerminalClear" type="button" class="ghost-button">Clear</button>
+          <button id="threadTerminalStop" type="button" class="danger-button">Stop Terminal</button>
+        </div>
+      </div>
+      <div class="thread-terminal-surface">
+        <div id="threadTerminalViewport" class="thread-terminal-viewport" aria-label="Project terminal"></div>
+      </div>
+    </div>
+    <script type="module" src="/src/terminal-pane.js"></script>
+  </body>
+</html>

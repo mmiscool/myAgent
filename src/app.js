@@ -1,10 +1,10 @@
 import "./styles.css";
-import "@xterm/xterm/css/xterm.css";
-import "monaco-editor/min/vs/editor/editor.main.css";
 import { marked } from "marked";
-import { FitAddon } from "@xterm/addon-fit";
-import { Terminal } from "@xterm/xterm";
-import { buildAutoApprovalResult, composerApprovalPolicyOverride } from "./approval-utils.mjs";
+import {
+  buildAutoApprovalResult,
+  composerApprovalPolicyOverride,
+  normalizeCommandApprovalDecisions,
+} from "./approval-utils.mjs";
 import { parseLocalFileLinkHref } from "./file-link-utils.mjs";
 import {
   formatServiceTierLabel,
@@ -12,16 +12,22 @@ import {
   supportedReasoningEffortsForModel,
   supportedServiceTiersForModel,
 } from "./model-capabilities.mjs";
-import { sortProjectsByRecentConversationActivity } from "./project-activity-utils.mjs";
 import { RALPH_LOOP_DELAY_SECONDS, startRalphLoopCountdown } from "./ralph-loop-countdown.mjs";
-import { normalizeRalphLoopInput } from "./ralph-loop-utils.mjs";
+import {
+  consumeRalphLoopBudget,
+  createRalphLoopBudget,
+  hasRalphLoopBudgetRemaining,
+  findLatestRalphLoopInput,
+  normalizeRalphLoopInput,
+  normalizeRalphLoopLimit,
+} from "./ralph-loop-utils.mjs";
 
 marked.setOptions({
   gfm: true,
   breaks: true,
 });
 
-let monacoLoadPromise = null;
+const markdownHtmlCache = new Map();
 
 const state = {
   app: null,
@@ -33,12 +39,14 @@ const state = {
   selectedThreadId: localStorage.getItem("selectedThreadId") || "",
   selectedThread: null,
   archived: false,
-  collapsedProjectIds: new Set(),
-  expandedProjectIds: new Set(),
   currentTurnId: "",
   activeThreadTab: localStorage.getItem("activeThreadTab") || "chat",
   threadTabByProjectId: {},
+  openTabsByProjectId: {},
+  activeTabIdByProjectId: {},
+  draftTabSequence: 0,
   threadActionMenuOpen: false,
+  composerSettingsOpen: false,
   composerMenuOpen: "",
   sidebarCollapsed: localStorage.getItem("sidebarCollapsed") === "true",
   autoscroll: localStorage.getItem("autoscroll") !== "false",
@@ -50,19 +58,18 @@ const state = {
   composerMode: localStorage.getItem("composerMode") || "default",
   composerApproveAllDangerous: localStorage.getItem("composerApproveAllDangerous") === "true",
   composerRalphLoop: false,
+  composerRalphLoopLimit: normalizeRalphLoopLimit(localStorage.getItem("composerRalphLoopLimit")),
   composerAttachments: [],
+  pendingNewThread: null,
+  manualSendInFlight: false,
   pendingServerRequests: [],
   autoApprovalInFlight: new Set(),
   ralphLoopLastCompletedTurnId: "",
   ralphLoopPendingReplay: null,
   ralphLoopAutoCompactThreadId: "",
+  ralphLoopBudget: null,
   resourceTabsByProjectId: {},
   activeResourceIdByProjectId: {},
-  terminalSessionByProjectId: {},
-  terminalClient: null,
-  terminalConnectInFlight: false,
-  terminalEmulator: null,
-  resourceEditor: createResourceEditorState(),
   imageEditor: createImageEditorState(),
 };
 
@@ -73,27 +80,12 @@ const elements = {
   sidebarToggleButton: document.getElementById("sidebarToggleButton"),
   sidebarRailToggle: document.getElementById("sidebarRailToggle"),
   projectList: document.getElementById("projectList"),
+  projectSelect: document.getElementById("projectSelect"),
   projectQuickAddForm: document.getElementById("projectQuickAddForm"),
   projectPathInput: document.getElementById("projectPathInput"),
   archivedToggle: document.getElementById("archivedToggle"),
   threadHeader: document.getElementById("threadHeader"),
   conversation: document.getElementById("conversation"),
-  threadTerminal: document.getElementById("threadTerminal"),
-  threadTerminalStatus: document.getElementById("threadTerminalStatus"),
-  threadTerminalReconnect: document.getElementById("threadTerminalReconnect"),
-  threadTerminalInterrupt: document.getElementById("threadTerminalInterrupt"),
-  threadTerminalClear: document.getElementById("threadTerminalClear"),
-  threadTerminalStop: document.getElementById("threadTerminalStop"),
-  threadTerminalViewport: document.getElementById("threadTerminalViewport"),
-  threadResourcePane: document.getElementById("threadResourcePane"),
-  threadResourceTitle: document.getElementById("threadResourceTitle"),
-  threadResourceStatus: document.getElementById("threadResourceStatus"),
-  threadResourceOpenRaw: document.getElementById("threadResourceOpenRaw"),
-  threadResourceReload: document.getElementById("threadResourceReload"),
-  threadResourceClose: document.getElementById("threadResourceClose"),
-  threadResourceEmpty: document.getElementById("threadResourceEmpty"),
-  threadResourceEditor: document.getElementById("threadResourceEditor"),
-  threadResourcePreview: document.getElementById("threadResourcePreview"),
   composerForm: document.getElementById("composerForm"),
   autoscrollToggle: document.getElementById("autoscrollToggle"),
   approveAllDangerousToggle: document.getElementById("approveAllDangerousToggle"),
@@ -107,6 +99,13 @@ const elements = {
   composerEffortLabel: document.getElementById("composerEffortLabel"),
   composerEffortMenu: document.getElementById("composerEffortMenu"),
   composerModeButton: document.getElementById("composerModeButton"),
+  composerSettingsButton: document.getElementById("composerSettingsButton"),
+  composerSettingsMenu: document.getElementById("composerSettingsMenu"),
+  ralphLoopModal: document.getElementById("ralphLoopModal"),
+  ralphLoopCountdownValue: document.getElementById("ralphLoopCountdownValue"),
+  ralphLoopCountdownNumber: document.getElementById("ralphLoopCountdownNumber"),
+  ralphLoopCountdownLabel: document.getElementById("ralphLoopCountdownLabel"),
+  ralphLoopLimitInput: document.getElementById("ralphLoopLimitInput"),
   imageEditorModal: document.getElementById("imageEditorModal"),
   imageEditorCanvasWrap: document.getElementById("imageEditorCanvasWrap"),
   imageEditorPreviewImage: document.getElementById("imageEditorPreviewImage"),
@@ -116,11 +115,13 @@ const elements = {
 
 const MIN_SIDEBAR_WIDTH = 240;
 const MAX_SIDEBAR_WIDTH = 560;
-const DEFAULT_VISIBLE_THREADS = 6;
 const COMPOSER_DRAFT_STORAGE_KEY = "composerDraft";
-let terminalResizeObserver = null;
-let terminalFitTimer = null;
+const MAX_MARKDOWN_CACHE_ENTRIES = 200;
 let projectThreadsRenderScheduled = false;
+let projectThreadsReloadTimer = null;
+let projectThreadsReloadInFlight = false;
+let projectThreadsReloadQueued = false;
+const paneFrameEntries = new Map();
 let conversationSocket = null;
 let conversationSocketRetryTimer = null;
 let conversationSocketShouldReconnect = true;
@@ -130,12 +131,11 @@ boot().catch(showFatalError);
 
 async function boot() {
   applySidebarLayout();
-  await loadBoot();
+  await loadBoot({ includeModels: false });
   if (!["chat", "terminal", "resource"].includes(state.activeThreadTab)) {
     state.activeThreadTab = "chat";
   }
-  setInitialProjectVisibility(state.selectedProjectId);
-  setProjectThreadTab(state.activeThreadTab, state.selectedProjectId);
+  initializeProjectTabs();
   syncSelectedProjectThreadTab();
   normalizeComposerSettings();
   elements.autoscrollToggle.checked = state.autoscroll;
@@ -149,6 +149,10 @@ async function boot() {
   renderThreadPane();
 
   connectEvents();
+  connectConversationSocket();
+  void loadModels().catch((error) => {
+    console.error("Failed to load models", error);
+  });
   void maybeAutoApprovePendingRequests();
   void loadAllProjectThreads().catch((error) => {
     console.error("Failed to load project threads", error);
@@ -156,8 +160,6 @@ async function boot() {
 
   if (state.selectedThreadId) {
     await loadThread(state.selectedThreadId);
-  } else if (state.activeThreadTab === "terminal" && selectedProject()) {
-    await ensureProjectTerminal();
   }
 }
 
@@ -180,8 +182,8 @@ async function api(path, options = {}) {
   return payload;
 }
 
-async function loadBoot() {
-  const payload = await api("/api/boot");
+async function loadBoot({ includeModels = true } = {}) {
+  const payload = await api(includeModels ? "/api/boot" : "/api/boot?includeModels=false");
   state.app = payload.app;
   state.projects = payload.projects;
   state.models = payload.models?.data || [];
@@ -193,23 +195,12 @@ async function loadBoot() {
   }
 }
 
-function setInitialProjectVisibility(projectId) {
-  const visibleProjectId = projectId || state.projects[0]?.id || "";
-
-  state.collapsedProjectIds = new Set(
-    state.projects
-      .map((project) => project.id)
-      .filter((id) => id !== visibleProjectId),
-  );
-  state.expandedProjectIds = new Set();
-}
-
-function ensureProjectVisible(projectId) {
-  if (!projectId) {
-    return;
-  }
-
-  state.collapsedProjectIds.delete(projectId);
+async function loadModels() {
+  const payload = await api("/api/models");
+  state.models = payload.data || [];
+  state.composerCapabilities = payload.capabilities || { serviceTiers: [], defaultServiceTier: "" };
+  normalizeComposerSettings();
+  renderComposerControls();
 }
 
 function persistComposerSettings() {
@@ -218,6 +209,7 @@ function persistComposerSettings() {
   localStorage.setItem("composerServiceTier", state.composerServiceTier || "");
   localStorage.setItem("composerMode", state.composerMode || "default");
   localStorage.setItem("composerApproveAllDangerous", String(state.composerApproveAllDangerous));
+  localStorage.setItem("composerRalphLoopLimit", String(state.composerRalphLoopLimit));
 }
 
 function currentComposerModel() {
@@ -253,6 +245,7 @@ function normalizeComposerSettings() {
   state.composerModel = selection.modelId;
   state.composerEffort = selection.effort;
   state.composerServiceTier = selection.serviceTier;
+  state.composerRalphLoopLimit = normalizeRalphLoopLimit(state.composerRalphLoopLimit);
 
   if (!["default", "plan"].includes(state.composerMode)) {
     state.composerMode = "default";
@@ -306,18 +299,49 @@ function formatComposerSettingsLabel(reasoningEffort, serviceTier) {
 function renderComposerControls() {
   normalizeComposerSettings();
 
+  const composerView = buildComposerViewState();
+  const modelMenuOpen = state.composerMenuOpen === "model";
+  const effortMenuOpen = state.composerMenuOpen === "effort";
+
+  if (!elements.composerModelLabel) {
+    syncAllPaneFrames();
+    return;
+  }
+
+  elements.composerModelLabel.textContent = composerView.modelLabel;
+  elements.composerEffortLabel.textContent = composerView.effortLabel;
+  elements.composerModelButton.disabled = !composerView.hasModelOptions;
+  elements.composerEffortButton.disabled = !composerView.hasEffortOptions;
+  elements.composerModelMenu.innerHTML = composerView.modelMenuHtml;
+  elements.composerEffortMenu.innerHTML = composerView.effortMenuHtml;
+  elements.composerSettingsMenu.classList.toggle("hidden", !state.composerSettingsOpen);
+  elements.composerSettingsButton.setAttribute("aria-expanded", state.composerSettingsOpen ? "true" : "false");
+  elements.composerModelMenu.classList.toggle("hidden", !modelMenuOpen);
+  elements.composerEffortMenu.classList.toggle("hidden", !effortMenuOpen);
+  elements.composerModelButton.setAttribute("aria-expanded", modelMenuOpen ? "true" : "false");
+  elements.composerEffortButton.setAttribute("aria-expanded", effortMenuOpen ? "true" : "false");
+  elements.composerModeButton.textContent = composerView.modeLabel;
+  elements.composerModeButton.classList.toggle("plan", composerView.mode === "plan");
+  elements.composerModeButton.setAttribute("aria-pressed", composerView.mode === "plan" ? "true" : "false");
+  elements.approveAllDangerousToggle.checked = composerView.approveAllDangerous;
+  elements.ralphLoopToggle.checked = composerView.ralphLoop;
+  elements.ralphLoopLimitInput.value = String(composerView.ralphLoopLimit);
+  const submitButton = elements.composerForm?.querySelector('button[type="submit"]');
+  if (submitButton) {
+    submitButton.disabled = state.manualSendInFlight;
+    submitButton.textContent = state.manualSendInFlight ? "Sending..." : "Send";
+  }
+  syncAllPaneFrames();
+}
+
+function buildComposerViewState() {
   const model = currentComposerModel();
   const reasoningOptions = supportedReasoningEffortsForModel(model);
   const supportedEfforts = reasoningOptions.map((entry) => entry.reasoningEffort);
   const supportedServiceTiers = supportedServiceTiersForModel(model, state.composerCapabilities);
   const hasModelOptions = state.models.length > 0;
   const hasEffortOptions = supportedEfforts.length > 0 || supportedServiceTiers.length > 0;
-  elements.composerModelLabel.textContent = model?.displayName || model?.id || state.composerModel || "Select Model";
-  elements.composerEffortLabel.textContent = formatComposerSettingsLabel(state.composerEffort, state.composerServiceTier);
-  elements.composerModelButton.disabled = !hasModelOptions;
-  elements.composerEffortButton.disabled = !hasEffortOptions;
-
-  elements.composerModelMenu.innerHTML = hasModelOptions
+  const modelMenuHtml = hasModelOptions
     ? state.models.map((entry) => `
       <button
         type="button"
@@ -377,22 +401,23 @@ function renderComposerControls() {
     `
     : "";
 
-  elements.composerEffortMenu.innerHTML = reasoningMarkup || serviceTierMarkup
+  const effortMenuHtml = reasoningMarkup || serviceTierMarkup
     ? `${reasoningMarkup}${serviceTierMarkup}`
     : '<div class="composer-picker-empty">No settings available for this model</div>';
 
-  const modelMenuOpen = state.composerMenuOpen === "model";
-  const effortMenuOpen = state.composerMenuOpen === "effort";
-  elements.composerModelMenu.classList.toggle("hidden", !modelMenuOpen);
-  elements.composerEffortMenu.classList.toggle("hidden", !effortMenuOpen);
-  elements.composerModelButton.setAttribute("aria-expanded", modelMenuOpen ? "true" : "false");
-  elements.composerEffortButton.setAttribute("aria-expanded", effortMenuOpen ? "true" : "false");
-
-  elements.composerModeButton.textContent = state.composerMode === "plan" ? "Plan" : "Chat";
-  elements.composerModeButton.classList.toggle("plan", state.composerMode === "plan");
-  elements.composerModeButton.setAttribute("aria-pressed", state.composerMode === "plan" ? "true" : "false");
-  elements.approveAllDangerousToggle.checked = state.composerApproveAllDangerous;
-  elements.ralphLoopToggle.checked = state.composerRalphLoop;
+  return {
+    modelLabel: model?.displayName || model?.id || state.composerModel || "Select Model",
+    effortLabel: formatComposerSettingsLabel(state.composerEffort, state.composerServiceTier),
+    hasModelOptions,
+    hasEffortOptions,
+    modelMenuHtml,
+    effortMenuHtml,
+    mode: state.composerMode === "plan" ? "plan" : "default",
+    modeLabel: state.composerMode === "plan" ? "Plan" : "Chat",
+    approveAllDangerous: state.composerApproveAllDangerous,
+    ralphLoop: state.composerRalphLoop,
+    ralphLoopLimit: state.composerRalphLoopLimit,
+  };
 }
 
 function composerRequestOverrides() {
@@ -433,6 +458,21 @@ function currentComposerInput() {
   });
 }
 
+function pendingThreadPreview(input) {
+  const text = oneLine(input?.text || "");
+
+  if (text) {
+    return text.slice(0, 120);
+  }
+
+  const imageCount = Array.isArray(input?.images) ? input.images.length : 0;
+  if (imageCount > 0) {
+    return imageCount === 1 ? "Image message" : `${imageCount} images`;
+  }
+
+  return "New conversation";
+}
+
 function currentRalphLoopInput(threadId) {
   const normalizedThreadId = String(threadId || "");
 
@@ -441,11 +481,15 @@ function currentRalphLoopInput(threadId) {
   }
 
   const currentInput = currentComposerInput();
-  if (!currentInput.text && currentInput.images.length === 0) {
-    return null;
+  if (currentInput.text || currentInput.images.length > 0) {
+    return currentInput;
   }
 
-  return currentInput;
+  if (state.selectedThread?.id === normalizedThreadId) {
+    return findLatestRalphLoopInput(state.selectedThread);
+  }
+
+  return null;
 }
 
 function isRalphLoopActiveForThread(threadId) {
@@ -467,6 +511,32 @@ function currentPendingRalphLoopReplay(threadId) {
   return pendingReplay;
 }
 
+function setRalphLoopBudget(threadId) {
+  const normalizedThreadId = cleanString(threadId);
+  state.ralphLoopBudget = normalizedThreadId
+    ? createRalphLoopBudget(state.composerRalphLoopLimit, normalizedThreadId)
+    : null;
+}
+
+function clearRalphLoopBudget() {
+  state.ralphLoopBudget = null;
+}
+
+function syncConfiguredRalphLoopBudget() {
+  const budgetThreadId = cleanString(state.ralphLoopBudget?.threadId);
+
+  if (!budgetThreadId || budgetThreadId !== state.selectedThreadId) {
+    return;
+  }
+
+  if (!state.composerRalphLoop) {
+    clearRalphLoopBudget();
+    return;
+  }
+
+  setRalphLoopBudget(budgetThreadId);
+}
+
 function cancelPendingRalphLoop({ disableLoop = false, render = true, cancelAutoCompact = false } = {}) {
   const pendingReplay = state.ralphLoopPendingReplay;
   state.ralphLoopPendingReplay = null;
@@ -484,8 +554,18 @@ function cancelPendingRalphLoop({ disableLoop = false, render = true, cancelAuto
     elements.ralphLoopToggle.checked = false;
   }
 
+  if (disableLoop || cancelAutoCompact) {
+    clearRalphLoopBudget();
+  }
+
   if (render) {
     renderConversation();
+  } else {
+    renderRalphLoopDialog(null);
+  }
+
+  if (disableLoop) {
+    renderComposerControls();
   }
 }
 
@@ -499,6 +579,29 @@ function syncPendingRalphLoopReplay() {
   if (!isRalphLoopActiveForThread(pendingReplay.threadId)) {
     cancelPendingRalphLoop({ render: false, cancelAutoCompact: true });
   }
+}
+
+function syncModalOpenState() {
+  const hasOpenModal = state.imageEditor.open || !elements.ralphLoopModal.classList.contains("hidden");
+  document.body.classList.toggle("modal-open", hasOpenModal);
+}
+
+function renderRalphLoopDialog(pendingReplay = currentPendingRalphLoopReplay(state.selectedThread?.id || state.selectedThreadId)) {
+  const visible = Boolean(pendingReplay);
+  elements.ralphLoopModal.classList.toggle("hidden", !visible);
+  elements.ralphLoopModal.setAttribute("aria-hidden", visible ? "false" : "true");
+
+  if (!visible) {
+    syncModalOpenState();
+    return;
+  }
+
+  const remainingSeconds = Math.max(0, Number(pendingReplay.remainingSeconds) || 0);
+  const durationText = `${remainingSeconds} second${remainingSeconds === 1 ? "" : "s"}`;
+  elements.ralphLoopCountdownValue.textContent = durationText;
+  elements.ralphLoopCountdownNumber.textContent = String(remainingSeconds);
+  elements.ralphLoopCountdownLabel.textContent = remainingSeconds === 1 ? "second remaining" : "seconds remaining";
+  syncModalOpenState();
 }
 
 function sleep(milliseconds) {
@@ -622,9 +725,12 @@ async function waitForRalphLoopReplay(threadId, completedTurnId = "") {
 
 async function sendConversationMessage(input, options = {}) {
   const project = selectedProject();
+  const activeTab = activeProjectTab(project?.id);
   const normalizedInput = normalizeRalphLoopInput(input);
   const overrides = composerRequestOverrides();
   const fromRalphLoop = options.fromRalphLoop === true;
+  const manualSend = !fromRalphLoop;
+  const startingNewThread = manualSend && !state.selectedThreadId;
 
   if (!project) {
     throw new Error("Select a project first");
@@ -638,35 +744,92 @@ async function sendConversationMessage(input, options = {}) {
     cancelPendingRalphLoop({ render: false, cancelAutoCompact: true });
   }
 
-  ensureProjectVisible(project.id);
-
-  if (state.selectedThreadId) {
-    await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/message`, {
-      method: "POST",
-      body: { projectId: project.id, text: normalizedInput.text, images: normalizedInput.images, ...overrides },
-    });
-  } else {
-    const created = await api("/api/threads", {
-      method: "POST",
-      body: { projectId: project.id, prompt: normalizedInput.text, images: normalizedInput.images, ...overrides },
-    });
-
-    state.selectedThreadId = created.data?.thread?.id || "";
+  if (manualSend && state.manualSendInFlight) {
+    throw new Error("A message is already being sent");
   }
 
-  persistSelection();
-  await loadAllProjectThreads();
-  renderProjects();
-
-  if (state.selectedThreadId) {
-    await loadThread(state.selectedThreadId);
+  if (activeTab?.pane && activeTab.pane !== "chat") {
+    throw new Error("Switch to a conversation tab before sending a message");
   }
 
-  return state.selectedThreadId;
+  if (manualSend) {
+    state.manualSendInFlight = true;
+    renderComposerControls();
+  }
+
+  if (startingNewThread) {
+    state.pendingNewThread = {
+      projectId: project.id,
+      title: pendingThreadPreview(normalizedInput),
+      input: normalizedInput,
+    };
+    renderProjects();
+    renderThreadHeader();
+    renderConversation();
+  }
+
+  try {
+    if (state.selectedThreadId) {
+      await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/message`, {
+        method: "POST",
+        body: { projectId: project.id, text: normalizedInput.text, images: normalizedInput.images, ...overrides },
+      });
+    } else {
+      const created = await api("/api/threads", {
+        method: "POST",
+        body: { projectId: project.id, prompt: normalizedInput.text, images: normalizedInput.images, ...overrides },
+      });
+
+      state.selectedThreadId = created.data?.thread?.id || "";
+      if (state.selectedThreadId) {
+        const nextTab = createThreadTab(project.id, state.selectedThreadId);
+        if (activeTab?.pane === "chat" && !cleanString(activeTab.threadId)) {
+          replaceProjectTab(project.id, activeTab.id, nextTab);
+        } else {
+          openProjectThreadTab(project.id, state.selectedThreadId, { activate: true });
+        }
+        syncSelectedProjectThreadTab();
+      }
+    }
+
+    persistSelection();
+    syncAllPaneFrames();
+    await loadAllProjectThreads();
+    renderProjects();
+
+    if (state.selectedThreadId) {
+      await loadThread(state.selectedThreadId);
+    }
+
+    if (!fromRalphLoop) {
+      if (state.composerRalphLoop && state.selectedThreadId) {
+        setRalphLoopBudget(state.selectedThreadId);
+      } else {
+        clearRalphLoopBudget();
+      }
+    }
+
+    return state.selectedThreadId;
+  } finally {
+    if (startingNewThread) {
+      state.pendingNewThread = null;
+    }
+    if (manualSend) {
+      state.manualSendInFlight = false;
+      renderComposerControls();
+      renderProjects();
+      renderThreadHeader();
+      renderConversation();
+    }
+  }
 }
 
 async function maybeRunRalphLoop(threadId, completedTurnId = "") {
   if (!isRalphLoopActiveForThread(threadId)) {
+    return;
+  }
+
+  if (!hasRalphLoopBudgetRemaining(state.ralphLoopBudget, threadId)) {
     return;
   }
 
@@ -701,7 +864,12 @@ async function maybeRunRalphLoop(threadId, completedTurnId = "") {
       return;
     }
 
+    if (!hasRalphLoopBudgetRemaining(state.ralphLoopBudget, threadId)) {
+      return;
+    }
+
     await sendConversationMessage(replayInput, { fromRalphLoop: true });
+    state.ralphLoopBudget = consumeRalphLoopBudget(state.ralphLoopBudget, threadId);
   } catch (error) {
     console.error("Ralph loop failed", error);
   }
@@ -713,29 +881,19 @@ async function loadThreads() {
   if (!project) {
     state.threads = [];
     renderProjects();
+    renderThreadPane();
     return;
   }
 
-  ensureProjectVisible(project.id);
   const payload = await api(`/api/projects/${encodeURIComponent(project.id)}/threads?archived=${state.archived}`);
   state.threads = payload.data?.data || payload.data?.threads || [];
   state.projectThreads[project.id] = state.threads;
-
-  if (state.selectedThreadId && !state.threads.some((thread) => thread.id === state.selectedThreadId)) {
-    state.selectedThreadId = "";
-    state.selectedThread = null;
-    state.currentTurnId = "";
-    persistSelection();
-  }
 
   renderProjects();
   renderThreadHeader();
   renderConversation();
   renderComposerControls();
-
-  if (state.activeThreadTab === "terminal" && project) {
-    await ensureProjectTerminal();
-  }
+  renderThreadPane();
 }
 
 async function loadProjectThreads(projectId) {
@@ -756,15 +914,48 @@ async function loadProjectThreads(projectId) {
 }
 
 async function loadAllProjectThreads() {
-  const visibleProjectIds = state.projects
-    .filter((project) => !state.collapsedProjectIds.has(project.id))
-    .map((project) => project.id);
+  const projectId = cleanString(state.selectedProjectId);
 
-  await Promise.all(visibleProjectIds.map((projectId) => loadProjectThreads(projectId).catch((error) => {
+  if (!projectId) {
+    state.threads = [];
+    renderProjects();
+    return;
+  }
+
+  await loadProjectThreads(projectId).catch((error) => {
     console.error(`Failed to load threads for project ${projectId}`, error);
-  })));
-  state.threads = state.projectThreads[state.selectedProjectId] || [];
+  });
+  state.threads = state.projectThreads[projectId] || [];
   renderProjects();
+}
+
+async function switchSelectedProject(projectId) {
+  const nextProjectId = cleanString(projectId);
+
+  if (nextProjectId === cleanString(state.selectedProjectId) && Object.prototype.hasOwnProperty.call(state.projectThreads, nextProjectId)) {
+    state.threadActionMenuOpen = false;
+    syncSelectedProjectThreadTab();
+    persistSelection();
+    renderProjects();
+    renderThreadHeader();
+    renderConversation();
+    renderComposerControls();
+    renderThreadPane();
+    if (state.selectedThreadId) {
+      await loadThread(state.selectedThreadId).catch(console.error);
+    }
+    return;
+  }
+
+  state.selectedProjectId = nextProjectId;
+  state.threadActionMenuOpen = false;
+  syncSelectedProjectThreadTab();
+  persistSelection();
+  renderProjects();
+  await loadThreads();
+  if (state.selectedThreadId) {
+    await loadThread(state.selectedThreadId).catch(console.error);
+  }
 }
 
 async function loadThread(threadId) {
@@ -785,9 +976,6 @@ async function loadThread(threadId) {
   renderThreadHeader();
   renderConversation();
   renderThreadPane();
-  if (state.activeThreadTab === "terminal") {
-    await ensureProjectTerminal();
-  }
 }
 
 function renderSelectedThread() {
@@ -960,6 +1148,11 @@ async function maybeAutoApprovePendingRequests(requests = state.pendingServerReq
   await Promise.all(tasks);
 }
 
+async function loadPendingServerRequests() {
+  const payload = await api("/api/pending-requests");
+  state.pendingServerRequests = Array.isArray(payload.data) ? payload.data : [];
+}
+
 function pendingServerRequestsForThread(threadId) {
   if (!threadId) {
     return [];
@@ -1051,6 +1244,9 @@ function collapseConversationItemsExcept(itemId) {
 
   detailsList.forEach((details) => {
     details.open = details.dataset.itemId === itemId;
+    if (details.open) {
+      hydrateConversationDetails(details);
+    }
   });
 }
 
@@ -1070,6 +1266,8 @@ function keepLatestCollapsibleItemExpanded() {
   if (details && !details.open) {
     details.open = true;
   }
+
+  hydrateConversationDetails(details);
 }
 
 function getPlanDisplay(item) {
@@ -1156,6 +1354,28 @@ function summarizeIntermediateItems(items) {
   return labels.length ? labels.join(" · ") : `${count} step${count === 1 ? "" : "s"}`;
 }
 
+function renderMessageItemBody(item) {
+  return `<div class="message-body">${renderMessageContent(item.content, item.text || "")}</div>`;
+}
+
+function renderFileChangeBody(item) {
+  return (item.changes || []).map((change) => `
+    <details>
+      <summary>${escapeHtml(change.kind || "change")} · ${escapeHtml(change.path || "")}</summary>
+      <pre class="diff-block">${escapeHtml(change.diff || "")}</pre>
+    </details>
+  `).join("");
+}
+
+function renderCollapsibleDisplayBody(display) {
+  if (typeof display?.bodyHtml === "string") {
+    return display.bodyHtml;
+  }
+
+  const body = display?.body || display?.summary || display?.title || "";
+  return `<pre data-role="body">${escapeHtml(body)}</pre>`;
+}
+
 function patchCollapsibleConversationItem(item, display) {
   const article = findConversationItemElement(item?.id);
 
@@ -1163,19 +1383,29 @@ function patchCollapsibleConversationItem(item, display) {
     return false;
   }
 
+  const details = article.querySelector("details[data-item-id]");
   const summaryNode = article.querySelector("[data-role='summary']");
   const bodyNode = article.querySelector("[data-role='body']");
   const metaNode = article.querySelector("[data-role='meta']");
 
-  if (!summaryNode || !bodyNode) {
+  if (!summaryNode || !details) {
     return false;
   }
 
   summaryNode.textContent = display.summary || display.title;
-  bodyNode.textContent = display.body || display.summary || display.title || "";
 
   if (metaNode) {
     metaNode.textContent = display.meta || "";
+  }
+
+  if (details.open) {
+    hydrateConversationDetails(details, { force: true });
+    const nextBodyNode = article.querySelector("[data-role='body']");
+    if (nextBodyNode && typeof display?.bodyHtml !== "string") {
+      nextBodyNode.textContent = display.body || display.summary || display.title || "";
+    }
+  } else if (bodyNode && typeof display?.bodyHtml !== "string") {
+    bodyNode.textContent = display.body || display.summary || display.title || "";
   }
 
   keepLatestCollapsibleItemExpanded();
@@ -1227,52 +1457,230 @@ function findLastItemIndexByType(items, type) {
   return -1;
 }
 
-function renderIntermediateItemsGroup(turn, items, latestCollapsibleItemId = "") {
-  if (!Array.isArray(items) || !items.length) {
-    return "";
-  }
-
-  const groupId = `${turn.id}:steps`;
-  const open = shouldExpandConversationItem(groupId, latestCollapsibleItemId) ? " open" : "";
-
-  return `
-    <article class="bubble agent collapsed-item" data-item-id="${escapeHtml(groupId)}" data-item-type="turnSteps">
-      <details data-item-id="${escapeHtml(groupId)}"${open}>
-        <summary class="collapsed-summary">
-          <span class="collapsed-title">Steps</span>
-          <span class="collapsed-text">${escapeHtml(summarizeIntermediateItems(items))}</span>
-        </summary>
-        <div class="collapsed-body turn-steps-body">
-          ${items.map((item) => renderItem(item, latestCollapsibleItemId)).join("")}
-        </div>
-      </details>
-    </article>
-  `;
-}
-
-function renderTurnItems(turn, latestCollapsibleItemId = "") {
+function splitTurnItemsForRender(turn) {
   const items = Array.isArray(turn?.items) ? turn.items : [];
 
   if (isLiveStatus(turn?.status) || items.length < 3) {
-    return items.map((item) => renderItem(item, latestCollapsibleItemId)).join("");
+    return null;
   }
 
   const firstUserIndex = items.findIndex((item) => item?.type === "userMessage");
   const lastAgentIndex = findLastItemIndexByType(items, "agentMessage");
 
   if (firstUserIndex === -1 || lastAgentIndex === -1 || firstUserIndex >= lastAgentIndex) {
+    return null;
+  }
+
+  return {
+    leadingItems: items.slice(0, firstUserIndex + 1),
+    intermediateItems: items.slice(firstUserIndex + 1, lastAgentIndex).concat(items.slice(lastAgentIndex + 1)),
+    finalAgentItem: items[lastAgentIndex],
+  };
+}
+
+function renderCollapsibleArticle({
+  bubbleClass = "agent",
+  itemId = "",
+  itemType = "",
+  title = "Item",
+  summary = "",
+  meta = "",
+  open = false,
+  bodyClass = "",
+  bodyHtml = "",
+}) {
+  const escapedItemId = escapeHtml(itemId);
+  const escapedItemType = escapeHtml(itemType);
+  const bodyClasses = ["collapsed-body"];
+
+  if (bodyClass) {
+    bodyClasses.push(bodyClass);
+  }
+
+  return `
+    <article class="bubble ${bubbleClass} collapsed-item" data-item-id="${escapedItemId}" data-item-type="${escapedItemType}">
+      <details data-item-id="${escapedItemId}"${open ? " open" : ""}>
+        <summary class="collapsed-summary">
+          <span class="collapsed-title">${escapeHtml(title)}</span>
+          <span class="collapsed-text" data-role="summary">${escapeHtml(summary || title)}</span>
+          ${meta ? `<span class="collapsed-meta" data-role="meta">${escapeHtml(meta)}</span>` : ""}
+        </summary>
+        <div class="${bodyClasses.join(" ")}">${bodyHtml}</div>
+      </details>
+    </article>
+  `;
+}
+
+function renderIntermediateItemsBody(items, latestCollapsibleItemId = "") {
+  return items.map((item) => renderItem(item, latestCollapsibleItemId)).join("");
+}
+
+function renderIntermediateItemsGroup(turn, items, latestCollapsibleItemId = "") {
+  if (!Array.isArray(items) || !items.length) {
+    return "";
+  }
+
+  const groupId = `${turn.id}:steps`;
+  const open = shouldExpandConversationItem(groupId, latestCollapsibleItemId);
+
+  return renderCollapsibleArticle({
+    itemId: groupId,
+    itemType: "turnSteps",
+    title: "Steps",
+    summary: summarizeIntermediateItems(items),
+    open,
+    bodyClass: "turn-steps-body",
+    bodyHtml: open ? renderIntermediateItemsBody(items, latestCollapsibleItemId) : "",
+  });
+}
+
+function renderTurnItems(turn, latestCollapsibleItemId = "") {
+  const items = Array.isArray(turn?.items) ? turn.items : [];
+  const groupedItems = splitTurnItemsForRender(turn);
+
+  if (!groupedItems) {
     return items.map((item) => renderItem(item, latestCollapsibleItemId)).join("");
   }
 
-  const leadingItems = items.slice(0, firstUserIndex + 1);
-  const intermediateItems = items.slice(firstUserIndex + 1, lastAgentIndex).concat(items.slice(lastAgentIndex + 1));
-  const finalAgentItem = items[lastAgentIndex];
-
   return [
-    ...leadingItems.map((item) => renderItem(item, latestCollapsibleItemId)),
-    renderIntermediateItemsGroup(turn, intermediateItems, latestCollapsibleItemId),
-    renderItem(finalAgentItem, latestCollapsibleItemId),
+    ...groupedItems.leadingItems.map((item) => renderItem(item, latestCollapsibleItemId)),
+    renderIntermediateItemsGroup(turn, groupedItems.intermediateItems, latestCollapsibleItemId),
+    renderItem(groupedItems.finalAgentItem, latestCollapsibleItemId),
   ].filter(Boolean).join("");
+}
+
+function findConversationItemRecord(itemId, thread = state.selectedThread) {
+  if (!itemId || !thread) {
+    return null;
+  }
+
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+
+  if (itemId.endsWith(":steps")) {
+    const turnId = itemId.slice(0, -":steps".length);
+    const turn = turns.find((entry) => entry?.id === turnId);
+    const groupedItems = splitTurnItemsForRender(turn);
+
+    if (!turn || !groupedItems?.intermediateItems.length) {
+      return null;
+    }
+
+    return {
+      kind: "turnSteps",
+      itemId,
+      items: groupedItems.intermediateItems,
+    };
+  }
+
+  for (const turn of turns) {
+    const items = Array.isArray(turn?.items) ? turn.items : [];
+    const item = items.find((entry) => entry?.id === itemId);
+
+    if (item) {
+      return {
+        kind: "item",
+        item,
+      };
+    }
+  }
+
+  return null;
+}
+
+function renderConversationItemBodyMarkup(itemId, latestCollapsibleItemId = findLatestCollapsibleItemId(state.selectedThread)) {
+  const record = findConversationItemRecord(itemId);
+
+  if (!record) {
+    return "";
+  }
+
+  if (record.kind === "turnSteps") {
+    return renderIntermediateItemsBody(record.items, latestCollapsibleItemId);
+  }
+
+  const { item } = record;
+
+  if (item.type === "userMessage" || item.type === "agentMessage") {
+    return renderMessageItemBody(item);
+  }
+
+  if (item.type === "plan") {
+    return renderCollapsibleDisplayBody(getPlanDisplay(item));
+  }
+
+  if (item.type === "reasoning") {
+    return renderCollapsibleDisplayBody(getReasoningDisplay(item));
+  }
+
+  if (item.type === "commandExecution") {
+    return renderCollapsibleDisplayBody(getCommandExecutionDisplay(item));
+  }
+
+  if (item.type === "fileChange") {
+    return renderFileChangeBody(item);
+  }
+
+  if (item.type === "mcpToolCall") {
+    return renderCollapsibleDisplayBody({
+      title: "MCP Tool",
+      summary: `${item.server || "mcp"} · ${item.tool || "tool"}`,
+      body: JSON.stringify(item, null, 2),
+      meta: formatStatus(item.status),
+    });
+  }
+
+  if (item.type === "dynamicToolCall") {
+    return renderCollapsibleDisplayBody({
+      title: "Tool Call",
+      summary: item.tool || "dynamic tool",
+      bodyHtml: renderToolCallBody(item),
+      meta: formatStatus(item.status),
+    });
+  }
+
+  if (item.type === "collabAgentToolCall") {
+    return renderCollapsibleDisplayBody({
+      title: "Collaboration",
+      summary: `${item.tool || "agent tool"}${item.model ? ` · ${item.model}` : ""}`,
+      body: JSON.stringify(item, null, 2),
+      meta: formatStatus(item.status),
+    });
+  }
+
+  return renderCollapsibleDisplayBody({
+    title: item.type,
+    summary: oneLine(JSON.stringify(item)),
+    body: JSON.stringify(item, null, 2),
+  });
+}
+
+function hydrateConversationDetails(details, { force = false } = {}) {
+  if (!(details instanceof HTMLDetailsElement)) {
+    return;
+  }
+
+  const itemId = cleanString(details.dataset.itemId);
+  const bodyNode = details.querySelector(".collapsed-body");
+
+  if (!itemId || !bodyNode) {
+    return;
+  }
+
+  if (!force && bodyNode.childElementCount > 0) {
+    return;
+  }
+
+  bodyNode.innerHTML = renderConversationItemBodyMarkup(itemId);
+}
+
+function handleConversationDetailsToggle(event) {
+  const details = event.target;
+
+  if (!(details instanceof HTMLDetailsElement) || !details.open) {
+    return;
+  }
+
+  hydrateConversationDetails(details);
 }
 
 function applyStreamingNotification(message) {
@@ -1343,7 +1751,7 @@ function applyStreamingNotification(message) {
     item.text = item.text || "";
     item.text = `${item.text || ""}${params.delta || ""}`;
     syncThreadSummary(state.selectedThread);
-    renderProjects();
+    scheduleProjectsRender();
     if (!patchStreamingConversationItem(item)) {
       renderSelectedThread();
     }
@@ -1426,8 +1834,8 @@ function applyStreamingNotification(message) {
 
 function persistSelection() {
   localStorage.setItem("selectedProjectId", state.selectedProjectId || "");
-  localStorage.setItem("selectedThreadId", state.selectedThreadId || "");
-  localStorage.setItem("activeThreadTab", state.activeThreadTab || "chat");
+  localStorage.setItem("selectedThreadId", persistedProjectThreadId() || "");
+  localStorage.setItem("activeThreadTab", projectThreadTab() || state.activeThreadTab || "chat");
   localStorage.setItem("sidebarCollapsed", String(state.sidebarCollapsed));
   localStorage.setItem("autoscroll", String(state.autoscroll));
   localStorage.setItem("sidebarWidth", String(state.sidebarWidth));
@@ -1469,40 +1877,8 @@ function projectDisplayName(project) {
   return segments.at(-1) || normalized || cwd;
 }
 
-function toggleProjectCollapsed(projectId) {
-  if (!projectId) {
-    return;
-  }
-
-  if (state.collapsedProjectIds.has(projectId)) {
-    state.collapsedProjectIds.delete(projectId);
-  } else {
-    state.collapsedProjectIds.add(projectId);
-  }
-}
-
-function toggleProjectThreads(projectId) {
-  if (!projectId) {
-    return;
-  }
-
-  if (state.expandedProjectIds.has(projectId)) {
-    state.expandedProjectIds.delete(projectId);
-  } else {
-    state.expandedProjectIds.add(projectId);
-  }
-}
-
 function optionHtml(value, label) {
   return `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`;
-}
-
-function createResourceEditorState() {
-  return {
-    monaco: null,
-    editor: null,
-    editorPromise: null,
-  };
 }
 
 function createResourceTab(pathname, position = {}) {
@@ -1511,22 +1887,7 @@ function createResourceTab(pathname, position = {}) {
     projectId: cleanString(position.projectId),
     path: pathname,
     name: fileNameFromPath(pathname),
-    kind: "loading",
-    mimeType: "",
-    size: 0,
-    mtimeMs: 0,
-    writable: false,
-    viewUrl: "",
-    loading: true,
-    error: "",
-    saveState: "idle",
-    saveTimer: 0,
-    saveInFlight: false,
-    saveQueued: false,
     pendingSelection: normalizeResourceSelection(position),
-    model: null,
-    viewState: null,
-    suppressModelChange: false,
   };
 }
 
@@ -1578,29 +1939,505 @@ function setProjectActiveResource(projectId, resourceId = "") {
   state.activeResourceIdByProjectId[normalizedProjectId] = cleanString(resourceId);
 }
 
+function createDraftThreadTab(projectId) {
+  state.draftTabSequence += 1;
+  const normalizedProjectId = cleanString(projectId);
+  return {
+    id: `chat:draft:${normalizedProjectId}:${Date.now()}:${state.draftTabSequence}`,
+    pane: "chat",
+    projectId: normalizedProjectId,
+    threadId: "",
+  };
+}
+
+function createThreadTab(projectId, threadId) {
+  const normalizedProjectId = cleanString(projectId);
+  const normalizedThreadId = cleanString(threadId);
+  return {
+    id: `chat:${normalizedThreadId}`,
+    pane: "chat",
+    projectId: normalizedProjectId,
+    threadId: normalizedThreadId,
+  };
+}
+
+function createTerminalTab(projectId) {
+  const normalizedProjectId = cleanString(projectId);
+  return {
+    id: `terminal:${normalizedProjectId}`,
+    pane: "terminal",
+    projectId: normalizedProjectId,
+  };
+}
+
+function createResourcePaneTab(projectId, resourceId) {
+  const normalizedProjectId = cleanString(projectId);
+  const normalizedResourceId = cleanString(resourceId);
+  return {
+    id: `resource:${normalizedResourceId}`,
+    pane: "resource",
+    projectId: normalizedProjectId,
+    resourceId: normalizedResourceId,
+  };
+}
+
+function ensureProjectOpenTabState(projectId = state.selectedProjectId) {
+  const normalizedProjectId = cleanString(projectId);
+
+  if (!normalizedProjectId) {
+    return { tabs: [], activeTabId: "" };
+  }
+
+  if (!Array.isArray(state.openTabsByProjectId[normalizedProjectId])) {
+    state.openTabsByProjectId[normalizedProjectId] = [];
+  }
+
+  if (typeof state.activeTabIdByProjectId[normalizedProjectId] !== "string") {
+    state.activeTabIdByProjectId[normalizedProjectId] = "";
+  }
+
+  return {
+    tabs: state.openTabsByProjectId[normalizedProjectId],
+    activeTabId: state.activeTabIdByProjectId[normalizedProjectId],
+  };
+}
+
+function projectOpenTabs(projectId = state.selectedProjectId) {
+  return ensureProjectOpenTabState(projectId).tabs;
+}
+
+function projectActiveTabId(projectId = state.selectedProjectId) {
+  return ensureProjectOpenTabState(projectId).activeTabId;
+}
+
+function setProjectActiveTabId(projectId, tabId = "") {
+  const normalizedProjectId = cleanString(projectId);
+
+  if (!normalizedProjectId) {
+    return;
+  }
+
+  ensureProjectOpenTabState(normalizedProjectId);
+  state.activeTabIdByProjectId[normalizedProjectId] = cleanString(tabId);
+}
+
+function findProjectTab(projectId, tabId) {
+  const normalizedTabId = cleanString(tabId);
+  if (!normalizedTabId) {
+    return null;
+  }
+
+  return projectOpenTabs(projectId).find((tab) => tab.id === normalizedTabId) || null;
+}
+
+function activeProjectTab(projectId = state.selectedProjectId) {
+  const activeTabId = projectActiveTabId(projectId);
+  return findProjectTab(projectId, activeTabId);
+}
+
+function upsertProjectTab(tab, { activate = true } = {}) {
+  if (!tab?.id || !tab?.projectId) {
+    return null;
+  }
+
+  const tabs = projectOpenTabs(tab.projectId);
+  const existingIndex = tabs.findIndex((entry) => entry.id === tab.id);
+
+  if (existingIndex >= 0) {
+    tabs[existingIndex] = {
+      ...tabs[existingIndex],
+      ...tab,
+    };
+  } else {
+    tabs.push({ ...tab });
+  }
+
+  if (activate) {
+    setProjectActiveTabId(tab.projectId, tab.id);
+  }
+
+  return findProjectTab(tab.projectId, tab.id);
+}
+
+function openProjectThreadTab(projectId, threadId, { activate = true } = {}) {
+  const normalizedThreadId = cleanString(threadId);
+
+  if (!normalizedThreadId) {
+    return null;
+  }
+
+  return upsertProjectTab(createThreadTab(projectId, normalizedThreadId), { activate });
+}
+
+function openProjectTerminalTab(projectId, { activate = true } = {}) {
+  return upsertProjectTab(createTerminalTab(projectId), { activate });
+}
+
+function openProjectResourceTab(projectId, resourceId, { activate = true } = {}) {
+  const normalizedResourceId = cleanString(resourceId);
+
+  if (!normalizedResourceId) {
+    return null;
+  }
+
+  return upsertProjectTab(createResourcePaneTab(projectId, normalizedResourceId), { activate });
+}
+
+function createProjectDraftTab(projectId, { activate = true } = {}) {
+  return upsertProjectTab(createDraftThreadTab(projectId), { activate });
+}
+
+function allOpenTabs() {
+  return Object.values(state.openTabsByProjectId)
+    .flatMap((tabs) => Array.isArray(tabs) ? tabs : []);
+}
+
+function findOpenTab(tabId) {
+  const normalizedTabId = cleanString(tabId);
+
+  if (!normalizedTabId) {
+    return null;
+  }
+
+  return allOpenTabs().find((tab) => tab.id === normalizedTabId) || null;
+}
+
+function paneFrameSrc(tab) {
+  const pane = tab?.pane;
+  if (pane === "terminal") {
+    return "/panes/terminal.html";
+  }
+
+  if (pane === "resource") {
+    return "/panes/resource.html";
+  }
+
+  const url = new URL("/panes/chat.html", window.location.origin);
+  if (tab?.projectId) {
+    url.searchParams.set("projectId", cleanString(tab.projectId));
+  }
+  if (tab?.threadId) {
+    url.searchParams.set("threadId", cleanString(tab.threadId));
+  }
+  if (tab?.id) {
+    url.searchParams.set("tabId", cleanString(tab.id));
+  }
+  return `${url.pathname}${url.search}`;
+}
+
+function paneFrameTitle(tab) {
+  const label = projectTabLabel(tab);
+  if (!label) {
+    return "Project tab";
+  }
+
+  return `${label} · ${formatStatus(tab?.pane || "tab")}`;
+}
+
+function ensurePaneFrameEntry(tab) {
+  if (!tab?.id || !tab?.pane) {
+    return null;
+  }
+
+  let entry = paneFrameEntries.get(tab.id);
+
+  if (entry && entry.pane !== tab.pane) {
+    removePaneFrameEntry(tab.id);
+    entry = null;
+  }
+
+  if (entry) {
+    entry.frame.title = paneFrameTitle(tab);
+    return entry;
+  }
+
+  const frame = document.createElement("iframe");
+  frame.className = "pane-frame tab-pane-frame";
+  frame.dataset.tabId = tab.id;
+  frame.dataset.pane = tab.pane;
+  frame.title = paneFrameTitle(tab);
+  frame.src = paneFrameSrc(tab);
+  frame.setAttribute("aria-hidden", "true");
+  elements.conversation.appendChild(frame);
+
+  entry = {
+    tabId: tab.id,
+    pane: tab.pane,
+    frame,
+    ready: false,
+  };
+  paneFrameEntries.set(tab.id, entry);
+  return entry;
+}
+
+function removePaneFrameEntry(tabId) {
+  const normalizedTabId = cleanString(tabId);
+  const entry = paneFrameEntries.get(normalizedTabId);
+
+  if (!entry) {
+    return;
+  }
+
+  paneFrameEntries.delete(normalizedTabId);
+  entry.frame.remove();
+}
+
+function renamePaneFrameEntry(previousTabId, nextTab) {
+  const normalizedPreviousTabId = cleanString(previousTabId);
+  const entry = paneFrameEntries.get(normalizedPreviousTabId);
+
+  if (!entry || !nextTab?.id) {
+    return;
+  }
+
+  paneFrameEntries.delete(normalizedPreviousTabId);
+  entry.tabId = nextTab.id;
+  entry.pane = nextTab.pane;
+  entry.frame.dataset.tabId = nextTab.id;
+  entry.frame.dataset.pane = nextTab.pane;
+  entry.frame.title = paneFrameTitle(nextTab);
+  entry.frame.src = paneFrameSrc(nextTab);
+  paneFrameEntries.set(nextTab.id, entry);
+}
+
+function paneFrameEntryForWindow(targetWindow) {
+  if (!targetWindow) {
+    return null;
+  }
+
+  for (const entry of paneFrameEntries.values()) {
+    if (entry.frame.contentWindow === targetWindow) {
+      return entry;
+    }
+  }
+
+  return null;
+}
+
+function replaceProjectTab(projectId, previousTabId, nextTab) {
+  const normalizedProjectId = cleanString(projectId);
+  const normalizedPreviousTabId = cleanString(previousTabId);
+
+  if (!normalizedProjectId || !normalizedPreviousTabId || !nextTab?.id) {
+    return null;
+  }
+
+  const tabs = projectOpenTabs(normalizedProjectId);
+  const previousIndex = tabs.findIndex((entry) => entry.id === normalizedPreviousTabId);
+
+  if (previousIndex === -1) {
+    return upsertProjectTab(nextTab, { activate: true });
+  }
+
+  const existingIndex = tabs.findIndex((entry) => entry.id === nextTab.id);
+  if (existingIndex >= 0 && existingIndex !== previousIndex) {
+    tabs.splice(previousIndex, 1);
+  } else {
+    tabs[previousIndex] = {
+      ...tabs[previousIndex],
+      ...nextTab,
+    };
+  }
+
+  if (projectActiveTabId(normalizedProjectId) === normalizedPreviousTabId) {
+    setProjectActiveTabId(normalizedProjectId, nextTab.id);
+  }
+
+  renamePaneFrameEntry(normalizedPreviousTabId, nextTab);
+  return findProjectTab(normalizedProjectId, nextTab.id);
+}
+
+function closeProjectTab(projectId, tabId, { ensureFallback = true } = {}) {
+  const normalizedProjectId = cleanString(projectId);
+  const normalizedTabId = cleanString(tabId);
+
+  if (!normalizedProjectId || !normalizedTabId) {
+    return;
+  }
+
+  const tabs = projectOpenTabs(normalizedProjectId);
+  const index = tabs.findIndex((entry) => entry.id === normalizedTabId);
+
+  if (index === -1) {
+    return;
+  }
+
+  tabs.splice(index, 1);
+  removePaneFrameEntry(normalizedTabId);
+
+  if (projectActiveTabId(normalizedProjectId) === normalizedTabId) {
+    const nextTab = tabs[index] || tabs[index - 1] || null;
+    setProjectActiveTabId(normalizedProjectId, nextTab?.id || "");
+  }
+
+  if (ensureFallback && tabs.length === 0) {
+    createProjectDraftTab(normalizedProjectId, { activate: true });
+  }
+}
+
+function closeProjectThreadTabs(projectId, threadId) {
+  const normalizedProjectId = cleanString(projectId);
+  const normalizedThreadId = cleanString(threadId);
+
+  if (!normalizedProjectId || !normalizedThreadId) {
+    return;
+  }
+
+  const tabIds = projectOpenTabs(normalizedProjectId)
+    .filter((tab) => tab.pane === "chat" && cleanString(tab.threadId) === normalizedThreadId)
+    .map((tab) => tab.id);
+
+  tabIds.forEach((tabId, index) => {
+    closeProjectTab(normalizedProjectId, tabId, { ensureFallback: index === tabIds.length - 1 });
+  });
+}
+
 function normalizeThreadTab(tab) {
   return ["chat", "terminal", "resource"].includes(tab) ? tab : "chat";
 }
 
 function projectThreadTab(projectId = state.selectedProjectId) {
-  const normalizedProjectId = cleanString(projectId);
-  return normalizeThreadTab(state.threadTabByProjectId[normalizedProjectId] || "chat");
+  return normalizeThreadTab(activeProjectTab(projectId)?.pane || "chat");
 }
 
 function setProjectThreadTab(tab, projectId = state.selectedProjectId) {
   const normalizedProjectId = cleanString(projectId);
   const nextTab = normalizeThreadTab(tab);
 
-  if (normalizedProjectId) {
-    state.threadTabByProjectId[normalizedProjectId] = nextTab;
+  if (!normalizedProjectId) {
+    state.activeThreadTab = nextTab;
+    return;
   }
 
+  if (nextTab === "terminal") {
+    openProjectTerminalTab(normalizedProjectId, { activate: true });
+  } else if (nextTab === "resource") {
+    const resourceId = projectActiveResourceId(normalizedProjectId);
+    if (resourceId) {
+      openProjectResourceTab(normalizedProjectId, resourceId, { activate: true });
+    } else {
+      createProjectDraftTab(normalizedProjectId, { activate: true });
+    }
+  } else {
+    const existingChatTab = projectOpenTabs(normalizedProjectId).find((entry) => entry.pane === "chat");
+    if (existingChatTab) {
+      setProjectActiveTabId(normalizedProjectId, existingChatTab.id);
+    } else {
+      createProjectDraftTab(normalizedProjectId, { activate: true });
+    }
+  }
+
+  state.threadTabByProjectId[normalizedProjectId] = nextTab;
   state.activeThreadTab = nextTab;
+}
+
+function persistedProjectThreadId(projectId = state.selectedProjectId) {
+  const activeTab = activeProjectTab(projectId);
+  if (activeTab?.pane === "chat" && activeTab.threadId) {
+    return activeTab.threadId;
+  }
+
+  return projectOpenTabs(projectId).find((tab) => tab.pane === "chat" && cleanString(tab.threadId))?.threadId || "";
+}
+
+function normalizeProjectOpenTabs(projectId = state.selectedProjectId) {
+  const normalizedProjectId = cleanString(projectId);
+
+  if (!normalizedProjectId) {
+    return;
+  }
+
+  const tabs = projectOpenTabs(normalizedProjectId);
+  const filteredTabs = tabs.filter((tab) => {
+    if (tab.pane === "resource") {
+      return Boolean(findResource(tab.resourceId));
+    }
+
+    return true;
+  });
+
+  if (filteredTabs.length !== tabs.length) {
+    state.openTabsByProjectId[normalizedProjectId] = filteredTabs;
+  }
+
+  if (!projectOpenTabs(normalizedProjectId).some((tab) => tab.id === projectActiveTabId(normalizedProjectId))) {
+    setProjectActiveTabId(normalizedProjectId, projectOpenTabs(normalizedProjectId)[0]?.id || "");
+  }
+
+  if (!projectOpenTabs(normalizedProjectId).length) {
+    createProjectDraftTab(normalizedProjectId, { activate: true });
+  }
+}
+
+function initializeProjectTabs() {
+  const projectId = cleanString(state.selectedProjectId);
+
+  if (!projectId) {
+    return;
+  }
+
+  const initialTab = normalizeThreadTab(state.activeThreadTab);
+  const persistedThreadId = cleanString(state.selectedThreadId);
+
+  if (persistedThreadId) {
+    openProjectThreadTab(projectId, persistedThreadId, { activate: initialTab === "chat" });
+  }
+
+  if (initialTab === "terminal") {
+    openProjectTerminalTab(projectId, { activate: true });
+  }
+
+  if (!projectOpenTabs(projectId).length) {
+    createProjectDraftTab(projectId, { activate: true });
+  }
 }
 
 function syncSelectedProjectThreadTab() {
   const projectId = cleanString(state.selectedProjectId);
-  state.activeThreadTab = projectId ? projectThreadTab(projectId) : normalizeThreadTab(state.activeThreadTab);
+  if (!projectId) {
+    state.activeThreadTab = normalizeThreadTab(state.activeThreadTab);
+    state.selectedThreadId = "";
+    state.selectedThread = null;
+    state.currentTurnId = "";
+    return;
+  }
+
+  normalizeProjectOpenTabs(projectId);
+  const tab = activeProjectTab(projectId) || projectOpenTabs(projectId)[0] || null;
+
+  if (!tab) {
+    state.activeThreadTab = "chat";
+    state.selectedThreadId = "";
+    state.selectedThread = null;
+    state.currentTurnId = "";
+    return;
+  }
+
+  setProjectActiveTabId(projectId, tab.id);
+  state.threadTabByProjectId[projectId] = tab.pane;
+  state.activeThreadTab = normalizeThreadTab(tab.pane);
+
+  if (tab.pane === "chat") {
+    const nextThreadId = cleanString(tab.threadId);
+    if (nextThreadId !== state.selectedThreadId) {
+      state.selectedThreadId = nextThreadId;
+      if (state.selectedThread?.id !== nextThreadId) {
+        state.selectedThread = null;
+        state.currentTurnId = "";
+      } else {
+        state.currentTurnId = findLatestTurnId(state.selectedThread);
+      }
+    }
+  } else {
+    state.selectedThreadId = "";
+    state.selectedThread = null;
+    state.currentTurnId = "";
+  }
+
+  if (tab.pane === "resource" && tab.resourceId) {
+    setProjectActiveResource(projectId, tab.resourceId);
+  }
+
   normalizeSelectedProjectResourceTab();
 }
 
@@ -1632,58 +2469,105 @@ function findResource(resourceId) {
   return allProjectResources().find((resource) => resource.id === resourceId) || null;
 }
 
-function findResourceByModel(model) {
-  return allProjectResources().find((resource) => resource.model === model) || null;
-}
-
 function fileNameFromPath(pathname) {
   const value = String(pathname || "").replace(/[\\/]+$/g, "");
   return value.split(/[\\/]/).filter(Boolean).at(-1) || value || "file";
 }
 
+function findThreadSummary(projectId, threadId) {
+  const normalizedThreadId = cleanString(threadId);
+
+  if (!normalizedThreadId) {
+    return null;
+  }
+
+  if (state.selectedThread?.id === normalizedThreadId) {
+    return state.selectedThread;
+  }
+
+  const threads = state.projectThreads[cleanString(projectId)] || [];
+  return threads.find((thread) => thread.id === normalizedThreadId) || null;
+}
+
+function projectTabLabel(tab) {
+  if (!tab) {
+    return "Tab";
+  }
+
+  if (tab.pane === "terminal") {
+    return "Terminal";
+  }
+
+  if (tab.pane === "resource") {
+    return findResource(tab.resourceId)?.name || "Resource";
+  }
+
+  if (!cleanString(tab.threadId)) {
+    return "New Chat";
+  }
+
+  const thread = findThreadSummary(tab.projectId, tab.threadId);
+  return oneLine(thread?.name || thread?.preview || "Conversation") || "Conversation";
+}
+
+function projectTabTitle(tab) {
+  if (!tab) {
+    return "Open tab";
+  }
+
+  if (tab.pane === "terminal") {
+    const project = state.projects.find((entry) => entry.id === tab.projectId);
+    return project?.cwd || projectDisplayName(project) || "Terminal";
+  }
+
+  if (tab.pane === "resource") {
+    return findResource(tab.resourceId)?.path || projectTabLabel(tab);
+  }
+
+  const thread = findThreadSummary(tab.projectId, tab.threadId);
+  return thread?.name || thread?.preview || "New conversation";
+}
+
 function renderThreadTabs() {
-  const resources = projectResources();
-  const activeResourceId = projectActiveResourceId();
+  const projectId = cleanString(state.selectedProjectId);
+  const tabs = projectOpenTabs(projectId);
+  const activeTabId = projectActiveTabId(projectId);
+  const hasTerminalTab = tabs.some((tab) => tab.pane === "terminal");
 
   return `
-    <div class="thread-tabbar" role="tablist" aria-label="Thread view">
-      <button
-        class="thread-tab ${state.activeThreadTab === "chat" ? "active" : ""}"
-        data-action="select-thread-tab"
-        data-tab="chat"
-        role="tab"
-        aria-selected="${state.activeThreadTab === "chat" ? "true" : "false"}"
-      >Chat</button>
-      <button
-        class="thread-tab ${state.activeThreadTab === "terminal" ? "active" : ""}"
-        data-action="select-thread-tab"
-        data-tab="terminal"
-        role="tab"
-        aria-selected="${state.activeThreadTab === "terminal" ? "true" : "false"}"
-      >Terminal</button>
-      ${resources.map((resource) => {
-        const active = state.activeThreadTab === "resource" && activeResourceId === resource.id;
-        return `
-          <span class="thread-resource-tab ${active ? "active" : ""}">
-            <button
-              class="thread-tab thread-resource-tab-button ${active ? "active" : ""}"
-              data-action="select-resource-tab"
-              data-id="${escapeHtml(resource.id)}"
-              role="tab"
-              aria-selected="${active ? "true" : "false"}"
-              title="${escapeHtml(resource.path)}"
-            >${escapeHtml(resource.name)}</button>
-            <button
-              type="button"
-              class="thread-resource-tab-close"
-              data-action="close-resource-tab"
-              data-id="${escapeHtml(resource.id)}"
-              aria-label="${escapeHtml(`Close ${resource.name}`)}"
-              title="${escapeHtml(`Close ${resource.name}`)}"
-            >×</button>
-          </span>
-        `;
-      }).join("")}
+    <div class="thread-tabbar-wrap">
+      <div class="thread-tabbar" role="tablist" aria-label="Project tabs">
+        ${tabs.map((tab) => {
+          const active = tab.id === activeTabId;
+          const label = projectTabLabel(tab);
+          const title = projectTabTitle(tab);
+
+          return `
+            <span class="thread-resource-tab ${active ? "active" : ""}">
+              <button
+                class="thread-tab thread-resource-tab-button ${active ? "active" : ""}"
+                data-action="select-project-tab"
+                data-id="${escapeHtml(tab.id)}"
+                role="tab"
+                aria-selected="${active ? "true" : "false"}"
+                title="${escapeHtml(title)}"
+              >${escapeHtml(label)}</button>
+              <button
+                type="button"
+                class="thread-resource-tab-close"
+                data-action="close-project-tab"
+                data-id="${escapeHtml(tab.id)}"
+                aria-label="${escapeHtml(`Close ${label}`)}"
+                title="${escapeHtml(`Close ${label}`)}"
+              >×</button>
+            </span>
+          `;
+        }).join("")}
+      </div>
+      <div class="thread-tabbar-actions">
+        <button type="button" class="thread-tab-action" data-action="new-thread" title="Open a new conversation tab">+ Chat</button>
+        ${hasTerminalTab ? "" : `<button type="button" class="thread-tab-action" data-action="open-terminal-tab" title="Open a terminal tab">Terminal</button>`}
+      </div>
     </div>
   `;
 }
@@ -1743,12 +2627,25 @@ function renderThreadActionMenu() {
 }
 
 function renderProjects() {
-  const projects = sortProjectsByRecentConversationActivity(state.projects, state.projectThreads);
-  const selectedIndex = projects.findIndex((project) => project.id === state.selectedProjectId);
+  const projects = state.projects.slice();
+  const project = selectedProject();
+  const projectId = cleanString(project?.id || state.selectedProjectId);
+  const projectPath = project ? (project.cwd || projectDisplayName(project)) : "";
+  const threadsLoaded = Boolean(projectId) && Object.prototype.hasOwnProperty.call(state.projectThreads, projectId);
+  const threads = threadsLoaded ? (state.projectThreads[projectId] || []) : [];
+  const pendingNewThread = state.pendingNewThread
+    && !state.selectedThreadId
+    && cleanString(state.pendingNewThread.projectId) === projectId
+      ? state.pendingNewThread
+      : null;
 
-  if (selectedIndex > 0) {
-    const [selectedProject] = projects.splice(selectedIndex, 1);
-    projects.unshift(selectedProject);
+  if (elements.projectSelect) {
+    elements.projectSelect.innerHTML = projects.length
+      ? projects.map((entry) => optionHtml(entry.id, projectDisplayName(entry))).join("")
+      : optionHtml("", "No projects");
+    elements.projectSelect.disabled = projects.length === 0;
+    elements.projectSelect.value = projects.some((entry) => entry.id === projectId) ? projectId : "";
+    elements.projectSelect.title = projectPath || "No project selected";
   }
 
   elements.archivedToggle.textContent = state.archived ? "Archived" : "Active";
@@ -1765,117 +2662,63 @@ function renderProjects() {
     return;
   }
 
-  elements.projectList.innerHTML = projects.map((project) => {
-    const threadsLoaded = Object.prototype.hasOwnProperty.call(state.projectThreads, project.id);
-    const threads = threadsLoaded ? (state.projectThreads[project.id] || []) : [];
-    const collapsedVisibleCount = collapsedVisibleThreadCount(threads);
-    const projectCollapsed = state.collapsedProjectIds.has(project.id);
-    const expanded = state.expandedProjectIds.has(project.id);
-    const visibleThreads = threadsLoaded ? (expanded ? threads : threads.slice(0, collapsedVisibleCount)) : [];
-    const moreCount = threadsLoaded ? Math.max(0, threads.length - collapsedVisibleCount) : 0;
-    const projectStackId = `project-stack-${project.id}`;
-    const projectName = projectDisplayName(project);
-    const projectPath = project.cwd || projectName;
-    const caretLabel = `${projectCollapsed ? "Expand" : "Collapse"} ${projectName}`;
-    const conversationsHtml = !threadsLoaded
-      ? `<div class="conversation-empty loading">Loading conversations...</div>`
-      : visibleThreads.length
-        ? visibleThreads.map((thread) => {
-          const preview = (thread.preview || thread.name || "New conversation").replace(/\s+/g, " ").trim();
-          const timeText = relativeTime(thread.updatedAt || thread.createdAt);
-          const activity = describeThreadActivity(thread);
-          const rowClasses = ["conversation-row"];
-          if (thread.id === state.selectedThreadId) {
-            rowClasses.push("selected");
-          }
-          if (activity.isWorking) {
-            rowClasses.push("working");
-          }
-          return `
-            <button class="${rowClasses.join(" ")}" data-action="select-thread" data-project-id="${escapeHtml(project.id)}" data-id="${escapeHtml(thread.id)}">
-              <span class="conversation-primary">
-                <span class="conversation-title">${escapeHtml(preview)}</span>
-                ${activity.isWorking ? `<span class="conversation-status">${renderActivityBadge(activity.label, activity.statusText, "sidebar")}</span>` : ""}
-              </span>
-              <span class="conversation-time">${escapeHtml(timeText)}</span>
-            </button>
-          `;
-        }).join("")
-        : `<div class="conversation-empty">No conversations yet</div>`;
-
-    return `
-      <section class="project-node ${project.id === state.selectedProjectId ? "active" : ""}">
-        <div class="project-row project-row-with-menu">
-          <button
-            type="button"
-            class="project-caret-button"
-            data-action="toggle-project-collapse"
-            data-project-id="${escapeHtml(project.id)}"
-            aria-controls="${escapeHtml(projectStackId)}"
-            aria-expanded="${projectCollapsed ? "false" : "true"}"
-            aria-label="${escapeHtml(caretLabel)}"
-            title="${escapeHtml(caretLabel)}"
-          >
-            <span class="project-caret">⌄</span>
+  elements.projectList.innerHTML = !threadsLoaded
+    ? `<div class="conversation-empty loading">Loading conversations...</div>`
+    : (threads.length || pendingNewThread)
+      ? `${pendingNewThread ? `
+        <button class="conversation-row selected working" type="button" disabled>
+          <span class="conversation-primary">
+            <span class="conversation-title">${escapeHtml(pendingNewThread.title)}</span>
+            <span class="conversation-status">${renderActivityBadge("Starting", "Starting conversation", "sidebar")}</span>
+          </span>
+          <span class="conversation-time">now</span>
+        </button>
+      ` : ""}${threads.map((thread) => {
+        const preview = (thread.preview || thread.name || "New conversation").replace(/\s+/g, " ").trim();
+        const timeText = relativeTime(thread.updatedAt || thread.createdAt);
+        const activity = describeThreadActivity(thread);
+        const rowClasses = ["conversation-row"];
+        if (thread.id === state.selectedThreadId) {
+          rowClasses.push("selected");
+        }
+        if (activity.isWorking) {
+          rowClasses.push("working");
+        }
+        return `
+          <button class="${rowClasses.join(" ")}" data-action="select-thread" data-project-id="${escapeHtml(projectId)}" data-id="${escapeHtml(thread.id)}">
+            <span class="conversation-primary">
+              <span class="conversation-title">${escapeHtml(preview)}</span>
+              ${activity.isWorking ? `<span class="conversation-status">${renderActivityBadge(activity.label, activity.statusText, "sidebar")}</span>` : ""}
+            </span>
+            <span class="conversation-time">${escapeHtml(timeText)}</span>
           </button>
-          <button
-            type="button"
-            class="project-row-main"
-            data-action="select-project"
-            data-id="${escapeHtml(project.id)}"
-            title="${escapeHtml(projectPath)}"
-          >
-            <span class="project-name">${escapeHtml(projectName)}</span>
-          </button>
-          <button
-            type="button"
-            class="project-row-new-thread"
-            data-action="new-thread"
-            data-project-id="${escapeHtml(project.id)}"
-            aria-label="${escapeHtml(`New thread in ${projectName}`)}"
-            title="${escapeHtml(`New Thread in ${projectName}`)}"
-          >+</button>
-        </div>
-        <div id="${escapeHtml(projectStackId)}" class="conversation-stack${projectCollapsed ? " hidden" : ""}">
-          ${conversationsHtml}
-          ${!projectCollapsed && moreCount > 0 ? `
-            <button
-              type="button"
-              class="conversation-more-button"
-              data-action="toggle-project-threads"
-              data-project-id="${escapeHtml(project.id)}"
-              aria-expanded="${expanded ? "true" : "false"}"
-            >${expanded ? "Show less" : `Show ${moreCount} more`}</button>
-          ` : ""}
-        </div>
-      </section>
-    `;
-  }).join("");
-}
-
-function collapsedVisibleThreadCount(threads) {
-  if (!Array.isArray(threads) || threads.length === 0) {
-    return 0;
-  }
-
-  const selectedIndex = threads.findIndex((thread) => thread.id === state.selectedThreadId);
-  const requiredVisibleCount = selectedIndex >= 0 ? selectedIndex + 1 : DEFAULT_VISIBLE_THREADS;
-  return Math.min(threads.length, Math.max(DEFAULT_VISIBLE_THREADS, requiredVisibleCount));
+        `;
+      }).join("")}`
+      : `<div class="conversation-empty">No conversations yet</div>`;
 }
 
 function renderThreadHeader() {
   normalizeSelectedProjectResourceTab();
 
-  const thread = state.selectedThread;
+  const currentTab = activeProjectTab();
+  const chatTab = currentTab?.pane === "chat";
+  const thread = currentTab?.pane === "chat" ? state.selectedThread : null;
   const project = selectedProject();
-  const compactHeaderOnly = state.activeThreadTab === "resource" || state.activeThreadTab === "terminal";
+  const compactHeaderOnly = currentTab?.pane === "resource" || currentTab?.pane === "terminal";
   const projectName = project ? projectDisplayName(project) : "";
+  const pendingNewThread = state.pendingNewThread
+    && !state.selectedThreadId
+    && cleanString(state.pendingNewThread.projectId) === cleanString(project?.id)
+      ? state.pendingNewThread
+      : null;
   const emptyStateSubtitle = isSelectedThreadLoading()
     ? "Loading conversation..."
-    : state.activeThreadTab === "terminal"
+    : currentTab?.pane === "terminal"
     ? "Open a shell in the selected project on the host."
-    : state.activeThreadTab === "resource"
+    : currentTab?.pane === "resource"
     ? "Open a file link in the conversation to inspect it here."
+    : pendingNewThread
+    ? "Sending first message..."
     : "Start a new conversation below. The first prompt creates the thread.";
 
   if (!thread) {
@@ -1883,13 +2726,13 @@ function renderThreadHeader() {
       <div class="thread-toolbar-controls">
         <div class="thread-toolbar-top">
           ${renderThreadTabs()}
-          ${renderThreadActionMenu()}
+          ${chatTab ? "" : renderThreadActionMenu()}
         </div>
       </div>
-      ${compactHeaderOnly ? "" : `
+      ${chatTab || compactHeaderOnly ? "" : `
         <div class="thread-toolbar">
           <div class="thread-title-wrap">
-            <h2 class="thread-title" title="${escapeHtml(project?.cwd || projectName || "No project selected")}">${escapeHtml(projectName || "No project selected")}</h2>
+            <h2 class="thread-title" title="${escapeHtml(pendingNewThread?.title || project?.cwd || projectName || "No project selected")}">${escapeHtml(pendingNewThread?.title || projectName || "No project selected")}</h2>
             <p class="meta">${escapeHtml(emptyStateSubtitle)}</p>
           </div>
         </div>
@@ -1905,10 +2748,10 @@ function renderThreadHeader() {
     <div class="thread-toolbar-controls">
       <div class="thread-toolbar-top">
         ${renderThreadTabs()}
-        ${renderThreadActionMenu()}
+        ${chatTab ? "" : renderThreadActionMenu()}
       </div>
     </div>
-    ${compactHeaderOnly ? "" : `
+    ${chatTab || compactHeaderOnly ? "" : `
       <div class="thread-toolbar">
         <div class="thread-title-wrap">
           <h2 class="thread-title" title="${escapeHtml(thread.name || thread.preview || "Untitled thread")}">${escapeHtml(thread.name || thread.preview || "Untitled thread")}</h2>
@@ -1928,19 +2771,7 @@ function renderThreadHeader() {
 function renderThreadPane() {
   normalizeSelectedProjectResourceTab();
   syncPendingRalphLoopReplay();
-
-  const terminalVisible = state.activeThreadTab === "terminal";
-  const resourceVisible = state.activeThreadTab === "resource";
-  const conversationVisible = state.activeThreadTab === "chat";
-
-  elements.conversation.classList.toggle("hidden", !conversationVisible);
-  elements.composerForm.classList.toggle("hidden", !conversationVisible);
-  elements.threadTerminal.classList.toggle("hidden", !terminalVisible);
-  elements.threadTerminal.setAttribute("aria-hidden", terminalVisible ? "false" : "true");
-  elements.threadResourcePane.classList.toggle("hidden", !resourceVisible);
-  elements.threadResourcePane.setAttribute("aria-hidden", resourceVisible ? "false" : "true");
-  renderTerminalPane(terminalVisible);
-  renderResourcePane(resourceVisible);
+  syncAllPaneFrames();
 }
 
 function scheduleProjectsRender() {
@@ -1955,183 +2786,456 @@ function scheduleProjectsRender() {
   });
 }
 
+function scheduleProjectThreadsReload(delayMs = 180) {
+  clearTimeout(projectThreadsReloadTimer);
+  projectThreadsReloadTimer = setTimeout(() => {
+    projectThreadsReloadTimer = null;
+    void flushProjectThreadsReload();
+  }, delayMs);
+}
+
+async function flushProjectThreadsReload() {
+  if (projectThreadsReloadInFlight) {
+    projectThreadsReloadQueued = true;
+    return;
+  }
+
+  projectThreadsReloadInFlight = true;
+
+  try {
+    await loadAllProjectThreads();
+  } catch (error) {
+    console.error("Failed to refresh project threads", error);
+  } finally {
+    projectThreadsReloadInFlight = false;
+
+    if (projectThreadsReloadQueued) {
+      projectThreadsReloadQueued = false;
+      scheduleProjectThreadsReload();
+    }
+  }
+}
+
+function visibleProjectTab() {
+  return activeProjectTab(state.selectedProjectId);
+}
+
+function postPaneMessage(tabId, pane, type, payload = {}) {
+  const entry = paneFrameEntries.get(cleanString(tabId));
+
+  if (!entry?.frame?.contentWindow || entry.ready !== true) {
+    return;
+  }
+
+  entry.frame.contentWindow.postMessage({
+    source: "codex-host",
+    pane,
+    type,
+    payload,
+  }, window.location.origin);
+}
+
+function syncChatPaneFrame(tab) {
+  if (!tab?.id || tab.pane !== "chat") {
+    return;
+  }
+
+  const visibleTabId = visibleProjectTab()?.id || "";
+  const project = state.projects.find((entry) => entry.id === cleanString(tab.projectId)) || null;
+  const replay = state.ralphLoopPendingReplay?.threadId === cleanString(tab.threadId)
+    ? {
+      threadId: state.ralphLoopPendingReplay.threadId,
+      remainingSeconds: state.ralphLoopPendingReplay.remainingSeconds,
+    }
+    : null;
+  const composerView = buildComposerViewState();
+
+  postPaneMessage(tab.id, "chat", "state", {
+    active: visibleTabId === tab.id,
+    projectId: cleanString(tab.projectId),
+    threadId: cleanString(tab.threadId),
+    projectName: project ? projectDisplayName(project) : "",
+    archived: state.archived,
+    autoscroll: state.autoscroll,
+    approveAllDangerous: state.composerApproveAllDangerous,
+    pendingRalphLoopReplay: replay,
+    pendingNewThread: state.pendingNewThread
+      && cleanString(state.pendingNewThread.projectId) === cleanString(tab.projectId)
+      ? state.pendingNewThread
+      : null,
+    composer: {
+      draftText: elements.promptInput.value || "",
+      attachments: state.composerAttachments.map((attachment) => ({
+        id: attachment.id,
+        name: attachment.name,
+        url: attachment.url,
+      })),
+      sendInFlight: state.manualSendInFlight,
+      ...composerView,
+    },
+  });
+}
+
+function syncTerminalPaneFrame(tab) {
+  if (!tab?.id || tab.pane !== "terminal") {
+    return;
+  }
+
+  const visibleTabId = visibleProjectTab()?.id || "";
+
+  postPaneMessage(tab.id, "terminal", "state", {
+    active: visibleTabId === tab.id,
+    projectId: cleanString(tab.projectId),
+  });
+}
+
+function syncResourcePaneFrame(tab) {
+  if (!tab?.id || tab.pane !== "resource") {
+    return;
+  }
+
+  const visibleTabId = visibleProjectTab()?.id || "";
+  const resource = findResource(tab.resourceId);
+
+  postPaneMessage(tab.id, "resource", "state", {
+    active: visibleTabId === tab.id,
+    projectId: cleanString(tab.projectId),
+    resource: resource
+      ? {
+        id: resource.id,
+        projectId: resource.projectId,
+        path: resource.path,
+        name: resource.name,
+      }
+      : null,
+  });
+}
+
+function syncAllPaneFrames() {
+  const tabs = allOpenTabs();
+  const tabIds = new Set(tabs.map((tab) => tab.id));
+  const visibleTabId = visibleProjectTab()?.id || "";
+  const visibleTab = visibleTabId
+    ? tabs.find((tab) => tab.id === visibleTabId) || null
+    : null;
+
+  for (const tabId of Array.from(paneFrameEntries.keys())) {
+    if (!tabIds.has(tabId) || tabId !== visibleTabId) {
+      removePaneFrameEntry(tabId);
+    }
+  }
+
+  if (!visibleTab) {
+    return;
+  }
+
+  const entry = ensurePaneFrameEntry(visibleTab);
+
+  if (!entry) {
+    return;
+  }
+
+  entry.frame.classList.add("is-active");
+  entry.frame.setAttribute("aria-hidden", "false");
+
+  if (visibleTab.pane === "terminal") {
+    syncTerminalPaneFrame(visibleTab);
+    return;
+  }
+
+  if (visibleTab.pane === "resource") {
+    syncResourcePaneFrame(visibleTab);
+    return;
+  }
+
+  syncChatPaneFrame(visibleTab);
+}
+
+function applyPaneThreadSummary(tab, payload = {}) {
+  const thread = payload.thread && typeof payload.thread === "object" ? payload.thread : null;
+  const currentTurnId = cleanString(payload.currentTurnId);
+
+  if (!thread?.id) {
+    return;
+  }
+
+  if (thread.id === state.selectedThreadId) {
+    state.selectedThread = {
+      ...(state.selectedThread && state.selectedThread.id === thread.id ? state.selectedThread : {}),
+      ...thread,
+    };
+
+    if (currentTurnId) {
+      state.currentTurnId = currentTurnId;
+    }
+  }
+
+  syncThreadSummary(thread);
+  renderProjects();
+
+  if (thread.id === state.selectedThreadId || cleanString(tab?.projectId) === cleanString(state.selectedProjectId)) {
+    renderThreadHeader();
+  }
+}
+
+async function performThreadAction(action, options = {}) {
+  if (!state.selectedThreadId) {
+    return;
+  }
+
+  if (action === "rename-thread") {
+    const name = cleanString(options.name);
+    if (!name) {
+      return;
+    }
+
+    state.threadActionMenuOpen = false;
+    await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/name`, {
+      method: "POST",
+      body: { name },
+    });
+    await loadThread(state.selectedThreadId);
+    await loadAllProjectThreads();
+    renderProjects();
+    return;
+  }
+
+  if (action === "fork-thread") {
+    state.threadActionMenuOpen = false;
+    await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/fork`, { method: "POST", body: {} });
+    await loadAllProjectThreads();
+    renderProjects();
+    return;
+  }
+
+  if (action === "compact-thread") {
+    state.threadActionMenuOpen = false;
+    await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/compact`, { method: "POST", body: {} });
+    return;
+  }
+
+  if (action === "review-thread") {
+    state.threadActionMenuOpen = false;
+    await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/review`, {
+      method: "POST",
+      body: { targetType: "uncommittedChanges", delivery: "inline" },
+    });
+    return;
+  }
+
+  if (action === "interrupt-thread") {
+    if (!state.currentTurnId) {
+      throw new Error("No active turn id available");
+    }
+
+    state.threadActionMenuOpen = false;
+    await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/interrupt`, {
+      method: "POST",
+      body: { turnId: state.currentTurnId },
+    });
+    return;
+  }
+
+  if (action === "archive-thread" || action === "unarchive-thread") {
+    state.threadActionMenuOpen = false;
+    const archivedThreadId = state.selectedThreadId;
+    await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/${action === "archive-thread" ? "archive" : "unarchive"}`, {
+      method: "POST",
+      body: {},
+    });
+    await loadAllProjectThreads();
+    closeProjectThreadTabs(state.selectedProjectId, archivedThreadId);
+    syncSelectedProjectThreadTab();
+    persistSelection();
+    renderProjects();
+    renderThreadHeader();
+    renderConversation();
+    renderThreadPane();
+    if (state.selectedThreadId) {
+      await loadThread(state.selectedThreadId).catch(console.error);
+    }
+  }
+}
+
+function handlePaneMessage(event) {
+  if (event.origin !== window.location.origin) {
+    return;
+  }
+
+  const data = event.data;
+
+  if (!data || data.source !== "codex-pane") {
+    return;
+  }
+
+  const entry = paneFrameEntryForWindow(event.source);
+  if (!entry) {
+    return;
+  }
+
+  const tab = findOpenTab(entry.tabId);
+  const pane = cleanString(data.pane);
+
+  if (data.type === "ready" && pane) {
+    entry.ready = true;
+    if (tab?.pane === "chat") {
+      syncChatPaneFrame(tab);
+    } else if (tab?.pane === "terminal") {
+      syncTerminalPaneFrame(tab);
+    } else if (tab?.pane === "resource") {
+      syncResourcePaneFrame(tab);
+    }
+    return;
+  }
+
+  if (pane === "chat" && data.type === "thread-summary") {
+    applyPaneThreadSummary(tab, data.payload);
+    return;
+  }
+
+  if (pane === "chat" && data.type === "open-resource") {
+    void openResourceFromFileLink(data.payload?.reference, { projectId: tab?.projectId }).catch(console.error);
+    return;
+  }
+
+  if (pane === "chat" && data.type === "refresh-threads") {
+    void loadAllProjectThreads().catch(console.error);
+    return;
+  }
+
+  if (pane === "chat" && data.type === "send-message") {
+    void sendConversationMessage(data.payload || {}).then(() => {
+      if (state.composerRalphLoop) {
+        persistComposerDraft();
+      } else {
+        elements.promptInput.value = "";
+        clearComposerDraft();
+        state.composerAttachments = [];
+      }
+      renderComposerAttachments();
+      syncAllPaneFrames();
+    }).catch((error) => {
+      alert(error.message);
+    });
+    return;
+  }
+
+  if (pane === "chat" && data.type === "composer-draft") {
+    elements.promptInput.value = String(data.payload?.text || "");
+    persistComposerDraft();
+    return;
+  }
+
+  if (pane === "chat" && data.type === "composer-attachments") {
+    state.composerAttachments = Array.isArray(data.payload?.attachments)
+      ? data.payload.attachments.map((attachment) => ({
+        id: attachment.id,
+        name: attachment.name,
+        url: attachment.url,
+      }))
+      : [];
+    renderComposerAttachments();
+    return;
+  }
+
+  if (pane === "chat" && data.type === "composer-setting") {
+    const key = cleanString(data.payload?.key);
+    const value = data.payload?.value;
+
+    if (key === "autoscroll") {
+      state.autoscroll = value === true;
+      persistSelection();
+    } else if (key === "approveAllDangerous") {
+      state.composerApproveAllDangerous = value === true;
+      persistSelection();
+    } else if (key === "ralphLoop") {
+      state.composerRalphLoop = value === true;
+      if (!state.composerRalphLoop) {
+        cancelPendingRalphLoop({ cancelAutoCompact: true });
+      } else if (state.selectedThreadId && currentRalphLoopInput(state.selectedThreadId)) {
+        setRalphLoopBudget(state.selectedThreadId);
+      }
+    } else if (key === "ralphLoopLimit") {
+      state.composerRalphLoopLimit = normalizeRalphLoopLimit(value);
+      syncConfiguredRalphLoopBudget();
+    } else if (key === "model") {
+      state.composerModel = cleanString(value);
+    } else if (key === "effort") {
+      state.composerEffort = cleanString(value);
+    } else if (key === "serviceTier") {
+      state.composerServiceTier = cleanString(value);
+    } else if (key === "mode") {
+      state.composerMode = value === "plan" ? "plan" : "default";
+    }
+
+    normalizeComposerSettings();
+    persistComposerSettings();
+    renderComposerControls();
+    return;
+  }
+
+  if (pane === "chat" && data.type === "open-composer-attachment") {
+    void openImageEditor(cleanString(data.payload?.id)).catch(console.error);
+    return;
+  }
+
+  if (pane === "chat" && data.type === "remove-composer-attachment") {
+    state.composerAttachments = state.composerAttachments.filter((attachment) => attachment.id !== cleanString(data.payload?.id));
+    renderComposerAttachments();
+    return;
+  }
+
+  if (pane === "chat" && data.type === "thread-action") {
+    void performThreadAction(cleanString(data.payload?.action), { name: data.payload?.name }).catch((error) => {
+      alert(error.message);
+    });
+    return;
+  }
+
+  if (pane === "resource" && data.type === "close-resource") {
+    closeResourceTab(cleanString(data.payload?.resourceId) || cleanString(tab?.resourceId));
+  }
+}
+
 function focusActiveThreadPane(tab = state.activeThreadTab) {
+  const activeTab = visibleProjectTab();
+
   requestAnimationFrame(() => {
+    if (!activeTab?.id) {
+      return;
+    }
+
     if (tab === "terminal") {
-      state.terminalEmulator?.terminal.focus();
+      postPaneMessage(activeTab.id, "terminal", "focus");
       return;
     }
 
     if (tab === "resource") {
-      void focusActiveResource();
+      postPaneMessage(activeTab.id, "resource", "focus");
       return;
     }
 
     if (tab === "chat") {
-      elements.promptInput.focus();
+      postPaneMessage(activeTab.id, "chat", "focus");
     }
   });
 }
 
-function renderTerminalPane(terminalVisible) {
-  if (!terminalVisible) {
-    return;
-  }
-
-  const project = selectedProject();
-  if (!project) {
-    elements.threadTerminalStatus.textContent = "Select a project first.";
-    return;
-  }
-
-  ensureTerminalEmulator();
-  scheduleTerminalFit();
-
-  const session = state.terminalSessionByProjectId[project.id];
-  const socket = state.terminalClient?.projectId === project.id ? state.terminalClient.socket : null;
-  const connected = socket?.readyState === WebSocket.OPEN;
-
-  if (state.terminalConnectInFlight && !session) {
-    elements.threadTerminalStatus.textContent = "Starting terminal...";
-    return;
-  }
-
-  if (!session) {
-    elements.threadTerminalStatus.textContent = "Terminal is not running.";
-    return;
-  }
-
-  if (session.state === "running") {
-    elements.threadTerminalStatus.textContent = `${session.locationLabel || "host"} · ${connected ? "connected" : "disconnected"}`;
-    return;
-  }
-
-  if (session.state === "error") {
-    elements.threadTerminalStatus.textContent = `${session.locationLabel || "host"} · error`;
-    return;
-  }
-
-  const exitDetails = Number.isInteger(session.exitCode)
-    ? `exit ${session.exitCode}`
-    : session.signal
-      ? `signal ${session.signal}`
-      : "stopped";
-  elements.threadTerminalStatus.textContent = `${session.locationLabel || "host"} · ${exitDetails}`;
-}
-
-function renderResourcePane(resourceVisible) {
-  const resource = activeResource();
-  const hasResource = resourceVisible && resource;
-  const statusText = describeResourceStatus(resource);
-
-  elements.threadResourceOpenRaw.disabled = !hasResource || !resource.viewUrl;
-  elements.threadResourceReload.disabled = !hasResource;
-  elements.threadResourceClose.disabled = !hasResource;
-
-  if (!resource) {
-    elements.threadResourceTitle.textContent = "Open a file link to preview it here.";
-    elements.threadResourceStatus.textContent = "";
-    elements.threadResourceStatus.classList.add("hidden");
-    elements.threadResourceStatus.classList.remove("error");
-    elements.threadResourceEmpty.textContent = "Open a file link in the conversation to view it here.";
-    elements.threadResourceEmpty.classList.remove("hidden");
-    elements.threadResourceEditor.classList.add("hidden");
-    elements.threadResourcePreview.classList.add("hidden");
-    elements.threadResourcePreview.innerHTML = "";
-    state.resourceEditor.editor?.setModel(null);
-    return;
-  }
-
-  elements.threadResourceTitle.textContent = resource.path;
-  elements.threadResourceStatus.textContent = statusText;
-  elements.threadResourceStatus.classList.toggle("hidden", !statusText);
-  elements.threadResourceStatus.classList.toggle(
-    "error",
-    Boolean(resource.error) && (resource.kind === "loading" || resource.saveState === "error"),
-  );
-
-  if (resource.loading && resource.kind === "loading") {
-    elements.threadResourceEmpty.textContent = "Loading file…";
-    elements.threadResourceEmpty.classList.remove("hidden");
-    elements.threadResourceEditor.classList.add("hidden");
-    elements.threadResourcePreview.classList.add("hidden");
-    elements.threadResourcePreview.innerHTML = "";
-    return;
-  }
-
-  if (resource.kind === "loading" && resource.error) {
-    elements.threadResourceEmpty.textContent = resource.error;
-    elements.threadResourceEmpty.classList.remove("hidden");
-    elements.threadResourceEditor.classList.add("hidden");
-    elements.threadResourcePreview.classList.add("hidden");
-    elements.threadResourcePreview.innerHTML = "";
-    return;
-  }
-
-  if (resource.kind === "image") {
-    elements.threadResourceEmpty.classList.add("hidden");
-    elements.threadResourceEditor.classList.add("hidden");
-    elements.threadResourcePreview.classList.remove("hidden");
-    elements.threadResourcePreview.innerHTML = `
-      <img
-        class="thread-resource-preview-image"
-        src="${escapeHtml(resource.viewUrl)}"
-        alt="${escapeHtml(resource.name)}"
-      >
-    `;
-    return;
-  }
-
-  if (resource.kind === "binary") {
-    elements.threadResourceEmpty.classList.add("hidden");
-    elements.threadResourceEditor.classList.add("hidden");
-    elements.threadResourcePreview.classList.remove("hidden");
-    elements.threadResourcePreview.innerHTML = `
-      <div class="thread-resource-binary">
-        <p>This file can’t be edited as text in Monaco.</p>
-        ${resource.viewUrl ? `<a href="${escapeHtml(resource.viewUrl)}" target="_blank" rel="noreferrer">Open the raw file in a new tab</a>` : ""}
-      </div>
-    `;
-    return;
-  }
-
-  elements.threadResourceEmpty.classList.add("hidden");
-  elements.threadResourcePreview.classList.add("hidden");
-  elements.threadResourcePreview.innerHTML = "";
-  elements.threadResourceEditor.classList.remove("hidden");
-  void syncActiveResourceEditor();
-}
-
-function describeResourceStatus(resource) {
-  if (!resource) {
-    return "";
-  }
-
-  if (resource.loading && resource.kind === "loading") {
-    return "Loading file…";
-  }
-
-  if (resource.loading) {
-    return "Reloading from disk…";
-  }
-
-  if (!resource.writable) {
-    return "Read-only text file";
-  }
-
-  if (resource.saveState === "error") {
-    return `Save failed: ${resource.error || "unknown error"}`;
-  }
-
-  return "";
-}
-
-async function openResourceFromFileLink(reference) {
+async function openResourceFromFileLink(reference, options = {}) {
   if (!reference?.path) {
     return;
   }
 
-  const projectId = cleanString(state.selectedProjectId);
+  const projectId = cleanString(options.projectId || state.selectedProjectId);
+
+  if (!projectId) {
+    return;
+  }
+
+  if (projectId !== state.selectedProjectId) {
+    state.selectedProjectId = projectId;
+  }
+
   const resources = projectResources(projectId);
   let resource = resources.find((entry) => entry.path === reference.path);
 
@@ -2142,293 +3246,13 @@ async function openResourceFromFileLink(reference) {
     resource.pendingSelection = normalizeResourceSelection(reference);
   }
 
-  setProjectThreadTab("resource", projectId);
   setProjectActiveResource(projectId, resource.id);
+  openProjectResourceTab(projectId, resource.id, { activate: true });
+  syncSelectedProjectThreadTab();
   persistSelection();
   renderThreadHeader();
   renderThreadPane();
-
-  if (resource.kind === "loading" || (resource.error && !resource.model && !resource.viewUrl)) {
-    await loadResource(resource.id);
-    return;
-  }
-
-  await focusActiveResource();
-}
-
-async function loadResource(resourceId) {
-  const resource = findResource(resourceId);
-
-  if (!resource) {
-    return;
-  }
-
-  resource.loading = true;
-  if (resource.kind === "loading") {
-    resource.error = "";
-  }
-  renderThreadPane();
-
-  try {
-    const payload = await api(`/api/file?path=${encodeURIComponent(resource.path)}`);
-    const data = payload.data || {};
-
-    resource.name = data.name || resource.name;
-    resource.kind = data.kind || "binary";
-    resource.mimeType = data.mimeType || "";
-    resource.size = Number(data.size) || 0;
-    resource.mtimeMs = Number(data.mtimeMs) || 0;
-    resource.writable = data.writable === true;
-    resource.viewUrl = data.viewUrl || "";
-    resource.loading = false;
-    resource.error = "";
-
-    if (resource.kind === "text") {
-      await upsertResourceModel(resource, data.text ?? "");
-    } else if (resource.model) {
-      resource.model.dispose();
-      resource.model = null;
-    }
-
-    renderThreadHeader();
-    renderThreadPane();
-    await focusActiveResource();
-  } catch (error) {
-    resource.loading = false;
-    resource.error = error.message;
-    renderThreadPane();
-  }
-}
-
-async function upsertResourceModel(resource, text) {
-  const monaco = await ensureMonaco();
-  const uri = monaco.Uri.file(resource.path);
-  const existingModel = resource.model || monaco.editor.getModel(uri);
-
-  if (!existingModel) {
-    resource.model = monaco.editor.createModel(String(text || ""), undefined, uri);
-  } else {
-    resource.suppressModelChange = true;
-    existingModel.setValue(String(text || ""));
-    resource.suppressModelChange = false;
-    resource.model = existingModel;
-  }
-
-  resource.saveState = "idle";
-}
-
-async function focusActiveResource() {
-  const resource = activeResource();
-
-  if (!resource || state.activeThreadTab !== "resource") {
-    return;
-  }
-
-  if (resource.kind === "text") {
-    await syncActiveResourceEditor();
-    state.resourceEditor.editor?.focus();
-    return;
-  }
-
-  elements.threadResourcePane.focus?.();
-}
-
-async function syncActiveResourceEditor() {
-  const resource = activeResource();
-
-  if (!resource || state.activeThreadTab !== "resource" || resource.kind !== "text" || !resource.model) {
-    return;
-  }
-
-  const editor = await ensureResourceEditor();
-  const previousModel = editor.getModel();
-  const previousResource = findResourceByModel(previousModel);
-
-  if (previousResource && previousResource !== resource) {
-    previousResource.viewState = editor.saveViewState();
-  }
-
-  if (previousModel !== resource.model) {
-    editor.setModel(resource.model);
-    if (resource.viewState) {
-      editor.restoreViewState(resource.viewState);
-    }
-  }
-
-  editor.updateOptions({ readOnly: !resource.writable });
-  applyPendingResourceSelection(resource, editor);
-  editor.layout();
-}
-
-function applyPendingResourceSelection(resource, editor) {
-  if (!resource?.pendingSelection || !resource.model) {
-    return;
-  }
-
-  const lineNumber = clamp(resource.pendingSelection.line || 1, 1, resource.model.getLineCount());
-  const column = clamp(resource.pendingSelection.column || 1, 1, resource.model.getLineMaxColumn(lineNumber));
-  const position = { lineNumber, column };
-
-  editor.setPosition(position);
-  editor.revealPositionInCenter(position);
-  resource.pendingSelection = null;
-}
-
-async function ensureMonaco() {
-  if (state.resourceEditor.monaco) {
-    return state.resourceEditor.monaco;
-  }
-
-  if (!monacoLoadPromise) {
-    monacoLoadPromise = Promise.all([
-      import("monaco-editor"),
-      import("monaco-editor/esm/vs/editor/editor.worker?worker"),
-      import("monaco-editor/esm/vs/language/json/json.worker?worker"),
-      import("monaco-editor/esm/vs/language/css/css.worker?worker"),
-      import("monaco-editor/esm/vs/language/html/html.worker?worker"),
-      import("monaco-editor/esm/vs/language/typescript/ts.worker?worker"),
-    ]).then(([
-      monaco,
-      editorWorkerModule,
-      jsonWorkerModule,
-      cssWorkerModule,
-      htmlWorkerModule,
-      tsWorkerModule,
-    ]) => {
-      const editorWorker = editorWorkerModule.default || editorWorkerModule;
-      const jsonWorker = jsonWorkerModule.default || jsonWorkerModule;
-      const cssWorker = cssWorkerModule.default || cssWorkerModule;
-      const htmlWorker = htmlWorkerModule.default || htmlWorkerModule;
-      const tsWorker = tsWorkerModule.default || tsWorkerModule;
-
-      globalThis.MonacoEnvironment = {
-        getWorker(_workerId, label) {
-          if (label === "json") {
-            return new jsonWorker();
-          }
-
-          if (label === "css" || label === "scss" || label === "less") {
-            return new cssWorker();
-          }
-
-          if (label === "html" || label === "handlebars" || label === "razor") {
-            return new htmlWorker();
-          }
-
-          if (label === "typescript" || label === "javascript") {
-            return new tsWorker();
-          }
-
-          return new editorWorker();
-        },
-      };
-
-      state.resourceEditor.monaco = monaco;
-      return monaco;
-    });
-  }
-
-  return monacoLoadPromise;
-}
-
-async function ensureResourceEditor() {
-  if (state.resourceEditor.editor) {
-    return state.resourceEditor.editor;
-  }
-
-  if (!state.resourceEditor.editorPromise) {
-    state.resourceEditor.editorPromise = (async () => {
-      const monaco = await ensureMonaco();
-      const editor = monaco.editor.create(elements.threadResourceEditor, {
-        automaticLayout: true,
-        fontFamily: "\"SFMono-Regular\", Menlo, Consolas, monospace",
-        fontSize: 13,
-        lineNumbersMinChars: 4,
-        minimap: { enabled: false },
-        readOnly: true,
-        scrollBeyondLastLine: false,
-        theme: "vs-dark",
-      });
-
-      editor.onDidChangeModelContent(() => {
-        const model = editor.getModel();
-        const resource = findResourceByModel(model);
-
-        if (!resource || resource.suppressModelChange || !resource.writable) {
-          return;
-        }
-
-        scheduleResourceSave(resource);
-      });
-
-      state.resourceEditor.editor = editor;
-      return editor;
-    })().finally(() => {
-      state.resourceEditor.editorPromise = null;
-    });
-  }
-
-  return state.resourceEditor.editorPromise;
-}
-
-function scheduleResourceSave(resource) {
-  if (!resource?.model || !resource.writable) {
-    return;
-  }
-
-  clearTimeout(resource.saveTimer);
-  resource.saveState = "dirty";
-  renderResourcePane(state.activeThreadTab === "resource");
-  resource.saveTimer = window.setTimeout(() => {
-    void flushResourceSave(resource.id);
-  }, 250);
-}
-
-async function flushResourceSave(resourceId) {
-  const resource = findResource(resourceId);
-
-  if (!resource?.model || !resource.writable) {
-    return;
-  }
-
-  clearTimeout(resource.saveTimer);
-  resource.saveTimer = 0;
-
-  if (resource.saveInFlight) {
-    resource.saveQueued = true;
-    return;
-  }
-
-  resource.saveInFlight = true;
-  resource.saveState = "saving";
-  resource.error = "";
-  renderResourcePane(state.activeThreadTab === "resource");
-
-  try {
-    const payload = await api("/api/file", {
-      method: "PUT",
-      body: {
-        path: resource.path,
-        text: resource.model.getValue(),
-        expectedMtimeMs: resource.mtimeMs,
-      },
-    });
-
-    resource.mtimeMs = Number(payload.data?.mtimeMs) || resource.mtimeMs;
-    resource.size = Number(payload.data?.size) || resource.size;
-    resource.saveState = "saved";
-  } catch (error) {
-    resource.saveState = "error";
-    resource.error = error.message;
-  } finally {
-    resource.saveInFlight = false;
-    renderResourcePane(state.activeThreadTab === "resource");
-  }
-
-  if (resource.saveQueued) {
-    resource.saveQueued = false;
-    void flushResourceSave(resourceId);
-  }
+  focusActiveThreadPane("resource");
 }
 
 function closeResourceTab(resourceId) {
@@ -2446,23 +3270,15 @@ function closeResourceTab(resourceId) {
   }
 
   resources.splice(index, 1);
-  clearTimeout(resource.saveTimer);
-  if (state.resourceEditor.editor?.getModel() === resource.model) {
-    state.resourceEditor.editor.setModel(null);
-  }
-  resource.model?.dispose();
 
   if (projectActiveResourceId(resource.projectId) === resourceId) {
     const nextActive = resources[index] || resources[index - 1] || null;
     setProjectActiveResource(resource.projectId, nextActive?.id || "");
   }
 
+  closeProjectTab(resource.projectId, `resource:${resourceId}`, { ensureFallback: true });
   if (cleanString(resource.projectId) === cleanString(state.selectedProjectId)) {
-    normalizeSelectedProjectResourceTab();
-  }
-
-  if (projectThreadTab(resource.projectId) === "resource" && !activeResource(resource.projectId)) {
-    setProjectThreadTab("chat", resource.projectId);
+    syncSelectedProjectThreadTab();
   }
 
   persistSelection();
@@ -2472,65 +3288,8 @@ function closeResourceTab(resourceId) {
 
 function renderConversation() {
   syncPendingRalphLoopReplay();
-
-  const thread = state.selectedThread;
-  if (isSelectedThreadLoading()) {
-    elements.conversation.innerHTML = `<div class="empty loading">Loading conversation...</div>`;
-    scrollConversationToBottom();
-    return;
-  }
-
-  const pendingRequests = pendingServerRequestsForThread(thread?.id);
-  const pendingRalphLoopReplay = currentPendingRalphLoopReplay(thread?.id);
-  const latestCollapsibleItemId = findLatestCollapsibleItemId(thread);
-
-  if (!thread?.turns?.length && pendingRequests.length === 0) {
-    elements.conversation.innerHTML = `<div class="empty">No turns yet.</div>`;
-    scrollConversationToBottom();
-    return;
-  }
-
-  const activity = describeThreadActivity(thread);
-  const pendingBanner = pendingRequests.length ? `
-    <section class="conversation-activity-banner" aria-live="polite">
-      ${renderActivityBadge(pendingRequests.some((request) => request.method === "item/tool/requestUserInput") ? "Needs Input" : "Needs Approval", "pending", "live")}
-      <span>${escapeHtml(pendingRequests.length === 1 ? "Conversation is waiting for one response." : `Conversation is waiting for ${pendingRequests.length} responses.`)}</span>
-    </section>
-  ` : "";
-  const activityBanner = activity.isWorking ? `
-    <section class="conversation-activity-banner" aria-live="polite">
-      ${renderActivityBadge(activity.label, activity.statusText, "live")}
-      <span>Conversation is actively working.</span>
-    </section>
-  ` : "";
-  const ralphLoopBanner = pendingRalphLoopReplay ? `
-    <section class="conversation-activity-banner conversation-ralph-loop-banner" aria-live="polite">
-      ${renderActivityBadge("Ralph Loop", "waiting", "live")}
-      <span>Continuing in ${escapeHtml(String(pendingRalphLoopReplay.remainingSeconds))} second${pendingRalphLoopReplay.remainingSeconds === 1 ? "" : "s"}.</span>
-      <button type="button" class="ghost-button conversation-banner-action" data-action="cancel-ralph-loop">Cancel Ralph loop</button>
-    </section>
-  ` : "";
-
-  elements.conversation.innerHTML = `${pendingBanner}${activityBanner}${ralphLoopBanner}${thread.turns.map((turn) => {
-    const items = renderTurnItems(turn, latestCollapsibleItemId);
-    const turnWorking = isLiveStatus(turn.status);
-
-    return `
-      <section class="turn-card">
-        <div class="turn-topline">
-          <span>${escapeHtml(turn.id)}</span>
-          <span class="turn-status-wrap">
-            ${turnWorking ? renderActivityBadge(describeStatusActivity(turn.status), formatStatus(turn.status), "small") : ""}
-            <span class="${turnWorking ? "status-live" : ""}">${escapeHtml(formatStatus(turn.status))}</span>
-          </span>
-        </div>
-        ${items || `<div class="empty">No items recorded for this turn.</div>`}
-        ${turn.error ? `<div class="bubble agent"><strong>Error</strong><div class="message-body"><pre>${escapeHtml(JSON.stringify(turn.error, null, 2))}</pre></div></div>` : ""}
-      </section>
-    `;
-  }).join("")}${pendingRequests.map(renderPendingServerRequest).join("")}`;
-
-  scrollConversationToBottom();
+  renderRalphLoopDialog(currentPendingRalphLoopReplay(state.selectedThread?.id || state.selectedThreadId));
+  syncAllPaneFrames();
 }
 
 function scrollConversationToBottom() {
@@ -2549,6 +3308,7 @@ function renderComposerAttachments() {
   if (!items.length) {
     elements.composerAttachments.innerHTML = "";
     elements.composerAttachments.classList.add("hidden");
+    syncAllPaneFrames();
     return;
   }
 
@@ -2576,6 +3336,7 @@ function renderComposerAttachments() {
       </button>
     </figure>
   `).join("");
+  syncAllPaneFrames();
 }
 
 function renderItem(item, latestCollapsibleItemId = "") {
@@ -2611,26 +3372,16 @@ function renderItem(item, latestCollapsibleItemId = "") {
   }
 
   if (item.type === "fileChange") {
-    const changes = (item.changes || []).map((change) => `
-      <details>
-        <summary>${escapeHtml(change.kind || "change")} · ${escapeHtml(change.path || "")}</summary>
-        <pre class="diff-block">${escapeHtml(change.diff || "")}</pre>
-      </details>
-    `).join("");
-
     const summary = `${item.changes?.length || 0} file ${item.changes?.length === 1 ? "change" : "changes"}`;
-    const open = shouldExpandConversationItem(item.id, latestCollapsibleItemId) ? " open" : "";
-    return `
-      <article class="bubble agent collapsed-item" data-item-id="${itemId}" data-item-type="${itemType}">
-        <details data-item-id="${itemId}"${open}>
-          <summary class="collapsed-summary">
-            <span class="collapsed-title">File Changes</span>
-            <span class="collapsed-text" data-role="summary">${escapeHtml(summary)}</span>
-          </summary>
-          <div class="collapsed-body">${changes}</div>
-        </details>
-      </article>
-    `;
+    const open = shouldExpandConversationItem(item.id, latestCollapsibleItemId);
+    return renderCollapsibleArticle({
+      itemId: item.id || "",
+      itemType: item.type || "",
+      title: "File Changes",
+      summary,
+      open,
+      bodyHtml: open ? renderFileChangeBody(item) : "",
+    });
   }
 
   if (item.type === "mcpToolCall") {
@@ -2673,52 +3424,35 @@ function renderItem(item, latestCollapsibleItemId = "") {
 }
 
 function renderMessageCollapsibleItem(item, title, latestCollapsibleItemId = "") {
-  const itemId = item?.id ? escapeHtml(item.id) : "";
-  const itemType = escapeHtml(item?.type || "");
   const summary = summarizeMessageItem(item, title);
-  const open = shouldExpandConversationItem(item?.id, latestCollapsibleItemId) ? " open" : "";
+  const open = shouldExpandConversationItem(item?.id, latestCollapsibleItemId);
 
-  return `
-    <article class="bubble ${item.type === "userMessage" ? "user" : "agent"} collapsed-item" data-item-id="${itemId}" data-item-type="${itemType}">
-      <details data-item-id="${itemId}"${open}>
-        <summary class="collapsed-summary">
-          <span class="collapsed-title">${escapeHtml(title)}</span>
-          <span class="collapsed-text" data-role="summary">${escapeHtml(summary)}</span>
-        </summary>
-        <div class="collapsed-body">
-          <div class="message-body">${renderMessageContent(item.content, item.text || "")}</div>
-        </div>
-      </details>
-    </article>
-  `;
+  return renderCollapsibleArticle({
+    bubbleClass: item.type === "userMessage" ? "user" : "agent",
+    itemId: item.id || "",
+    itemType: item.type || "",
+    title,
+    summary,
+    open,
+    bodyHtml: open ? renderMessageItemBody(item) : "",
+  });
 }
 
 function renderCollapsibleItem(item, display, latestCollapsibleItemId = "") {
-  const itemId = item?.id ? escapeHtml(item.id) : "";
-  const itemType = escapeHtml(item?.type || "");
   const title = display?.title || item?.type || "Item";
   const summary = display?.summary || title;
-  const body = display?.body || summary;
-  const bodyHtml = typeof display?.bodyHtml === "string"
-    ? display.bodyHtml
-    : `<pre data-role="body">${escapeHtml(body)}</pre>`;
   const meta = display?.meta || "";
-  const open = shouldExpandConversationItem(item?.id, latestCollapsibleItemId) ? " open" : "";
+  const open = shouldExpandConversationItem(item?.id, latestCollapsibleItemId);
 
-  return `
-    <article class="bubble agent collapsed-item" data-item-id="${itemId}" data-item-type="${itemType}">
-      <details data-item-id="${itemId}"${open}>
-        <summary class="collapsed-summary">
-          <span class="collapsed-title">${escapeHtml(title)}</span>
-          <span class="collapsed-text" data-role="summary">${escapeHtml(summary || title)}</span>
-          ${meta ? `<span class="collapsed-meta" data-role="meta">${escapeHtml(meta)}</span>` : ""}
-        </summary>
-        <div class="collapsed-body">
-          ${bodyHtml}
-        </div>
-      </details>
-    </article>
-  `;
+  return renderCollapsibleArticle({
+    itemId: item.id || "",
+    itemType: item.type || "",
+    title,
+    summary,
+    meta,
+    open,
+    bodyHtml: open ? renderCollapsibleDisplayBody(display) : "",
+  });
 }
 
 function renderToolCallBody(item) {
@@ -2805,17 +3539,17 @@ function renderPendingServerRequest(request) {
   }
 
   if (request.method === "item/commandExecution/requestApproval") {
-    const decisions = Array.isArray(request.params?.availableDecisions) && request.params.availableDecisions.length
-      ? request.params.availableDecisions
-      : ["accept", "decline"];
+    const decisions = normalizeCommandApprovalDecisions(request.params?.availableDecisions);
     const reason = request.params?.reason || "";
     const command = request.params?.command || "";
     const cwd = request.params?.cwd || "";
+    const hasDetails = Boolean(reason || command || cwd);
 
     return `
       <article class="bubble agent pending-request-card">
         <strong>Command Approval</strong>
         <div class="message-body">
+          ${hasDetails ? "" : "<p>This approval request arrived without command details. You can still allow or decline it.</p>"}
           ${reason ? `<p>${escapeHtml(reason)}</p>` : ""}
           ${command ? `<pre>${escapeHtml(command)}</pre>` : ""}
           ${cwd ? `<p><strong>cwd</strong> ${escapeHtml(cwd)}</p>` : ""}
@@ -2908,7 +3642,22 @@ function commandApprovalDecisionLabel(decision) {
 }
 
 function renderMarkdown(text) {
-  return marked.parse(String(text || ""));
+  const key = String(text || "");
+  const cached = markdownHtmlCache.get(key);
+
+  if (cached) {
+    return cached;
+  }
+
+  const html = marked.parse(key);
+  markdownHtmlCache.set(key, html);
+
+  if (markdownHtmlCache.size > MAX_MARKDOWN_CACHE_ENTRIES) {
+    const oldestKey = markdownHtmlCache.keys().next().value;
+    markdownHtmlCache.delete(oldestKey);
+  }
+
+  return html;
 }
 
 function renderMessageContent(items, fallbackText = "") {
@@ -2950,12 +3699,9 @@ function renderContentEntry(entry) {
 }
 
 function connectEvents() {
-  connectConversationSocket();
-  window.addEventListener("beforeunload", disconnectConversationSocket);
-  window.addEventListener("beforeunload", () => {
-    void disconnectTerminalClient();
-  });
+  window.addEventListener("message", handlePaneMessage);
   elements.sidebarResizeHandle.addEventListener("pointerdown", startSidebarResize);
+  elements.sidebarResizeHandle.addEventListener("dblclick", handleSidebarResizeDoubleClick);
   elements.sidebarResizeHandle.addEventListener("keydown", handleSidebarResizeKeydown);
   window.addEventListener("pointermove", handleSidebarResizePointerMove);
   window.addEventListener("pointerup", stopSidebarResize);
@@ -2965,25 +3711,38 @@ function connectEvents() {
   elements.promptInput.addEventListener("input", () => {
     persistComposerDraft();
   });
+  elements.projectSelect?.addEventListener("change", async (event) => {
+    try {
+      await switchSelectedProject(event.target.value);
+    } catch (error) {
+      alert(error.message);
+    }
+  });
   elements.autoscrollToggle.addEventListener("change", (event) => {
     state.autoscroll = event.target.checked;
     persistSelection();
-    if (state.autoscroll) {
-      scrollConversationToBottom();
-    }
+    syncAllPaneFrames();
   });
   elements.approveAllDangerousToggle.addEventListener("change", (event) => {
     state.composerApproveAllDangerous = event.target.checked;
     persistSelection();
-    if (state.composerApproveAllDangerous) {
-      void maybeAutoApprovePendingRequests();
-    }
+    syncAllPaneFrames();
   });
   elements.ralphLoopToggle.addEventListener("change", (event) => {
     state.composerRalphLoop = event.target.checked;
     if (!state.composerRalphLoop) {
       cancelPendingRalphLoop({ cancelAutoCompact: true });
+    } else if (state.selectedThreadId && currentRalphLoopInput(state.selectedThreadId)) {
+      setRalphLoopBudget(state.selectedThreadId);
     }
+  });
+  elements.ralphLoopLimitInput.addEventListener("change", (event) => {
+    const nextLimit = normalizeRalphLoopLimit(event.target.value);
+    state.composerRalphLoopLimit = nextLimit;
+    event.target.value = String(nextLimit);
+    syncConfiguredRalphLoopBudget();
+    persistSelection();
+    syncAllPaneFrames();
   });
   elements.imageEditorOverlayCanvas.addEventListener("pointerdown", handleImageEditorPointerDown);
   elements.imageEditorOverlayCanvas.addEventListener("pointermove", handleImageEditorPointerMove);
@@ -3022,52 +3781,24 @@ function connectEvents() {
       return;
     }
 
+    if (event.key === "Escape" && state.composerSettingsOpen) {
+      state.composerSettingsOpen = false;
+      state.composerMenuOpen = "";
+      renderComposerControls();
+      return;
+    }
+
     if (event.key === "Escape" && state.imageEditor.open) {
       closeImageEditor();
+      return;
+    }
+
+    if (event.key === "Escape" && state.ralphLoopPendingReplay) {
+      cancelPendingRalphLoop({ disableLoop: true, cancelAutoCompact: true });
     }
   });
 
-  elements.threadTerminalReconnect.addEventListener("click", () => {
-    void reconnectProjectTerminal();
-  });
-
-  elements.threadTerminalInterrupt.addEventListener("click", () => {
-    void sendTerminalControl("interrupt");
-  });
-
-  elements.threadTerminalClear.addEventListener("click", () => {
-    clearProjectTerminal();
-  });
-
-  elements.threadTerminalStop.addEventListener("click", () => {
-    void stopProjectTerminal();
-  });
-
-  elements.threadResourceOpenRaw.addEventListener("click", () => {
-    const resource = activeResource();
-    if (resource?.viewUrl) {
-      window.open(resource.viewUrl, "_blank", "noopener,noreferrer");
-    }
-  });
-
-  elements.threadResourceReload.addEventListener("click", () => {
-    const resource = activeResource();
-    if (resource?.id) {
-      void loadResource(resource.id);
-    }
-  });
-
-  elements.threadResourceClose.addEventListener("click", () => {
-    const resource = activeResource();
-    if (resource?.id) {
-      closeResourceTab(resource.id);
-    }
-  });
-
-  terminalResizeObserver = new ResizeObserver(() => {
-    scheduleTerminalFit();
-  });
-  terminalResizeObserver.observe(elements.threadTerminalViewport);
+  window.addEventListener("beforeunload", disconnectConversationSocket);
 }
 
 function clampSidebarWidth(width) {
@@ -3151,6 +3882,15 @@ function stopSidebarResize(event) {
   persistSelection();
 }
 
+function handleSidebarResizeDoubleClick(event) {
+  if (event.target.closest("[data-action='toggle-sidebar']")) {
+    return;
+  }
+
+  event.preventDefault();
+  toggleSidebarCollapsed();
+}
+
 function handleSidebarResizeKeydown(event) {
   if (event.key === "Enter" || event.key === " ") {
     event.preventDefault();
@@ -3209,6 +3949,21 @@ function connectConversationSocket() {
   const socket = new WebSocket(url);
   conversationSocket = socket;
 
+  socket.addEventListener("open", async () => {
+    if (conversationSocket !== socket) {
+      return;
+    }
+
+    try {
+      await loadPendingServerRequests();
+      renderProjects();
+      renderSelectedThread();
+      void maybeAutoApprovePendingRequests();
+    } catch (error) {
+      console.error("Failed to sync pending requests", error);
+    }
+  });
+
   socket.addEventListener("message", async (event) => {
     if (typeof event.data !== "string") {
       return;
@@ -3256,8 +4011,7 @@ function connectConversationSocket() {
       }
 
       if (method.startsWith("thread/")) {
-        await loadAllProjectThreads().catch(console.error);
-        renderProjects();
+        scheduleProjectThreadsReload();
       }
     }
   });
@@ -3288,292 +4042,14 @@ function connectConversationSocket() {
 function disconnectConversationSocket() {
   conversationSocketShouldReconnect = false;
   clearTimeout(conversationSocketRetryTimer);
+  clearTimeout(projectThreadsReloadTimer);
+  projectThreadsReloadTimer = null;
   conversationSocketRetryTimer = null;
   if (conversationSocket) {
     const socket = conversationSocket;
     conversationSocket = null;
     socket.close();
   }
-}
-
-function terminalSocketUrl(projectId, size = {}) {
-  const url = new URL(`/ws/projects/${encodeURIComponent(projectId)}/terminal`, window.location.href);
-  url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-
-  if (state.app?.port) {
-    url.port = String(state.app.port);
-  }
-
-  if (Number.isInteger(size.columns) && size.columns > 0) {
-    url.searchParams.set("columns", String(size.columns));
-  }
-  if (Number.isInteger(size.rows) && size.rows > 0) {
-    url.searchParams.set("rows", String(size.rows));
-  }
-  url.searchParams.set("term", "xterm-256color");
-  return url.toString();
-}
-
-function ensureTerminalEmulator() {
-  if (state.terminalEmulator) {
-    return state.terminalEmulator;
-  }
-
-  const terminal = new Terminal({
-    cursorBlink: true,
-    fontFamily: "\"SFMono-Regular\", Menlo, Consolas, monospace",
-    fontSize: 13,
-    lineHeight: 1.35,
-    scrollback: 5000,
-    theme: {
-      background: "#0d0f12",
-      foreground: "#eceef0",
-      cursor: "#4aa3ff",
-      selectionBackground: "rgba(74, 163, 255, 0.24)",
-    },
-  });
-  const fitAddon = new FitAddon();
-
-  terminal.loadAddon(fitAddon);
-  terminal.open(elements.threadTerminalViewport);
-  elements.threadTerminalViewport.addEventListener("click", () => {
-    terminal.focus();
-  });
-  terminal.onData((data) => {
-    const socket = state.terminalClient?.socket;
-    if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "input", data }));
-    }
-  });
-  terminal.onResize(({ cols, rows }) => {
-    const socket = state.terminalClient?.socket;
-    if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "resize", columns: cols, rows }));
-    }
-  });
-
-  state.terminalEmulator = { terminal, fitAddon };
-  return state.terminalEmulator;
-}
-
-function resolveTerminalGeometry() {
-  const { terminal, fitAddon } = ensureTerminalEmulator();
-  if (state.activeThreadTab === "terminal") {
-    try {
-      fitAddon.fit();
-    } catch {}
-  }
-
-  return {
-    columns: Math.max(40, terminal.cols || 120),
-    rows: Math.max(12, terminal.rows || 32),
-  };
-}
-
-async function ensureProjectTerminal() {
-  const project = selectedProject();
-  if (!project || state.terminalConnectInFlight) {
-    return;
-  }
-
-  const current = state.terminalClient;
-  if (current?.projectId === project.id && (
-    current.socket.readyState === WebSocket.OPEN
-    || current.socket.readyState === WebSocket.CONNECTING
-  )) {
-    scheduleTerminalFit();
-    return;
-  }
-
-  state.terminalConnectInFlight = true;
-  renderThreadPane();
-
-  try {
-    const geometry = resolveTerminalGeometry();
-    const payload = await api(`/api/projects/${encodeURIComponent(project.id)}/terminal`, {
-      method: "POST",
-      body: {
-        columns: geometry.columns,
-        rows: geometry.rows,
-        term: "xterm-256color",
-      },
-    });
-    state.terminalSessionByProjectId[project.id] = payload.data || payload;
-    await connectTerminalClient(project.id, geometry);
-  } finally {
-    state.terminalConnectInFlight = false;
-    renderThreadPane();
-  }
-}
-
-async function connectTerminalClient(projectId, geometry = resolveTerminalGeometry()) {
-  const current = state.terminalClient;
-  const emulator = ensureTerminalEmulator();
-
-  if (current?.projectId === projectId && (
-    current.socket.readyState === WebSocket.OPEN
-    || current.socket.readyState === WebSocket.CONNECTING
-  )) {
-    scheduleTerminalFit();
-    emulator.terminal.focus();
-    return;
-  }
-
-  await disconnectTerminalClient();
-  const socket = new WebSocket(terminalSocketUrl(projectId, geometry));
-  state.terminalClient = { projectId, socket };
-
-  socket.addEventListener("open", () => {
-    if (state.terminalClient?.socket !== socket) {
-      return;
-    }
-
-    scheduleTerminalFit();
-    emulator.terminal.focus();
-    renderThreadPane();
-  });
-
-  socket.addEventListener("message", (event) => {
-    if (typeof event.data !== "string") {
-      return;
-    }
-
-    let payload;
-
-    try {
-      payload = JSON.parse(event.data);
-    } catch (error) {
-      console.error("Failed to parse terminal payload", error);
-      return;
-    }
-
-    if (payload.type === "session") {
-      state.terminalSessionByProjectId[projectId] = payload.data || payload;
-      if (state.terminalClient?.projectId === projectId) {
-        emulator.terminal.reset();
-        if (payload.data?.buffer) {
-          emulator.terminal.write(String(payload.data.buffer));
-        }
-        scheduleTerminalFit();
-        emulator.terminal.focus();
-      }
-      renderThreadPane();
-      return;
-    }
-
-    if (payload.type === "output") {
-      if (state.terminalClient?.projectId === projectId) {
-        emulator.terminal.write(String(payload.data || ""));
-      }
-      return;
-    }
-
-    if (payload.type === "exit") {
-      state.terminalSessionByProjectId[projectId] = {
-        ...(state.terminalSessionByProjectId[projectId] || {}),
-        state: "stopped",
-        exitCode: payload.exitCode ?? null,
-        signal: payload.signal ?? null,
-      };
-      renderThreadPane();
-      return;
-    }
-
-    if (payload.type === "error") {
-      if (state.terminalClient?.projectId === projectId) {
-        emulator.terminal.writeln(`\r\n[terminal error] ${String(payload.error || "unknown error")}`);
-      }
-      state.terminalSessionByProjectId[projectId] = {
-        ...(state.terminalSessionByProjectId[projectId] || {}),
-        state: "error",
-        error: String(payload.error || "unknown error"),
-      };
-      renderThreadPane();
-    }
-  });
-
-  socket.addEventListener("close", () => {
-    if (state.terminalClient?.socket === socket) {
-      state.terminalClient = null;
-      renderThreadPane();
-    }
-  });
-
-  socket.addEventListener("error", () => {
-    if (state.terminalClient?.socket === socket && state.activeThreadTab === "terminal") {
-      elements.threadTerminalStatus.textContent = "Terminal connection error";
-    }
-  });
-}
-
-async function disconnectTerminalClient() {
-  if (!state.terminalClient) {
-    return;
-  }
-
-  const { socket } = state.terminalClient;
-  state.terminalClient = null;
-  if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-    socket.close();
-  }
-}
-
-function scheduleTerminalFit() {
-  clearTimeout(terminalFitTimer);
-  terminalFitTimer = setTimeout(() => {
-    applyTerminalFit();
-  }, 80);
-}
-
-function applyTerminalFit() {
-  if (state.activeThreadTab !== "terminal" || !state.terminalEmulator) {
-    return;
-  }
-
-  try {
-    state.terminalEmulator.fitAddon.fit();
-  } catch {}
-}
-
-function requireActiveTerminalSocket() {
-  const project = selectedProject();
-  const socket = state.terminalClient?.socket;
-  if (!project || state.terminalClient?.projectId !== project.id || socket?.readyState !== WebSocket.OPEN) {
-    throw new Error("Terminal is not connected");
-  }
-
-  return socket;
-}
-
-async function reconnectProjectTerminal() {
-  await disconnectTerminalClient();
-  await ensureProjectTerminal();
-}
-
-function sendTerminalControl(action) {
-  const socket = requireActiveTerminalSocket();
-  socket.send(JSON.stringify({ type: "control", action }));
-}
-
-function clearProjectTerminal() {
-  const { terminal } = ensureTerminalEmulator();
-  terminal.clear();
-}
-
-async function stopProjectTerminal() {
-  const project = selectedProject();
-  if (!project) {
-    return;
-  }
-
-  await disconnectTerminalClient();
-  await api(`/api/projects/${encodeURIComponent(project.id)}/terminal`, {
-    method: "DELETE",
-  });
-  delete state.terminalSessionByProjectId[project.id];
-  ensureTerminalEmulator().terminal.reset();
-  renderThreadPane();
-  elements.threadTerminalStatus.textContent = "Terminal stopped";
 }
 
 document.addEventListener("click", async (event) => {
@@ -3598,7 +4074,13 @@ document.addEventListener("click", async (event) => {
     renderThreadHeader();
   }
 
-  if (state.composerMenuOpen && !event.target.closest(".composer-picker")) {
+  if (state.composerMenuOpen && !event.target.closest(".composer-settings")) {
+    state.composerMenuOpen = "";
+    renderComposerControls();
+  }
+
+  if (state.composerSettingsOpen && !event.target.closest(".composer-settings")) {
+    state.composerSettingsOpen = false;
     state.composerMenuOpen = "";
     renderComposerControls();
   }
@@ -3631,7 +4113,19 @@ document.addEventListener("click", async (event) => {
       return;
     }
 
+    if (action === "toggle-composer-settings") {
+      state.composerSettingsOpen = !state.composerSettingsOpen;
+      if (!state.composerSettingsOpen) {
+        state.composerMenuOpen = "";
+      }
+      renderComposerControls();
+      return;
+    }
+
     if (action === "toggle-composer-menu") {
+      if (!state.composerSettingsOpen) {
+        state.composerSettingsOpen = true;
+      }
       const nextMenu = button.dataset.menu === "effort" ? "effort" : "model";
       state.composerMenuOpen = state.composerMenuOpen === nextMenu ? "" : nextMenu;
       renderComposerControls();
@@ -3705,23 +4199,20 @@ document.addEventListener("click", async (event) => {
       if (!state.selectedProjectId || !state.projects.some((project) => project.id === state.selectedProjectId)) {
         state.selectedProjectId = state.projects[0]?.id || "";
       }
-      ensureProjectVisible(state.selectedProjectId);
+      if (state.selectedProjectId) {
+        normalizeProjectOpenTabs(state.selectedProjectId);
+      }
       syncSelectedProjectThreadTab();
       await loadAllProjectThreads();
+      if (state.selectedThreadId) {
+        await loadThread(state.selectedThreadId).catch(console.error);
+      }
       renderProjects();
       return;
     }
 
     if (action === "select-project") {
-      state.selectedProjectId = button.dataset.id;
-      state.selectedThreadId = "";
-      state.selectedThread = null;
-      state.threadActionMenuOpen = false;
-      syncSelectedProjectThreadTab();
-      await disconnectTerminalClient();
-      persistSelection();
-      renderProjects();
-      await loadThreads();
+      await switchSelectedProject(button.dataset.id || "");
       return;
     }
 
@@ -3731,71 +4222,62 @@ document.addEventListener("click", async (event) => {
       return;
     }
 
-    if (action === "toggle-project-threads") {
-      const projectId = button.dataset.projectId || "";
-      if (!projectId) {
+    if (action === "select-project-tab") {
+      const tabId = button.dataset.id || "";
+      if (!tabId) {
         return;
       }
 
-      toggleProjectThreads(projectId);
-      renderProjects();
-      return;
-    }
-
-    if (action === "toggle-project-collapse") {
-      const projectId = button.dataset.projectId || "";
-      if (!projectId) {
-        return;
-      }
-
-      const wasCollapsed = state.collapsedProjectIds.has(projectId);
-      toggleProjectCollapsed(projectId);
-      renderProjects();
-      if (wasCollapsed) {
-        void loadAllProjectThreads().catch((error) => {
-          console.error(`Failed to load threads for project ${projectId}`, error);
-        });
-      }
-      return;
-    }
-
-    if (action === "select-thread-tab") {
-      const nextTab = button.dataset.tab === "terminal" ? "terminal" : "chat";
-      setProjectThreadTab(nextTab);
+      setProjectActiveTabId(state.selectedProjectId, tabId);
+      syncSelectedProjectThreadTab();
       state.threadActionMenuOpen = false;
       persistSelection();
       renderThreadHeader();
+      renderConversation();
       renderThreadPane();
-      focusActiveThreadPane(nextTab);
-      if (nextTab === "terminal") {
-        await ensureProjectTerminal();
+      if (state.selectedThreadId) {
+        await loadThread(state.selectedThreadId).catch(console.error);
       }
+      focusActiveThreadPane(projectThreadTab());
       return;
     }
 
-    if (action === "select-resource-tab") {
-      const resourceId = button.dataset.id || "";
-      const resource = findResource(resourceId);
-      if (!resource) {
+    if (action === "open-terminal-tab") {
+      if (!state.selectedProjectId) {
         return;
       }
 
-      if (cleanString(resource.projectId) !== cleanString(state.selectedProjectId)) {
-        state.selectedProjectId = resource.projectId;
-      }
-      setProjectActiveResource(resource.projectId, resourceId);
-      setProjectThreadTab("resource", resource.projectId);
+      openProjectTerminalTab(state.selectedProjectId, { activate: true });
       syncSelectedProjectThreadTab();
       state.threadActionMenuOpen = false;
       persistSelection();
       renderThreadHeader();
       renderThreadPane();
-      focusActiveThreadPane("resource");
+      focusActiveThreadPane("terminal");
       return;
     }
 
-    if (action === "close-resource-tab") {
-      closeResourceTab(button.dataset.id || "");
+    if (action === "close-project-tab") {
+      const tabId = button.dataset.id || "";
+      const tab = findProjectTab(state.selectedProjectId, tabId);
+
+      if (!tab) {
+        return;
+      }
+
+      if (tab.pane === "resource") {
+        closeResourceTab(tab.resourceId || "");
+      } else {
+        closeProjectTab(state.selectedProjectId, tabId, { ensureFallback: true });
+        syncSelectedProjectThreadTab();
+        persistSelection();
+        renderThreadHeader();
+        renderConversation();
+        renderThreadPane();
+        if (state.selectedThreadId) {
+          await loadThread(state.selectedThreadId).catch(console.error);
+        }
+      }
       return;
     }
 
@@ -3809,21 +4291,14 @@ document.addEventListener("click", async (event) => {
 
     if (action === "new-thread") {
       const projectId = button.dataset.projectId || state.selectedProjectId;
-      const projectChanged = Boolean(projectId) && projectId !== state.selectedProjectId;
 
       if (projectId) {
         state.selectedProjectId = projectId;
       }
 
-      state.selectedThreadId = "";
-      state.selectedThread = null;
-      state.currentTurnId = "";
+      createProjectDraftTab(state.selectedProjectId, { activate: true });
       state.threadActionMenuOpen = false;
       syncSelectedProjectThreadTab();
-
-      if (projectChanged) {
-        await disconnectTerminalClient();
-      }
 
       state.threads = state.projectThreads[state.selectedProjectId] || [];
       persistSelection();
@@ -3832,10 +4307,6 @@ document.addEventListener("click", async (event) => {
       renderConversation();
       renderComposerControls();
       renderThreadPane();
-
-      if (projectChanged && state.activeThreadTab === "terminal" && selectedProject()) {
-        await ensureProjectTerminal();
-      }
 
       if (projectId && !Object.prototype.hasOwnProperty.call(state.projectThreads, projectId)) {
         void loadProjectThreads(projectId).catch((error) => {
@@ -3856,19 +4327,16 @@ document.addEventListener("click", async (event) => {
 
       if (projectId && projectId !== state.selectedProjectId) {
         state.selectedProjectId = projectId;
-        ensureProjectVisible(projectId);
-        syncSelectedProjectThreadTab();
-        void disconnectTerminalClient();
         if (!state.projectThreads[projectId]) {
           void loadProjectThreads(projectId).catch((error) => {
             console.error(`Failed to load threads for project ${projectId}`, error);
           });
         }
       }
+
+      openProjectThreadTab(projectId, threadId, { activate: true });
+      syncSelectedProjectThreadTab();
       state.threadActionMenuOpen = false;
-      state.selectedThreadId = threadId;
-      state.selectedThread = null;
-      state.currentTurnId = "";
       persistSelection();
       renderProjects();
       renderThreadHeader();
@@ -3879,76 +4347,33 @@ document.addEventListener("click", async (event) => {
     }
 
     if (action === "rename-thread") {
-      if (!state.selectedThreadId) {
-        return;
-      }
-
       const name = window.prompt("Thread name", state.selectedThread?.name || "");
-
-      if (!name) {
-        return;
-      }
-
-      state.threadActionMenuOpen = false;
-      await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/name`, {
-        method: "POST",
-        body: { name },
-      });
-      await loadThread(state.selectedThreadId);
-      await loadAllProjectThreads();
-      renderProjects();
+      await performThreadAction(action, { name });
       return;
     }
 
     if (action === "fork-thread") {
-      state.threadActionMenuOpen = false;
-      await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/fork`, { method: "POST", body: {} });
-      await loadAllProjectThreads();
-      renderProjects();
+      await performThreadAction(action);
       return;
     }
 
     if (action === "compact-thread") {
-      state.threadActionMenuOpen = false;
-      await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/compact`, { method: "POST", body: {} });
+      await performThreadAction(action);
       return;
     }
 
     if (action === "review-thread") {
-      state.threadActionMenuOpen = false;
-      await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/review`, {
-        method: "POST",
-        body: { targetType: "uncommittedChanges", delivery: "inline" },
-      });
+      await performThreadAction(action);
       return;
     }
 
     if (action === "interrupt-thread") {
-      if (!state.currentTurnId) {
-        throw new Error("No active turn id available");
-      }
-
-      state.threadActionMenuOpen = false;
-      await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/interrupt`, {
-        method: "POST",
-        body: { turnId: state.currentTurnId },
-      });
+      await performThreadAction(action);
       return;
     }
 
     if (action === "archive-thread" || action === "unarchive-thread") {
-      state.threadActionMenuOpen = false;
-      await api(`/api/threads/${encodeURIComponent(state.selectedThreadId)}/${action === "archive-thread" ? "archive" : "unarchive"}`, {
-        method: "POST",
-        body: {},
-      });
-      await loadAllProjectThreads();
-      renderProjects();
-      state.selectedThreadId = "";
-      state.selectedThread = null;
-      renderThreadHeader();
-      renderConversation();
-      renderThreadPane();
+      await performThreadAction(action);
       return;
     }
 
@@ -4012,12 +4437,11 @@ document.addEventListener("submit", async (event) => {
       const created = savedPayload.data;
       state.projects = await api("/api/projects").then((result) => result.data);
       state.selectedProjectId = created.id;
-      state.selectedThreadId = "";
-      state.selectedThread = null;
+      createProjectDraftTab(created.id, { activate: true });
+      syncSelectedProjectThreadTab();
       form.reset();
       elements.projectQuickAddForm.classList.add("hidden");
       persistSelection();
-      setInitialProjectVisibility(created.id);
       await loadThreads();
       return;
     }
@@ -4185,7 +4609,7 @@ async function openImageEditor(attachmentId) {
   };
   elements.imageEditorModal.classList.remove("hidden");
   elements.imageEditorModal.setAttribute("aria-hidden", "false");
-  document.body.classList.add("modal-open");
+  syncModalOpenState();
   elements.imageEditorPreviewImage.src = attachment.url;
   layoutImageEditorCanvas();
   syncImageEditorToolbar();
@@ -4197,7 +4621,7 @@ function closeImageEditor() {
   elements.imageEditorModal.classList.add("hidden");
   elements.imageEditorModal.setAttribute("aria-hidden", "true");
   elements.imageEditorPreviewImage.removeAttribute("src");
-  document.body.classList.remove("modal-open");
+  syncModalOpenState();
 }
 
 function setImageEditorTool(tool) {

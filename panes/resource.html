@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Resource</title>
+    <style>
+      html, body {
+        height: 100%;
+      }
+
+      body {
+        margin: 0;
+      }
+
+      .pane-frame-shell {
+        height: 100%;
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+        gap: 12px;
+        padding: 5px;
+        background:
+          radial-gradient(circle at top right, rgba(74, 163, 255, 0.08), transparent 25%),
+          linear-gradient(180deg, #161718 0%, #111213 100%);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="pane-frame-shell">
+      <div class="thread-resource-bar">
+        <div class="thread-resource-meta">
+          <div id="threadResourceTitle" class="thread-resource-title">Open a file link to preview it here.</div>
+          <div id="threadResourceStatus" class="thread-resource-status">Text files open in Monaco and save as you type. Images render inline.</div>
+        </div>
+        <div class="thread-resource-actions">
+          <button id="threadResourceOpenRaw" type="button" class="ghost-button">Open Raw</button>
+          <button id="threadResourceReload" type="button" class="ghost-button">Reload</button>
+          <button id="threadResourceClose" type="button" class="ghost-button">Close Tab</button>
+        </div>
+      </div>
+      <div class="thread-resource-surface">
+        <div id="threadResourceEmpty" class="thread-resource-empty">Open a file link in the conversation to view it here.</div>
+        <div id="threadResourceEditor" class="thread-resource-editor hidden" aria-label="File editor"></div>
+        <div id="threadResourcePreview" class="thread-resource-preview hidden"></div>
+      </div>
+    </div>
+    <script type="module" src="/src/resource-pane.js"></script>
+  </body>
+</html>
