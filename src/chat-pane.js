@@ -262,6 +262,9 @@ document.addEventListener("click", async (event) => {
     if (action === "toggle-approve-all-dangerous") {
       updateComposerSetting("approveAllDangerous", !state.composer.approveAllDangerous);
       renderComposer();
+      if (state.approveAllDangerous) {
+        await maybeAutoApprovePendingRequests();
+      }
       return;
     }
 
@@ -286,7 +289,7 @@ document.addEventListener("click", async (event) => {
     if (action === "rename-thread") {
       const name = window.prompt("Thread name", state.thread?.name || "");
       if (name) {
-        bridge.send("thread-action", { action, name });
+        await performThreadAction(action, { name });
       }
       state.ui.threadActionMenuOpen = false;
       renderChatHeader();
@@ -294,7 +297,7 @@ document.addEventListener("click", async (event) => {
     }
 
     if (["fork-thread", "compact-thread", "review-thread", "interrupt-thread", "archive-thread", "unarchive-thread"].includes(action)) {
-      bridge.send("thread-action", { action });
+      await performThreadAction(action);
       state.ui.threadActionMenuOpen = false;
       renderChatHeader();
       return;
@@ -484,6 +487,7 @@ async function bootstrapStandalone() {
     loadPendingRequests(),
   ]);
   connectConversationSocket();
+  await maybeAutoApprovePendingRequests();
 }
 
 function activeComposerDraftText() {
@@ -693,6 +697,77 @@ async function loadPendingRequests() {
   const requests = Array.isArray(payload.data) ? payload.data : [];
   state.pendingRequests = requests.filter((request) => request?.params?.threadId === state.threadId);
   renderConversation();
+}
+
+async function performThreadAction(action, options = {}) {
+  if (!state.threadId) {
+    return;
+  }
+
+  const threadId = encodeURIComponent(state.threadId);
+
+  if (action === "rename-thread") {
+    const name = cleanString(options.name);
+    if (!name) {
+      return;
+    }
+
+    await api(`/api/threads/${threadId}/name`, {
+      method: "POST",
+      body: { name },
+    });
+    await loadThread(state.threadId);
+    return;
+  }
+
+  if (action === "compact-thread") {
+    await api(`/api/threads/${threadId}/compact`, { method: "POST", body: {} });
+    await loadThread(state.threadId).catch(console.error);
+    await loadPendingRequests().catch(console.error);
+    await maybeAutoApprovePendingRequests();
+    return;
+  }
+
+  if (action === "review-thread") {
+    await api(`/api/threads/${threadId}/review`, {
+      method: "POST",
+      body: { targetType: "uncommittedChanges", delivery: "inline" },
+    });
+    return;
+  }
+
+  if (action === "fork-thread") {
+    const payload = await api(`/api/threads/${threadId}/fork`, { method: "POST", body: {} });
+    const nextThreadId = cleanString(payload.data?.thread?.id || payload.data?.id || "");
+    if (nextThreadId) {
+      const url = new URL(window.location.href);
+      url.searchParams.set("threadId", nextThreadId);
+      window.location.href = url.toString();
+    }
+    return;
+  }
+
+  if (action === "interrupt-thread") {
+    const turnId = findLatestTurnId(state.thread);
+    if (!turnId) {
+      throw new Error("No active turn id available");
+    }
+
+    await api(`/api/threads/${threadId}/interrupt`, {
+      method: "POST",
+      body: { turnId },
+    });
+    return;
+  }
+
+  if (action === "archive-thread" || action === "unarchive-thread") {
+    await api(`/api/threads/${threadId}/${action === "archive-thread" ? "archive" : "unarchive"}`, {
+      method: "POST",
+      body: {},
+    });
+    state.archived = action === "archive-thread";
+    renderConversation();
+  }
 }
 
 function syncHostThreadSummary() {

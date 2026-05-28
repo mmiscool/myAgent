@@ -56,6 +56,73 @@ describe("approval utils", () => {
     });
   });
 
+  test("auto-approves Codex MCP approval elicitations with empty content", () => {
+    const request = {
+      method: "mcpServer/elicitation/request",
+      params: {
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+        },
+        requestedSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+    };
+
+    expect(isAutoApprovableRequest(request)).toBe(true);
+    expect(buildAutoApprovalResult(request)).toEqual({
+      action: "accept",
+      content: {},
+    });
+  });
+
+  test("auto-approves Codex MCP tool-call elicitations with tool metadata", () => {
+    const request = {
+      id: 0,
+      method: "mcpServer/elicitation/request",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        serverName: "playwright",
+        mode: "form",
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          tool_description: "Navigate to a URL",
+          tool_params: {
+            url: "http://localhost:5174/",
+          },
+        },
+        message: "Tool call needs your approval.",
+        requestedSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+    };
+
+    expect(isAutoApprovableRequest(request)).toBe(true);
+    expect(buildAutoApprovalResult(request)).toEqual({
+      action: "accept",
+      content: {},
+    });
+  });
+
+  test("does not auto-approve ordinary MCP elicitations", () => {
+    expect(buildAutoApprovalResult({
+      method: "mcpServer/elicitation/request",
+      params: {
+        message: "What is your email?",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            email: { type: "string" },
+          },
+        },
+      },
+    })).toBeNull();
+  });
+
   test("does not auto-approve unrelated requests", () => {
     expect(buildAutoApprovalResult({
       method: "item/tool/requestUserInput",

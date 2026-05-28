@@ -39,6 +39,14 @@ export function createAppThreadRuntime({
     actions.renderThreadPane?.();
   }
 
+  function manuallyExpandedConversationItemIds() {
+    if (!(state.manuallyExpandedConversationItemIds instanceof Set)) {
+      state.manuallyExpandedConversationItemIds = new Set();
+    }
+
+    return state.manuallyExpandedConversationItemIds;
+  }
+
   async function loadProjectThreads(projectId) {
     try {
       const payload = await api(`/api/projects/${encodeURIComponent(projectId)}/threads?archived=${state.archived}`);
@@ -220,13 +228,26 @@ export function createAppThreadRuntime({
     target[key] = values;
   }
 
+  function pendingServerRequestId(value) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return String(value);
+    }
+
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+
+    return "";
+  }
+
   function upsertPendingServerRequest(request) {
-    if (!request?.id) {
+    const requestId = pendingServerRequestId(request?.id);
+
+    if (!requestId) {
       return;
     }
 
-    const requestId = String(request.id);
-    const existingIndex = state.pendingServerRequests.findIndex((entry) => String(entry?.id) === requestId);
+    const existingIndex = state.pendingServerRequests.findIndex((entry) => pendingServerRequestId(entry?.id) === requestId);
 
     if (existingIndex === -1) {
       state.pendingServerRequests = state.pendingServerRequests.concat(request);
@@ -237,16 +258,16 @@ export function createAppThreadRuntime({
   }
 
   function removePendingServerRequest(requestId) {
-    const normalizedId = String(requestId || "");
+    const normalizedId = pendingServerRequestId(requestId);
     if (!normalizedId) {
       return;
     }
 
-    state.pendingServerRequests = state.pendingServerRequests.filter((entry) => String(entry?.id) !== normalizedId);
+    state.pendingServerRequests = state.pendingServerRequests.filter((entry) => pendingServerRequestId(entry?.id) !== normalizedId);
   }
 
   async function respondToPendingServerRequest(request, result) {
-    const requestId = String(request?.id || "");
+    const requestId = pendingServerRequestId(request?.id);
 
     if (!requestId) {
       return;
@@ -270,7 +291,7 @@ export function createAppThreadRuntime({
     }
 
     const tasks = requests.map(async (request) => {
-      const requestId = String(request?.id || "");
+      const requestId = pendingServerRequestId(request?.id);
       const result = buildAutoApprovalResult(request);
 
       if (!requestId || !result || state.autoApprovalInFlight.has(requestId)) {
@@ -367,7 +388,7 @@ export function createAppThreadRuntime({
       return false;
     }
 
-    return itemId === latestCollapsibleItemId;
+    return itemId === latestCollapsibleItemId || manuallyExpandedConversationItemIds().has(itemId);
   }
 
   function findConversationItemElement(itemId) {
@@ -384,9 +405,16 @@ export function createAppThreadRuntime({
 
   function collapseConversationItemsExcept(itemId) {
     const detailsList = elements.conversation.querySelectorAll(".collapsed-item details[data-item-id]");
+    const manuallyExpandedItemIds = manuallyExpandedConversationItemIds();
 
     detailsList.forEach((details) => {
-      details.open = details.dataset.itemId === itemId;
+      const detailsItemId = cleanString(details.dataset.itemId);
+      const isManuallyExpanded = manuallyExpandedItemIds.has(detailsItemId);
+      const shouldOpen = detailsItemId === itemId || isManuallyExpanded;
+      if (shouldOpen && !details.open && !isManuallyExpanded) {
+        details.dataset.autoExpanded = "true";
+      }
+      details.open = shouldOpen;
       if (details.open) {
         hydrateConversationDetails(details);
       }
@@ -785,11 +813,26 @@ export function createAppThreadRuntime({
   function handleConversationDetailsToggle(event) {
     const details = event.target;
 
-    if (!(details instanceof HTMLDetailsElement) || !details.open) {
+    if (!(details instanceof HTMLDetailsElement)) {
       return;
     }
 
-    hydrateConversationDetails(details);
+    const itemId = cleanString(details.dataset.itemId);
+    const manuallyExpandedItemIds = manuallyExpandedConversationItemIds();
+    const autoExpanded = details.dataset.autoExpanded === "true";
+    delete details.dataset.autoExpanded;
+
+    if (details.open) {
+      if (itemId && !autoExpanded) {
+        manuallyExpandedItemIds.add(itemId);
+      }
+      hydrateConversationDetails(details);
+      return;
+    }
+
+    if (itemId) {
+      manuallyExpandedItemIds.delete(itemId);
+    }
   }
 
   function applyStreamingNotification(message) {

@@ -832,22 +832,159 @@ function openConsoleResponseStream(threadId, turnId, itemId) {
   activeConsoleResponseKey = `${threadId || ""}:${turnId || ""}:${itemId || ""}`;
 }
 
+function buildConsoleResponseKey(parts = []) {
+  return parts.map((part) => String(part || "")).join(":");
+}
+
+function buildConsoleSectionLines({ threadId, turnId, itemId, status, extra = [] } = {}) {
+  const lines = [];
+
+  if (threadId) {
+    lines.push(`thread: ${threadId}`);
+  }
+  if (turnId) {
+    lines.push(`turn: ${turnId}`);
+  }
+  if (itemId) {
+    lines.push(`item: ${itemId}`);
+  }
+  if (status) {
+    lines.push(`status: ${status}`);
+  }
+
+  for (const value of extra) {
+    const text = String(value || "").trim();
+    if (text) {
+      lines.push(text);
+    }
+  }
+
+  return lines;
+}
+
+function isToolCallItemType(type) {
+  return type === "dynamicToolCall" || type === "mcpToolCall" || type === "collabAgentToolCall";
+}
+
+function toolCallTitle(item) {
+  if (!item || typeof item !== "object") {
+    return "Tool Call";
+  }
+
+  if (item.type === "mcpToolCall") {
+    return "MCP Tool";
+  }
+
+  if (item.type === "collabAgentToolCall") {
+    return "Collaboration";
+  }
+
+  return "Tool Call";
+}
+
+function toolCallSummary(item) {
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+
+  if (item.type === "mcpToolCall") {
+    return `${item.server || "mcp"} · ${item.tool || "tool"}`;
+  }
+
+  if (item.type === "collabAgentToolCall") {
+    return `${item.tool || "agent tool"}${item.model ? ` · ${item.model}` : ""}`;
+  }
+
+  return item.tool || "dynamic tool";
+}
+
+function writeToolCallEvent(title, item, params) {
+  closeConsoleResponseStream();
+  writeConsoleSection(title, buildConsoleSectionLines({
+    threadId: params?.threadId,
+    turnId: params?.turnId,
+    itemId: item?.id || params?.itemId,
+    status: item?.status,
+    extra: [
+      toolCallSummary(item),
+      JSON.stringify(item, null, 2),
+    ],
+  }));
+}
+
+function writeConsoleLlmText({ title, threadId, turnId, itemId, extraKeyParts = [], delta = "" }) {
+  const key = buildConsoleResponseKey([threadId, turnId, itemId, ...extraKeyParts]);
+  if (key !== activeConsoleResponseKey) {
+    writeConsoleSection(title, buildConsoleSectionLines({ threadId, turnId, itemId }));
+    activeConsoleResponseKey = key;
+  }
+
+  process.stdout.write(delta);
+}
+
 function writeRealtimeLlmDelta(message) {
   const method = typeof message?.method === "string" ? message.method : "";
   const params = message?.params || {};
 
-  if (method === "item/agentMessage/delta") {
-    const key = `${params.threadId || ""}:${params.turnId || ""}:${params.itemId || ""}`;
-    if (key !== activeConsoleResponseKey) {
-      openConsoleResponseStream(params.threadId, params.turnId, params.itemId);
+  if (method === "item/started" || method === "item/completed") {
+    const item = params?.item;
+    if (isToolCallItemType(item?.type)) {
+      const phase = method === "item/started" ? "Started" : "Completed";
+      writeToolCallEvent(`${toolCallTitle(item)} ${phase}`, item, params);
+      return;
     }
+  }
 
-    process.stdout.write(params.delta || "");
+  if (method === "item/agentMessage/delta") {
+    writeConsoleLlmText({
+      title: "Assistant Message",
+      threadId: params.threadId,
+      turnId: params.turnId,
+      itemId: params.itemId,
+      delta: params.delta || "",
+    });
+    return;
+  }
+
+  if (method === "item/reasoning/textDelta") {
+    writeConsoleLlmText({
+      title: "Assistant Reasoning",
+      threadId: params.threadId,
+      turnId: params.turnId,
+      itemId: params.itemId,
+      extraKeyParts: ["reasoning", "content", params.contentIndex],
+      delta: params.delta || "",
+    });
+    return;
+  }
+
+  if (method === "item/reasoning/summaryTextDelta") {
+    writeConsoleLlmText({
+      title: "Assistant Reasoning Summary",
+      threadId: params.threadId,
+      turnId: params.turnId,
+      itemId: params.itemId,
+      extraKeyParts: ["reasoning", "summary", params.summaryIndex],
+      delta: params.delta || "",
+    });
+    return;
+  }
+
+  if (method === "item/plan/delta") {
+    writeConsoleLlmText({
+      title: "Assistant Plan",
+      threadId: params.threadId,
+      turnId: params.turnId,
+      itemId: params.itemId,
+      extraKeyParts: ["plan"],
+      delta: params.delta || "",
+    });
     return;
   }
 
   if (
-    method === "turn/completed"
+    method === "item/completed"
+    || method === "turn/completed"
     || method === "turn/aborted"
     || method === "thread/closed"
     || method === "error"

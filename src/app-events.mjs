@@ -54,6 +54,9 @@ export function createAppEvents({
       state.composerApproveAllDangerous = event.target.checked;
       actions.persistSelection?.();
       actions.syncAllPaneFrames?.();
+      if (state.composerApproveAllDangerous) {
+        void actions.maybeAutoApprovePendingRequests?.();
+      }
     });
     elements.ralphLoopToggle.addEventListener("change", (event) => {
       state.composerRalphLoop = event.target.checked;

@@ -87,6 +87,8 @@ function clearResourceState() {
     clearTimeout(state.resource.saveTimer);
   }
 
+  clearResourcePreviewUrl(state.resource);
+
   if (state.editor?.getModel()) {
     state.editor.setModel(null);
   }
@@ -166,7 +168,14 @@ function renderResourcePane() {
     elements.empty.classList.add("hidden");
     elements.editor.classList.add("hidden");
     elements.preview.classList.remove("hidden");
-    elements.preview.innerHTML = `<img class="thread-resource-image" src="${escapeHtml(resource.viewUrl)}" alt="${escapeHtml(resource.name || "Resource preview")}">`;
+    if (resource.mimeType === "image/svg+xml") {
+      elements.preview.innerHTML = `<div class="thread-resource-svg-loading">Loading SVG preview...</div>`;
+      void renderSvgPreview(resource);
+      return;
+    }
+
+    clearResourcePreviewUrl(resource);
+    elements.preview.innerHTML = `<img class="thread-resource-preview-image thread-resource-image" src="${escapeHtml(resource.viewUrl)}" alt="${escapeHtml(resource.name || "Resource preview")}">`;
     return;
   }
 
@@ -188,6 +197,126 @@ function renderResourcePane() {
   elements.preview.innerHTML = "";
   elements.editor.classList.remove("hidden");
   void syncActiveResourceEditor();
+}
+
+async function renderSvgPreview(resource) {
+  const resourceId = resource?.id;
+  const viewUrl = resource?.viewUrl;
+
+  if (!viewUrl) {
+    return;
+  }
+
+  try {
+    const response = await fetch(viewUrl, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`SVG preview failed: ${response.status}`);
+    }
+
+    const previewUrl = buildDarkModeSvgPreviewUrl(await response.text());
+
+    if (state.resource !== resource || state.resource?.id !== resourceId) {
+      URL.revokeObjectURL(previewUrl);
+      return;
+    }
+
+    clearResourcePreviewUrl(resource);
+    resource.previewObjectUrl = previewUrl;
+    elements.preview.innerHTML = `<img class="thread-resource-preview-image thread-resource-image" src="${escapeHtml(previewUrl)}" alt="${escapeHtml(resource.name || "SVG preview")}">`;
+  } catch (error) {
+    if (state.resource !== resource || state.resource?.id !== resourceId) {
+      return;
+    }
+
+    console.error(error);
+    elements.preview.innerHTML = `<img class="thread-resource-preview-image thread-resource-image" src="${escapeHtml(viewUrl)}" alt="${escapeHtml(resource.name || "SVG preview")}">`;
+  }
+}
+
+function buildDarkModeSvgPreviewUrl(source) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(source, "image/svg+xml");
+
+  if (doc.querySelector("parsererror")) {
+    throw new Error("Invalid SVG");
+  }
+
+  const svg = doc.documentElement;
+  svg.removeAttribute("background");
+  svg.style.background = "transparent";
+  svg.setAttribute("color", "#d8dee9");
+
+  for (const element of Array.from(svg.querySelectorAll("rect"))) {
+    if (isWhitePaint(svgPaint(element, "fill")) && isFullCanvasRect(element)) {
+      element.setAttribute("fill", "none");
+      element.style.fill = "none";
+    }
+  }
+
+  for (const element of Array.from(svg.querySelectorAll("text, tspan"))) {
+    const fill = svgPaint(element, "fill");
+    if (!fill || isDarkPaint(fill) || isWhitePaint(fill)) {
+      element.setAttribute("fill", "#d8dee9");
+      element.style.fill = "#d8dee9";
+    }
+
+    if (isDarkPaint(svgPaint(element, "stroke"))) {
+      element.setAttribute("stroke", "#111214");
+      element.style.stroke = "#111214";
+    }
+  }
+
+  const serialized = new XMLSerializer().serializeToString(svg);
+  return URL.createObjectURL(new Blob([serialized], { type: "image/svg+xml" }));
+}
+
+function clearResourcePreviewUrl(resource) {
+  if (!resource?.previewObjectUrl) {
+    return;
+  }
+
+  URL.revokeObjectURL(resource.previewObjectUrl);
+  resource.previewObjectUrl = "";
+}
+
+function isFullCanvasRect(element) {
+  const x = normalizeSvgLength(element.getAttribute("x"), "0");
+  const y = normalizeSvgLength(element.getAttribute("y"), "0");
+  const width = normalizeSvgLength(element.getAttribute("width"), "");
+  const height = normalizeSvgLength(element.getAttribute("height"), "");
+  const svg = element.ownerSVGElement;
+  const canvasWidth = normalizeSvgLength(svg?.getAttribute("width"), "");
+  const canvasHeight = normalizeSvgLength(svg?.getAttribute("height"), "");
+  const viewBox = String(svg?.getAttribute("viewBox") || "").trim().split(/\s+/);
+  const viewBoxWidth = normalizeSvgLength(viewBox[2], "");
+  const viewBoxHeight = normalizeSvgLength(viewBox[3], "");
+
+  return x === "0"
+    && y === "0"
+    && (width === "100%" || width === "100" || width === canvasWidth || width === viewBoxWidth)
+    && (height === "100%" || height === "100" || height === canvasHeight || height === viewBoxHeight);
+}
+
+function normalizeSvgLength(value, fallback) {
+  return String(value ?? fallback).trim().toLowerCase();
+}
+
+function isWhitePaint(value) {
+  const paint = normalizeSvgPaint(value);
+  return paint === "white" || paint === "#fff" || paint === "#ffffff" || paint === "rgb(255,255,255)";
+}
+
+function isDarkPaint(value) {
+  const paint = normalizeSvgPaint(value);
+  return paint === "black" || paint === "#000" || paint === "#000000" || paint === "rgb(0,0,0)";
+}
+
+function normalizeSvgPaint(value) {
+  return String(value || "").trim().toLowerCase().replace(/\s+/g, "");
+}
+
+function svgPaint(element, property) {
+  return element.getAttribute(property) || element.style?.[property] || "";
 }
 
 async function ensureMonaco() {

@@ -126,6 +126,7 @@
   place-items: center;
   padding: 18px;
   overflow: auto;
+  background: transparent;
 }
 
 .thread-resource-preview-image {
@@ -134,7 +135,11 @@
   max-height: 100%;
   border-radius: 14px;
   border: 1px solid #2d3035;
-  background: #111214;
+  background: transparent;
+}
+
+.thread-resource-svg-loading {
+  color: var(--muted);
 }
 
 .thread-resource-editor {
@@ -254,4 +259,3 @@
   display: grid;
   gap: 10px;
 }
-

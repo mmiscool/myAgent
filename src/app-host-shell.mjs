@@ -833,13 +833,6 @@ export function createAppHostShell({
       return;
     }
 
-    if (pane === "chat" && data.type === "thread-action") {
-      void performThreadAction(cleanString(data.payload?.action), { name: data.payload?.name }).catch((error) => {
-        alert(error.message);
-      });
-      return;
-    }
-
     if (pane === "resource" && data.type === "close-resource") {
       closeResourceTab(cleanString(data.payload?.resourceId) || cleanString(tab?.resourceId));
     }

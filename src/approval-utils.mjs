@@ -17,7 +17,7 @@ export function composerApprovalPolicyOverride(projectApprovalPolicy, autoApprov
 }
 
 export function isAutoApprovableRequest(request) {
-  return AUTO_APPROVABLE_REQUEST_METHODS.has(request?.method);
+  return AUTO_APPROVABLE_REQUEST_METHODS.has(request?.method) || isMcpApprovalElicitation(request);
 }
 
 export function normalizeCommandApprovalDecisions(availableDecisions) {
@@ -75,7 +75,20 @@ export function buildAutoApprovalResult(request) {
     };
   }
 
+  if (isMcpApprovalElicitation(request)) {
+    return {
+      action: "accept",
+      content: {},
+    };
+  }
+
   return null;
+}
+
+function isMcpApprovalElicitation(request) {
+  return request?.method === "mcpServer/elicitation/request"
+    && typeof request?.params?._meta?.codex_approval_kind === "string"
+    && request.params._meta.codex_approval_kind.trim().length > 0;
 }
 
 function autoApprovalDecisionPriority(decision) {

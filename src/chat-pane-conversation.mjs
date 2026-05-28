@@ -21,13 +21,34 @@ export function createChatPaneConversation({
   renderPendingServerRequest,
   renderToolCallBody,
 }) {
+  function pendingServerRequestId(value) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return String(value);
+    }
+
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+
+    return "";
+  }
+
+  function manuallyExpandedConversationItemIds() {
+    if (!(state.manuallyExpandedConversationItemIds instanceof Set)) {
+      state.manuallyExpandedConversationItemIds = new Set();
+    }
+
+    return state.manuallyExpandedConversationItemIds;
+  }
+
   function upsertPendingServerRequest(request) {
-    if (!request?.id || request?.params?.threadId !== state.threadId) {
+    const requestId = pendingServerRequestId(request?.id);
+
+    if (!requestId || request?.params?.threadId !== state.threadId) {
       return;
     }
 
-    const requestId = String(request.id);
-    const existingIndex = state.pendingRequests.findIndex((entry) => String(entry?.id) === requestId);
+    const existingIndex = state.pendingRequests.findIndex((entry) => pendingServerRequestId(entry?.id) === requestId);
 
     if (existingIndex === -1) {
       state.pendingRequests = state.pendingRequests.concat(request);
@@ -38,16 +59,16 @@ export function createChatPaneConversation({
   }
 
   function removePendingServerRequest(requestId) {
-    const normalizedId = String(requestId || "");
+    const normalizedId = pendingServerRequestId(requestId);
     if (!normalizedId) {
       return;
     }
 
-    state.pendingRequests = state.pendingRequests.filter((entry) => String(entry?.id) !== normalizedId);
+    state.pendingRequests = state.pendingRequests.filter((entry) => pendingServerRequestId(entry?.id) !== normalizedId);
   }
 
   async function respondToPendingServerRequest(request, result) {
-    const requestId = String(request?.id || "");
+    const requestId = pendingServerRequestId(request?.id);
 
     if (!requestId) {
       return;
@@ -68,7 +89,7 @@ export function createChatPaneConversation({
     }
 
     const tasks = requests.map(async (request) => {
-      const requestId = String(request?.id || "");
+      const requestId = pendingServerRequestId(request?.id);
       const result = buildAutoApprovalResult(request);
 
       if (!requestId || !result || state.autoApprovalInFlight.has(requestId)) {
@@ -160,7 +181,7 @@ export function createChatPaneConversation({
       return false;
     }
 
-    return itemId === latestCollapsibleItemId;
+    return itemId === latestCollapsibleItemId || manuallyExpandedConversationItemIds().has(itemId);
   }
 
   function findConversationItemElement(itemId) {
@@ -177,9 +198,16 @@ export function createChatPaneConversation({
 
   function collapseConversationItemsExcept(itemId) {
     const detailsList = elements.conversation.querySelectorAll(".collapsed-item details[data-item-id]");
+    const manuallyExpandedItemIds = manuallyExpandedConversationItemIds();
 
     detailsList.forEach((details) => {
-      details.open = details.dataset.itemId === itemId;
+      const detailsItemId = String(details.dataset.itemId || "");
+      const isManuallyExpanded = manuallyExpandedItemIds.has(detailsItemId);
+      const shouldOpen = detailsItemId === itemId || isManuallyExpanded;
+      if (shouldOpen && !details.open && !isManuallyExpanded) {
+        details.dataset.autoExpanded = "true";
+      }
+      details.open = shouldOpen;
       if (details.open) {
         hydrateConversationDetails(details);
       }
@@ -612,11 +640,26 @@ export function createChatPaneConversation({
   function handleConversationDetailsToggle(event) {
     const details = event.target;
 
-    if (!(details instanceof HTMLDetailsElement) || !details.open) {
+    if (!(details instanceof HTMLDetailsElement)) {
       return;
     }
 
-    hydrateConversationDetails(details);
+    const itemId = String(details.dataset.itemId || "").trim();
+    const manuallyExpandedItemIds = manuallyExpandedConversationItemIds();
+    const autoExpanded = details.dataset.autoExpanded === "true";
+    delete details.dataset.autoExpanded;
+
+    if (details.open) {
+      if (itemId && !autoExpanded) {
+        manuallyExpandedItemIds.add(itemId);
+      }
+      hydrateConversationDetails(details);
+      return;
+    }
+
+    if (itemId) {
+      manuallyExpandedItemIds.delete(itemId);
+    }
   }
 
   function renderItem(item, latestCollapsibleItemId = "") {
