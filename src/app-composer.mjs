@@ -33,7 +33,9 @@ export function createAppComposer({
     localStorage.setItem("composerEffort", state.composerEffort || "");
     localStorage.setItem("composerServiceTier", state.composerServiceTier || "");
     localStorage.setItem("composerMode", state.composerMode || "default");
+    localStorage.setItem("composerUseMonaco", String(state.composerUseMonaco !== false));
     localStorage.setItem("composerApproveAllDangerous", String(state.composerApproveAllDangerous));
+    localStorage.setItem("composerRalphLoop", String(state.composerRalphLoop));
     localStorage.setItem("composerRalphLoopLimit", String(state.composerRalphLoopLimit));
   }
 
@@ -87,8 +89,7 @@ export function createAppComposer({
     if (!["default", "plan"].includes(state.composerMode)) {
       state.composerMode = "default";
     }
-
-    persistComposerSettings();
+    state.composerUseMonaco = state.composerUseMonaco !== false;
   }
 
   function formatEffortLabel(effort) {
@@ -213,6 +214,7 @@ export function createAppComposer({
       effortMenuHtml,
       mode: state.composerMode === "plan" ? "plan" : "default",
       modeLabel: state.composerMode === "plan" ? "Plan" : "Chat",
+      useMonaco: state.composerUseMonaco !== false,
       approveAllDangerous: state.composerApproveAllDangerous,
       ralphLoop: state.composerRalphLoop,
       ralphLoopLimit: state.composerRalphLoopLimit,
@@ -246,6 +248,9 @@ export function createAppComposer({
     elements.composerModeButton.textContent = composerView.modeLabel;
     elements.composerModeButton.classList.toggle("plan", composerView.mode === "plan");
     elements.composerModeButton.setAttribute("aria-pressed", composerView.mode === "plan" ? "true" : "false");
+    if (elements.composerUseMonacoToggle) {
+      elements.composerUseMonacoToggle.checked = composerView.useMonaco;
+    }
     elements.approveAllDangerousToggle.checked = composerView.approveAllDangerous;
     elements.ralphLoopToggle.checked = composerView.ralphLoop;
     elements.ralphLoopLimitInput.value = String(composerView.ralphLoopLimit);
@@ -389,6 +394,7 @@ export function createAppComposer({
     if (disableLoop) {
       state.composerRalphLoop = false;
       elements.ralphLoopToggle.checked = false;
+      persistComposerSettings();
     }
 
     if (disableLoop || cancelAutoCompact) {

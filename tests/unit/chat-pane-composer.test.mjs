@@ -24,6 +24,7 @@ describe("chat pane composer host sync", () => {
         effortMenuHtml: "<button>High</button>",
         mode: "default",
         modeLabel: "Chat",
+        useMonaco: true,
         approveAllDangerous: false,
         ralphLoop: false,
         ralphLoopLimit: 3,
@@ -37,6 +38,39 @@ describe("chat pane composer host sync", () => {
     };
 
     expect(captureHostComposerRenderState(unrelatedThreadUpdate)).toEqual(captureHostComposerRenderState(composerState));
+  });
+
+  test("includes editor mode changes in the render state", () => {
+    const baseState = {
+      projectId: "project-1",
+      threadId: "thread-1",
+      autoscroll: true,
+      composer: {
+        draftText: "hello",
+        attachments: [],
+        sendInFlight: false,
+        modelLabel: "GPT",
+        effortLabel: "High",
+        hasModelOptions: true,
+        hasEffortOptions: true,
+        modelMenuHtml: "<button>GPT</button>",
+        effortMenuHtml: "<button>High</button>",
+        mode: "default",
+        modeLabel: "Chat",
+        useMonaco: true,
+        approveAllDangerous: false,
+        ralphLoop: false,
+        ralphLoopLimit: 3,
+      },
+    };
+
+    expect(captureHostComposerRenderState({
+      ...baseState,
+      composer: {
+        ...baseState.composer,
+        useMonaco: false,
+      },
+    })).not.toEqual(captureHostComposerRenderState(baseState));
   });
 
   test("preserves the locally focused draft over stale host state", () => {

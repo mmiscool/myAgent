@@ -28,17 +28,81 @@
         flex: 0 0 auto;
       }
 
+      .chat-pane-body {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+
       .conversation {
         flex: 1 1 auto;
         min-height: 0;
+        overflow: auto;
+      }
+
+      .conversation-scroll-shell {
+        flex: 1 1 auto;
+        min-height: 0;
+        position: relative;
+        display: flex;
+      }
+
+      .chat-composer-resize-handle {
+        flex: 0 0 12px;
+        position: relative;
+        cursor: row-resize;
+        user-select: none;
+        background:
+          linear-gradient(90deg, rgba(141, 143, 149, 0.16), rgba(74, 163, 255, 0.28), rgba(141, 143, 149, 0.16));
+      }
+
+      .chat-composer-resize-handle:hover,
+      .chat-composer-resize-handle:focus-visible,
+      .is-resizing-composer .chat-composer-resize-handle {
+        background:
+          linear-gradient(90deg, rgba(141, 143, 149, 0.28), rgba(74, 163, 255, 0.42), rgba(141, 143, 149, 0.28));
+      }
+
+      .chat-composer-resize-handle:focus-visible {
+        outline: none;
+      }
+
+      .chat-composer-resize-handle::before {
+        content: "";
+        position: absolute;
+        top: 50%;
+        left: 24px;
+        right: 24px;
+        height: 2px;
+        background: rgba(255, 255, 255, 0.28);
+        transform: translateY(-50%);
+        border-radius: 999px;
+        pointer-events: none;
+      }
+
+      .chat-composer {
+        flex: 0 0 auto;
+        min-height: 210px;
+        overflow: visible;
+        position: relative;
       }
     </style>
   </head>
   <body>
     <div class="pane-frame-shell">
       <div id="chatPaneHeader" class="pane-chat-header"></div>
-      <div id="conversation" class="conversation"></div>
-      <div id="chatPaneComposer"></div>
+      <div id="chatPaneBody" class="chat-pane-body">
+        <div class="conversation-scroll-shell">
+          <div id="conversation" class="conversation"></div>
+          <button id="scrollToBottomButton" class="scroll-to-bottom-button hidden" type="button" aria-label="Scroll to bottom" title="Scroll to bottom">
+            <span aria-hidden="true">↓</span>
+          </button>
+        </div>
+        <div id="chatPaneComposerResizeHandle" class="chat-composer-resize-handle" role="separator" aria-orientation="horizontal" aria-label="Resize input area" tabindex="0"></div>
+        <div id="chatPaneComposer" class="chat-composer"></div>
+      </div>
     </div>
     <script type="module" src="/src/chat-pane.js"></script>
   </body>

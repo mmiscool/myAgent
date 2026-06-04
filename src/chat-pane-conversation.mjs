@@ -21,6 +21,46 @@ export function createChatPaneConversation({
   renderPendingServerRequest,
   renderToolCallBody,
 }) {
+  const BOTTOM_SCROLL_TOLERANCE_PX = 8;
+
+  function isConversationAtBottom() {
+    const conversation = elements.conversation;
+    if (!conversation) {
+      return true;
+    }
+
+    const distanceFromBottom = conversation.scrollHeight - conversation.clientHeight - conversation.scrollTop;
+    return distanceFromBottom <= BOTTOM_SCROLL_TOLERANCE_PX;
+  }
+
+  function updateScrollToBottomButton() {
+    const button = elements.scrollToBottomButton;
+    if (!button) {
+      return;
+    }
+
+    button.classList.toggle("hidden", state.stickyScrollAtBottom !== false);
+  }
+
+  function updateStickyScrollState() {
+    state.stickyScrollAtBottom = isConversationAtBottom();
+    updateScrollToBottomButton();
+  }
+
+  function handleConversationScroll() {
+    updateStickyScrollState();
+  }
+
+  function captureStickyScrollStateBeforeRender() {
+    if (state.stickyScrollAtBottom === false) {
+      return false;
+    }
+
+    state.stickyScrollAtBottom = isConversationAtBottom();
+    updateScrollToBottomButton();
+    return state.stickyScrollAtBottom !== false;
+  }
+
   function pendingServerRequestId(value) {
     if (typeof value === "number" && Number.isFinite(value)) {
       return String(value);
@@ -773,6 +813,7 @@ export function createChatPaneConversation({
   }
 
   function renderConversation() {
+    const shouldStickToBottom = captureStickyScrollStateBeforeRender();
     const thread = state.thread;
     const pendingNewThread = state.pendingNewThread;
     const pendingRalphLoopReplay = state.pendingRalphLoopReplay && state.pendingRalphLoopReplay.threadId === state.threadId
@@ -802,7 +843,7 @@ export function createChatPaneConversation({
             ${imageCount > 0 ? `<div class="bubble user"><div class="message-body"><p>${escapeHtml(imageCount === 1 ? "1 image attached" : `${imageCount} images attached`)}</p></div></div>` : ""}
           </section>
         `;
-        scrollConversationToBottom();
+        scrollConversationToBottom({ force: shouldStickToBottom });
         return;
       }
 
@@ -819,7 +860,7 @@ export function createChatPaneConversation({
           </section>
         `
         : `<div class="empty loading">Loading conversation...</div>`;
-      scrollConversationToBottom();
+      scrollConversationToBottom({ force: shouldStickToBottom });
       return;
     }
 
@@ -828,7 +869,7 @@ export function createChatPaneConversation({
 
     if (!thread?.turns?.length && pendingRequests.length === 0) {
       elements.conversation.innerHTML = `<div class="empty">No turns yet.</div>`;
-      scrollConversationToBottom();
+      scrollConversationToBottom({ force: shouldStickToBottom });
       return;
     }
 
@@ -871,16 +912,19 @@ export function createChatPaneConversation({
       `;
     }).join("")}${pendingRequests.map(renderPendingServerRequest).join("")}`;
 
-    scrollConversationToBottom();
+    scrollConversationToBottom({ force: shouldStickToBottom });
   }
 
-  function scrollConversationToBottom() {
-    if (!state.autoscroll) {
+  function scrollConversationToBottom({ force = true } = {}) {
+    if (!force && state.stickyScrollAtBottom === false) {
       return;
     }
 
+    state.stickyScrollAtBottom = true;
     requestAnimationFrame(() => {
       elements.conversation.scrollTop = elements.conversation.scrollHeight;
+      state.stickyScrollAtBottom = true;
+      updateScrollToBottomButton();
     });
   }
 
@@ -1025,11 +1069,13 @@ export function createChatPaneConversation({
   return {
     applyStreamingNotification,
     handleConversationDetailsToggle,
+    handleConversationScroll,
     latestAgentMessageText,
     maybeAutoApprovePendingRequests,
     removePendingServerRequest,
     renderConversation,
     respondToPendingServerRequest,
+    scrollConversationToBottom,
     upsertPendingServerRequest,
   };
 }

@@ -1,4 +1,4 @@
-export {
+import {
   cleanString,
   escapeHtml,
   oneLine,
@@ -6,6 +6,15 @@ export {
   formatStatus,
   isLiveStatus,
 } from "./ui-formatters.mjs";
+
+export {
+  cleanString,
+  escapeHtml,
+  oneLine,
+  relativeTime,
+  formatStatus,
+  isLiveStatus,
+};
 
 export async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -30,6 +39,33 @@ export function websocketUrl(pathname) {
   const url = new URL(pathname, window.location.href);
   url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
+}
+
+export function buildChatPanePath({ projectId = "", threadId = "", tabId = "" } = {}, baseUrl = "http://localhost") {
+  const url = new URL("/panes/chat.html", baseUrl);
+  const normalizedProjectId = cleanString(projectId);
+  const normalizedThreadId = cleanString(threadId);
+  const normalizedTabId = cleanString(tabId);
+
+  if (normalizedProjectId) {
+    url.searchParams.set("projectId", normalizedProjectId);
+  }
+  if (normalizedThreadId) {
+    url.searchParams.set("threadId", normalizedThreadId);
+  }
+  if (normalizedTabId) {
+    url.searchParams.set("tabId", normalizedTabId);
+  }
+
+  return `${url.pathname}${url.search}`;
+}
+
+export function openChatPaneWindow(params = {}) {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  return Boolean(window.open(buildChatPanePath(params, window.location.origin), "_blank", "noopener,noreferrer"));
 }
 
 export function createPaneBridge(pane, handlers = {}) {

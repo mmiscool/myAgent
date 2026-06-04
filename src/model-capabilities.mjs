@@ -149,6 +149,18 @@ export function resolveComposerSelection({
   requestedServiceTier,
   capabilities,
 }) {
+  const modelList = Array.isArray(models) ? models : [];
+  if (modelList.length === 0) {
+    return {
+      model: null,
+      modelId: cleanString(requestedModelId),
+      effort: cleanString(requestedEffort),
+      serviceTier: cleanString(requestedServiceTier),
+      supportedEfforts: [],
+      supportedServiceTiers: [],
+    };
+  }
+
   const model = resolveComposerModel(models, requestedModelId, fallbackModelId);
   const supportedEfforts = supportedReasoningEffortValuesForModel(model);
   const defaultEffort = defaultReasoningEffortForModel(model);

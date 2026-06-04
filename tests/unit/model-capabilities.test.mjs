@@ -68,6 +68,24 @@ describe("model capabilities", () => {
     });
   });
 
+  test("preserves stored composer selection before the model catalog loads", () => {
+    expect(resolveComposerSelection({
+      models: [],
+      requestedModelId: "gpt-5.3-codex",
+      fallbackModelId: "gpt-5.4",
+      requestedEffort: "medium",
+      requestedServiceTier: "priority",
+      capabilities: { serviceTiers: [], defaultServiceTier: "" },
+    })).toMatchObject({
+      model: null,
+      modelId: "gpt-5.3-codex",
+      effort: "medium",
+      serviceTier: "priority",
+      supportedEfforts: [],
+      supportedServiceTiers: [],
+    });
+  });
+
   test("formats service tier labels for display", () => {
     expect(formatServiceTierLabel("fast")).toBe("Fast");
     expect(formatServiceTierLabel("priority_queue")).toBe("Priority Queue");

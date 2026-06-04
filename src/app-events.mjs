@@ -1,4 +1,5 @@
 import { createAttachmentId, guessImageExtension, readFileAsDataUrl } from "./attachment-utils.mjs";
+import { openChatPaneWindow } from "./pane-bridge.mjs";
 
 export function createAppEvents({
   state,
@@ -45,9 +46,14 @@ export function createAppEvents({
         alert(error.message);
       }
     });
-    elements.autoscrollToggle.addEventListener("change", (event) => {
+    elements.autoscrollToggle?.addEventListener("change", (event) => {
       state.autoscroll = event.target.checked;
       actions.persistSelection?.();
+      actions.syncAllPaneFrames?.();
+    });
+    elements.composerUseMonacoToggle?.addEventListener("change", (event) => {
+      state.composerUseMonaco = event.target.checked;
+      actions.persistComposerSettings?.();
       actions.syncAllPaneFrames?.();
     });
     elements.approveAllDangerousToggle.addEventListener("change", (event) => {
@@ -60,6 +66,8 @@ export function createAppEvents({
     });
     elements.ralphLoopToggle.addEventListener("change", (event) => {
       state.composerRalphLoop = event.target.checked;
+      actions.persistComposerSettings?.();
+      actions.syncAllPaneFrames?.();
       if (!state.composerRalphLoop) {
         actions.cancelPendingRalphLoop?.({ cancelAutoCompact: true });
       } else if (state.selectedThreadId && actions.currentRalphLoopInput?.(state.selectedThreadId)) {
@@ -457,6 +465,7 @@ export function createAppEvents({
         state.composerModel = button.dataset.value || "";
         state.composerMenuOpen = "";
         actions.normalizeComposerSettings?.();
+        actions.persistComposerSettings?.();
         actions.renderComposerControls?.();
         return;
       }
@@ -465,6 +474,7 @@ export function createAppEvents({
         state.composerEffort = button.dataset.value || "";
         state.composerMenuOpen = "";
         actions.normalizeComposerSettings?.();
+        actions.persistComposerSettings?.();
         actions.renderComposerControls?.();
         return;
       }
@@ -473,6 +483,7 @@ export function createAppEvents({
         state.composerServiceTier = button.dataset.value || "";
         state.composerMenuOpen = "";
         actions.normalizeComposerSettings?.();
+        actions.persistComposerSettings?.();
         actions.renderComposerControls?.();
         return;
       }
@@ -670,6 +681,16 @@ export function createAppEvents({
       if (action === "rename-thread") {
         const name = window.prompt("Thread name", state.selectedThread?.name || "");
         await actions.performThreadAction?.(action, { name });
+        return;
+      }
+
+      if (action === "open-conversation-window") {
+        openChatPaneWindow({
+          projectId: state.selectedProjectId,
+          threadId: state.selectedThreadId,
+        });
+        state.threadActionMenuOpen = false;
+        actions.renderThreadHeader?.();
         return;
       }
 

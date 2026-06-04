@@ -112,6 +112,7 @@ export function renderThreadActionMenu(state) {
       <div class="thread-menu-popover ${state.threadActionMenuOpen ? "" : "hidden"}" role="menu" aria-label="Thread actions">
         ${menuItem("new-thread", "New Thread", "+")}
         ${menuItem("refresh-threads", "Refresh", "↻")}
+        ${menuItem("open-conversation-window", "Open Conversation in New Window", "↗")}
         ${menuItem("rename-thread", "Rename", "✎")}
         ${menuItem("fork-thread", "Fork", "⑂")}
         ${menuItem("compact-thread", "Compact", "⇲")}

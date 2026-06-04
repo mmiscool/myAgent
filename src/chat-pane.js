@@ -1,3 +1,4 @@
+import "monaco-editor/min/vs/editor/editor.main.css";
 import "./styles.css";
 import { marked } from "marked";
 import { buildAutoApprovalResult, normalizeCommandApprovalDecisions } from "./approval-utils.mjs";
@@ -17,6 +18,7 @@ import { createChatPaneConversation } from "./chat-pane-conversation.mjs";
 import { createConversationUi } from "./conversation-ui.mjs";
 import {
   api,
+  openChatPaneWindow,
   cleanString,
   createPaneBridge,
   escapeHtml,
@@ -42,6 +44,19 @@ marked.setOptions({
 
 const markdownHtmlCache = new Map();
 const MAX_MARKDOWN_CACHE_ENTRIES = 200;
+const CHAT_COMPOSER_HANDLE_HEIGHT = 12;
+const MIN_CHAT_COMPOSER_HEIGHT = 210;
+const MIN_CHAT_CONVERSATION_HEIGHT = 120;
+const DEFAULT_CHAT_COMPOSER_HEIGHT = 270;
+
+function normalizeComposerHeight(rawHeight) {
+  const height = Number(rawHeight);
+  if (!Number.isFinite(height) || height <= 0) {
+    return DEFAULT_CHAT_COMPOSER_HEIGHT;
+  }
+
+  return Math.round(height);
+}
 
 const conversationUi = createConversationUi({
   normalizeCommandApprovalDecisions,
@@ -63,11 +78,12 @@ const state = {
   thread: null,
   archived: false,
   pendingRequests: [],
-  autoscroll: localStorage.getItem("autoscroll") !== "false",
+  stickyScrollAtBottom: true,
   approveAllDangerous: localStorage.getItem("composerApproveAllDangerous") === "true",
   autoApprovalInFlight: new Set(),
   pendingRalphLoopReplay: null,
   pendingNewThread: null,
+  composerHeight: normalizeComposerHeight(localStorage.getItem("chatComposerHeight")),
   composerModel: localStorage.getItem("composerModel") || "",
   composerEffort: localStorage.getItem("composerEffort") || "",
   composerServiceTier: localStorage.getItem("composerServiceTier") || "",
@@ -83,8 +99,9 @@ const state = {
     effortMenuHtml: "",
     mode: localStorage.getItem("composerMode") === "plan" ? "plan" : "default",
     modeLabel: localStorage.getItem("composerMode") === "plan" ? "Plan" : "Chat",
+    useMonaco: localStorage.getItem("composerUseMonaco") !== "false",
     approveAllDangerous: localStorage.getItem("composerApproveAllDangerous") === "true",
-    ralphLoop: false,
+    ralphLoop: localStorage.getItem("composerRalphLoop") === "true",
     ralphLoopLimit: normalizeRalphLoopLimit(localStorage.getItem("composerRalphLoopLimit")),
   },
   ui: {
@@ -100,7 +117,10 @@ const state = {
 const elements = {
   chatPaneHeader: document.getElementById("chatPaneHeader"),
   conversation: document.getElementById("conversation"),
+  scrollToBottomButton: document.getElementById("scrollToBottomButton"),
+  chatPaneBody: document.getElementById("chatPaneBody"),
   chatPaneComposer: document.getElementById("chatPaneComposer"),
+  chatPaneComposerResizeHandle: document.getElementById("chatPaneComposerResizeHandle"),
 };
 
 const standaloneMode = window.parent === window;
@@ -117,6 +137,8 @@ const bridge = createPaneBridge("chat", {
 
 const {
   focusComposerInput,
+  getActiveComposerDraftText,
+  isComposerInputEventTarget,
   loadStandaloneComposerState,
   readFileAsDataUrl,
   renderComposer,
@@ -140,11 +162,13 @@ const {
 const {
   applyStreamingNotification,
   handleConversationDetailsToggle,
+  handleConversationScroll,
   latestAgentMessageText,
   maybeAutoApprovePendingRequests,
   removePendingServerRequest,
   renderConversation,
   respondToPendingServerRequest,
+  scrollConversationToBottom,
   upsertPendingServerRequest,
 } = createChatPaneConversation({
   state,
@@ -170,7 +194,125 @@ const {
   renderToolCallBody,
 });
 
+let composerResizeState = null;
+
+function clampComposerHeight(nextHeight) {
+  const baseHeight = normalizeComposerHeight(nextHeight);
+  if (!elements.chatPaneBody || !(elements.chatPaneBody instanceof HTMLElement)) {
+    return baseHeight;
+  }
+
+  const containerHeight = elements.chatPaneBody.clientHeight;
+  if (containerHeight <= 0) {
+    return baseHeight;
+  }
+
+  const availableHeight = Math.max(
+    0,
+    containerHeight - CHAT_COMPOSER_HANDLE_HEIGHT - MIN_CHAT_CONVERSATION_HEIGHT,
+  );
+  if (availableHeight <= 0) {
+    return Math.max(1, Math.min(baseHeight, containerHeight));
+  }
+
+  return Math.min(
+    Math.max(baseHeight, MIN_CHAT_COMPOSER_HEIGHT),
+    availableHeight,
+  );
+}
+
+function applyComposerHeightLayout(persist = false) {
+  state.composerHeight = clampComposerHeight(state.composerHeight);
+  if (elements.chatPaneComposer instanceof HTMLElement) {
+    elements.chatPaneComposer.style.height = `${state.composerHeight}px`;
+  }
+
+  if (persist) {
+    localStorage.setItem("chatComposerHeight", String(state.composerHeight));
+  }
+}
+
+function handleComposerResizePointerMove(event) {
+  if (!composerResizeState || event.pointerId !== composerResizeState.pointerId) {
+    return;
+  }
+
+  const delta = event.clientY - composerResizeState.startY;
+  state.composerHeight = clampComposerHeight(composerResizeState.startHeight + (delta * -1));
+  applyComposerHeightLayout(false);
+}
+
+function stopComposerResize(event) {
+  if (!composerResizeState || (event && event.pointerId !== composerResizeState.pointerId)) {
+    return;
+  }
+
+  elements.chatPaneComposerResizeHandle?.releasePointerCapture?.(composerResizeState.pointerId);
+  document.body.classList.remove("is-resizing-composer");
+  applyComposerHeightLayout(true);
+  composerResizeState = null;
+}
+
+function handleComposerResizeKeydown(event) {
+  const handle = elements.chatPaneComposerResizeHandle;
+  if (!handle || event.target !== handle) {
+    return;
+  }
+
+  const step = event.shiftKey ? 40 : 16;
+  let nextHeight = state.composerHeight;
+
+  if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
+    nextHeight -= step;
+  } else if (event.key === "ArrowDown" || event.key === "ArrowRight") {
+    nextHeight += step;
+  } else if (event.key === "Home") {
+    nextHeight = MIN_CHAT_COMPOSER_HEIGHT;
+  } else if (event.key === "End") {
+    const containerHeight = elements.chatPaneBody?.clientHeight || window.innerHeight;
+    nextHeight = containerHeight - CHAT_COMPOSER_HANDLE_HEIGHT - MIN_CHAT_CONVERSATION_HEIGHT;
+  } else if (event.key === "Enter" || event.key === " ") {
+    return;
+  } else {
+    return;
+  }
+
+  event.preventDefault();
+  state.composerHeight = nextHeight;
+  applyComposerHeightLayout(true);
+}
+
+function startComposerResize(event) {
+  if (!(elements.chatPaneComposerResizeHandle instanceof HTMLElement) || !(elements.chatPaneComposer instanceof HTMLElement)) {
+    return;
+  }
+
+  if (event.pointerType === "mouse" && event.button !== 0) {
+    return;
+  }
+
+  event.preventDefault();
+  composerResizeState = {
+    pointerId: event.pointerId,
+    startY: event.clientY,
+    startHeight: elements.chatPaneComposer.clientHeight || state.composerHeight,
+  };
+  elements.chatPaneComposerResizeHandle.setPointerCapture?.(event.pointerId);
+  document.body.classList.add("is-resizing-composer");
+}
+
 elements.conversation.addEventListener("toggle", handleConversationDetailsToggle, true);
+elements.conversation.addEventListener("scroll", handleConversationScroll, { passive: true });
+elements.scrollToBottomButton?.addEventListener("click", scrollConversationToBottom);
+if (elements.chatPaneComposerResizeHandle instanceof HTMLElement) {
+  elements.chatPaneComposerResizeHandle.addEventListener("pointerdown", startComposerResize);
+  elements.chatPaneComposerResizeHandle.addEventListener("keydown", handleComposerResizeKeydown);
+  elements.chatPaneComposerResizeHandle.tabIndex = 0;
+}
+
+window.addEventListener("pointermove", handleComposerResizePointerMove);
+window.addEventListener("pointerup", stopComposerResize);
+window.addEventListener("pointercancel", stopComposerResize);
 
 document.addEventListener("click", async (event) => {
   if (state.ui.composerSettingsOpen && !event.target.closest(".composer-settings")) {
@@ -253,12 +395,6 @@ document.addEventListener("click", async (event) => {
       return;
     }
 
-    if (action === "toggle-autoscroll") {
-      updateComposerSetting("autoscroll", !state.autoscroll);
-      renderComposer();
-      return;
-    }
-
     if (action === "toggle-approve-all-dangerous") {
       updateComposerSetting("approveAllDangerous", !state.composer.approveAllDangerous);
       renderComposer();
@@ -291,6 +427,16 @@ document.addEventListener("click", async (event) => {
       if (name) {
         await performThreadAction(action, { name });
       }
+      state.ui.threadActionMenuOpen = false;
+      renderChatHeader();
+      return;
+    }
+
+    if (action === "open-conversation-window") {
+      openChatPaneWindow({
+        projectId: state.projectId,
+        threadId: state.threadId,
+      });
       state.ui.threadActionMenuOpen = false;
       renderChatHeader();
       return;
@@ -384,6 +530,12 @@ document.addEventListener("change", (event) => {
     return;
   }
 
+  if (target instanceof HTMLInputElement && target.id === "chatComposerUseMonacoToggle") {
+    updateComposerSetting("useMonaco", target.checked);
+    renderComposer();
+    return;
+  }
+
   if (!(target instanceof HTMLSelectElement) || target.dataset.hasOther !== "true") {
     return;
   }
@@ -407,8 +559,7 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("paste", async (event) => {
-  const target = event.target;
-  if (!(target instanceof HTMLTextAreaElement) || target.id !== "chatPromptInput") {
+  if (!isComposerInputEventTarget(event.target)) {
     return;
   }
 
@@ -437,7 +588,7 @@ document.addEventListener("paste", async (event) => {
   state.composer.attachments = nextAttachments;
   bridge.send("composer-attachments", { attachments: nextAttachments });
   renderComposer();
-});
+}, { capture: true });
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && state.ui.composerMenuOpen) {
@@ -460,9 +611,14 @@ document.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("beforeunload", disconnectConversationSocket);
+window.addEventListener("resize", () => {
+  applyComposerHeightLayout();
+});
+applyComposerHeightLayout(false);
 
 if (standaloneMode) {
   queueMicrotask(() => {
+    applyComposerHeightLayout(true);
     void bootstrapStandalone().catch(console.error);
   });
 }
@@ -491,13 +647,7 @@ async function bootstrapStandalone() {
 }
 
 function activeComposerDraftText() {
-  const input = document.getElementById("chatPromptInput");
-
-  if (!(input instanceof HTMLTextAreaElement) || document.activeElement !== input) {
-    return undefined;
-  }
-
-  return input.value || "";
+  return getActiveComposerDraftText();
 }
 
 function composerRenderSignature() {
@@ -505,6 +655,7 @@ function composerRenderSignature() {
 }
 
 async function applyHostState(payload = {}) {
+  applyComposerHeightLayout();
   const nextThreadId = cleanString(payload.threadId);
   const previousThreadId = state.threadId;
   const previousComposerSignature = composerRenderSignature();
@@ -513,7 +664,6 @@ async function applyHostState(payload = {}) {
   state.active = payload.active === true;
   state.projectId = cleanString(payload.projectId);
   state.projectName = cleanString(payload.projectName);
-  state.autoscroll = payload.autoscroll !== false;
   state.approveAllDangerous = payload.approveAllDangerous === true;
   state.archived = payload.archived === true;
   state.pendingRalphLoopReplay = payload.pendingRalphLoopReplay || null;
@@ -804,6 +954,7 @@ function renderThreadActionMenu() {
         title="Thread actions"
       >☰</button>
       <div class="thread-menu-popover ${state.ui.threadActionMenuOpen ? "" : "hidden"}" role="menu" aria-label="Thread actions">
+        <button type="button" class="thread-menu-item" data-action="open-conversation-window">↗ Open Conversation in New Window</button>
         <button type="button" class="thread-menu-item" data-action="rename-thread">✎ Rename</button>
         <button type="button" class="thread-menu-item" data-action="fork-thread">⑂ Fork</button>
         <button type="button" class="thread-menu-item" data-action="compact-thread">⇲ Compact</button>

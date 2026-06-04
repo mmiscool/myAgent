@@ -90,8 +90,9 @@ const state = {
   composerServiceTier: localStorage.getItem("composerServiceTier") || "",
   composerCapabilities: { serviceTiers: [], defaultServiceTier: "" },
   composerMode: localStorage.getItem("composerMode") || "default",
+  composerUseMonaco: localStorage.getItem("composerUseMonaco") !== "false",
   composerApproveAllDangerous: localStorage.getItem("composerApproveAllDangerous") === "true",
-  composerRalphLoop: false,
+  composerRalphLoop: localStorage.getItem("composerRalphLoop") === "true",
   composerRalphLoopLimit: normalizeRalphLoopLimit(localStorage.getItem("composerRalphLoopLimit")),
   composerAttachments: [],
   pendingNewThread: null,
@@ -133,6 +134,7 @@ const elements = {
   composerEffortLabel: document.getElementById("composerEffortLabel"),
   composerEffortMenu: document.getElementById("composerEffortMenu"),
   composerModeButton: document.getElementById("composerModeButton"),
+  composerUseMonacoToggle: document.getElementById("composerUseMonacoToggle"),
   composerSettingsButton: document.getElementById("composerSettingsButton"),
   composerSettingsMenu: document.getElementById("composerSettingsMenu"),
   ralphLoopModal: document.getElementById("ralphLoopModal"),
@@ -471,7 +473,10 @@ async function boot() {
   initializeProjectTabs();
   syncSelectedProjectThreadTab();
   normalizeComposerSettings();
-  elements.autoscrollToggle.checked = state.autoscroll;
+  if (elements.autoscrollToggle) {
+    elements.autoscrollToggle.checked = state.autoscroll;
+  }
+  elements.composerUseMonacoToggle.checked = state.composerUseMonaco;
   elements.approveAllDangerousToggle.checked = state.composerApproveAllDangerous;
   elements.ralphLoopToggle.checked = state.composerRalphLoop;
   restoreComposerDraft();

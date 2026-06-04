@@ -4,6 +4,7 @@ import {
   renderThreadActionMenu,
   renderThreadTabs,
 } from "./app-host-shell-markup.mjs";
+import { buildChatPanePath } from "./pane-bridge.mjs";
 
 export function createAppHostShell({
   state,
@@ -78,17 +79,11 @@ export function createAppHostShell({
       return "/panes/resource.html";
     }
 
-    const url = new URL("/panes/chat.html", window.location.origin);
-    if (tab?.projectId) {
-      url.searchParams.set("projectId", cleanString(tab.projectId));
-    }
-    if (tab?.threadId) {
-      url.searchParams.set("threadId", cleanString(tab.threadId));
-    }
-    if (tab?.id) {
-      url.searchParams.set("tabId", cleanString(tab.id));
-    }
-    return `${url.pathname}${url.search}`;
+    return buildChatPanePath({
+      projectId: tab?.projectId,
+      threadId: tab?.threadId,
+      tabId: tab?.id,
+    }, window.location.origin);
   }
 
   function paneFrameTitle(tab) {
@@ -798,6 +793,7 @@ export function createAppHostShell({
         persistSelection();
       } else if (key === "ralphLoop") {
         state.composerRalphLoop = value === true;
+        actions.persistComposerSettings?.();
         if (!state.composerRalphLoop) {
           actions.cancelPendingRalphLoop?.({ cancelAutoCompact: true });
         } else if (state.selectedThreadId && actions.currentRalphLoopInput?.(state.selectedThreadId)) {
@@ -814,6 +810,8 @@ export function createAppHostShell({
         state.composerServiceTier = cleanString(value);
       } else if (key === "mode") {
         state.composerMode = value === "plan" ? "plan" : "default";
+      } else if (key === "useMonaco") {
+        state.composerUseMonaco = value !== false;
       }
 
       actions.normalizeComposerSettings?.();
