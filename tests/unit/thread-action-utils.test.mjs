@@ -33,13 +33,13 @@ describe("thread action utils", () => {
     const findProjectByCwd = vi.fn().mockResolvedValue({
       cwd: "/repo",
       approvalPolicy: "on-request",
-      sandboxMode: "workspace-write",
+      sandboxMode: "danger-full-access",
       defaultPersonality: "pragmatic",
     });
     const buildThreadConfig = vi.fn().mockReturnValue({
       cwd: "/repo",
       approvalPolicy: "on-request",
-      sandbox: "workspace-write",
+      sandbox: "danger-full-access",
       personality: "pragmatic",
     });
     const helpers = createThreadActionHelpers({
@@ -68,7 +68,7 @@ describe("thread action utils", () => {
       threadId: "thread-123",
       cwd: "/repo",
       approvalPolicy: "on-request",
-      sandbox: "workspace-write",
+      sandbox: "danger-full-access",
       personality: "pragmatic",
       persistExtendedHistory: true,
     });

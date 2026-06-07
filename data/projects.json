@@ -9,7 +9,7 @@
     "defaultSummary": "auto",
     "defaultPersonality": "pragmatic",
     "approvalPolicy": "on-request",
-    "sandboxMode": "workspace-write",
+    "sandboxMode": "danger-full-access",
     "networkAccess": true,
     "createdAt": 1779266881388,
     "updatedAt": 1779266881388
@@ -24,7 +24,7 @@
     "defaultSummary": "auto",
     "defaultPersonality": "pragmatic",
     "approvalPolicy": "on-request",
-    "sandboxMode": "workspace-write",
+    "sandboxMode": "danger-full-access",
     "networkAccess": true,
     "createdAt": 1779261233074,
     "updatedAt": 1779261233074
@@ -39,7 +39,7 @@
     "defaultSummary": "auto",
     "defaultPersonality": "pragmatic",
     "approvalPolicy": "on-request",
-    "sandboxMode": "workspace-write",
+    "sandboxMode": "danger-full-access",
     "networkAccess": true,
     "createdAt": 1779163903574,
     "updatedAt": 1779163903574
@@ -54,7 +54,7 @@
     "defaultSummary": "auto",
     "defaultPersonality": "pragmatic",
     "approvalPolicy": "on-request",
-    "sandboxMode": "workspace-write",
+    "sandboxMode": "danger-full-access",
     "networkAccess": true,
     "createdAt": 1778478847231,
     "updatedAt": 1778478847231
@@ -69,7 +69,7 @@
     "defaultSummary": "auto",
     "defaultPersonality": "pragmatic",
     "approvalPolicy": "on-request",
-    "sandboxMode": "workspace-write",
+    "sandboxMode": "danger-full-access",
     "networkAccess": true,
     "createdAt": 1778475479518,
     "updatedAt": 1778475479518
@@ -84,7 +84,7 @@
     "defaultSummary": "auto",
     "defaultPersonality": "pragmatic",
     "approvalPolicy": "on-request",
-    "sandboxMode": "workspace-write",
+    "sandboxMode": "danger-full-access",
     "networkAccess": true,
     "createdAt": 1777948853816,
     "updatedAt": 1777948853816
@@ -99,7 +99,7 @@
     "defaultSummary": "auto",
     "defaultPersonality": "pragmatic",
     "approvalPolicy": "on-request",
-    "sandboxMode": "workspace-write",
+    "sandboxMode": "danger-full-access",
     "networkAccess": true,
     "createdAt": 1777761609585,
     "updatedAt": 1777761609585
@@ -114,7 +114,7 @@
     "defaultSummary": "auto",
     "defaultPersonality": "pragmatic",
     "approvalPolicy": "on-request",
-    "sandboxMode": "workspace-write",
+    "sandboxMode": "danger-full-access",
     "networkAccess": true,
     "createdAt": 1777684566210,
     "updatedAt": 1777684566210
@@ -129,7 +129,7 @@
     "defaultSummary": "auto",
     "defaultPersonality": "pragmatic",
     "approvalPolicy": "on-request",
-    "sandboxMode": "workspace-write",
+    "sandboxMode": "danger-full-access",
     "networkAccess": true,
     "createdAt": 1776146048767,
     "updatedAt": 1776146048767
@@ -144,7 +144,7 @@
     "defaultSummary": "auto",
     "defaultPersonality": "pragmatic",
     "approvalPolicy": "on-request",
-    "sandboxMode": "workspace-write",
+    "sandboxMode": "danger-full-access",
     "networkAccess": true,
     "createdAt": 1775327770311,
     "updatedAt": 1775327770311
@@ -159,7 +159,7 @@
     "defaultSummary": "auto",
     "defaultPersonality": "pragmatic",
     "approvalPolicy": "on-request",
-    "sandboxMode": "workspace-write",
+    "sandboxMode": "danger-full-access",
     "networkAccess": true,
     "createdAt": 1775087143332,
     "updatedAt": 1775087143332
@@ -174,7 +174,7 @@
     "defaultSummary": "auto",
     "defaultPersonality": "pragmatic",
     "approvalPolicy": "on-request",
-    "sandboxMode": "workspace-write",
+    "sandboxMode": "danger-full-access",
     "networkAccess": true,
     "createdAt": 1774929088973,
     "updatedAt": 1774929088973

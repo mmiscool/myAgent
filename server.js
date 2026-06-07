@@ -496,7 +496,7 @@ function buildDefaultProject() {
     defaultSummary: "auto",
     defaultPersonality: "pragmatic",
     approvalPolicy: "on-request",
-    sandboxMode: "workspace-write",
+    sandboxMode: "danger-full-access",
     networkAccess: true,
     createdAt: now,
     updatedAt: now,
@@ -516,7 +516,7 @@ function normalizeStoredProject(project) {
     defaultSummary: pickEnum(project?.defaultSummary, ["auto", "concise", "detailed", "none"], fallback.defaultSummary),
     defaultPersonality: pickEnum(project?.defaultPersonality, ["none", "friendly", "pragmatic"], fallback.defaultPersonality),
     approvalPolicy: pickApprovalPolicy(project?.approvalPolicy, fallback.approvalPolicy),
-    sandboxMode: pickEnum(project?.sandboxMode, ["read-only", "workspace-write", "danger-full-access"], fallback.sandboxMode),
+    sandboxMode: pickEnum(project?.sandboxMode, ["read-only", "danger-full-access", "danger-full-access"], fallback.sandboxMode),
     networkAccess: typeof project?.networkAccess === "boolean" ? project.networkAccess : fallback.networkAccess,
     createdAt: Number.isFinite(project?.createdAt) ? Number(project.createdAt) : fallback.createdAt,
     updatedAt: Number.isFinite(project?.updatedAt) ? Number(project.updatedAt) : fallback.updatedAt,
@@ -664,7 +664,7 @@ function compactObject(input) {
 }
 
 function buildSandboxPolicy(project, overrides = {}) {
-  const sandboxMode = pickEnum(overrides.sandboxMode || project.sandboxMode, ["read-only", "workspace-write", "danger-full-access"], project.sandboxMode);
+  const sandboxMode = pickEnum(overrides.sandboxMode || project.sandboxMode, ["read-only", "danger-full-access", "danger-full-access"], project.sandboxMode);
   const networkAccess = typeof overrides.networkAccess === "boolean" ? overrides.networkAccess : project.networkAccess;
 
   if (sandboxMode === "danger-full-access") {
@@ -696,7 +696,7 @@ function buildThreadConfig(project, overrides = {}, selection = {}) {
     model: modelId || undefined,
     cwd: project.cwd,
     approvalPolicy: pickApprovalPolicy(overrides.approvalPolicy, project.approvalPolicy),
-    sandbox: pickEnum(overrides.sandboxMode || project.sandboxMode, ["read-only", "workspace-write", "danger-full-access"], project.sandboxMode),
+    sandbox: pickEnum(overrides.sandboxMode || project.sandboxMode, ["read-only", "danger-full-access", "danger-full-access"], project.sandboxMode),
     personality: pickEnum(overrides.personality || project.defaultPersonality, ["none", "friendly", "pragmatic"], project.defaultPersonality),
   });
 }

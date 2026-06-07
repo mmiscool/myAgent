@@ -755,7 +755,7 @@ export function createAppEvents({
           defaultSummary: "auto",
           defaultPersonality: "pragmatic",
           approvalPolicy: "on-request",
-          sandboxMode: "workspace-write",
+          sandboxMode: "danger-full-access",
           networkAccess: true,
         };
         const savedPayload = await api("/api/projects", { method: "POST", body });
