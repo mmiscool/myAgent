@@ -1,5 +1,20 @@
 [
   {
+    "id": "bc0cbe45-e7bd-4f37-823b-d65809905ae3",
+    "name": "fidget",
+    "description": "",
+    "cwd": "/home/user/projects/fidget",
+    "defaultModel": "",
+    "defaultEffort": "medium",
+    "defaultSummary": "auto",
+    "defaultPersonality": "pragmatic",
+    "approvalPolicy": "on-request",
+    "sandboxMode": "danger-full-access",
+    "networkAccess": true,
+    "createdAt": 1781161976974,
+    "updatedAt": 1781161976974
+  },
+  {
     "id": "d3f089bf-20a7-4149-b5fb-d66e18c43809",
     "name": "personalNgrokAlternative",
     "description": "",

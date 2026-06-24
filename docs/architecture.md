@@ -2,34 +2,34 @@
 
 ## Frontend
 
-The UI is split into a host shell and pane-specific clients.
+The active UI lives under `new-app/`.
 
-- `src/app.js`: host shell for project selection, tabs, sidebar, host-level composer state, pane iframe lifecycle, and websocket/event coordination.
-- `src/chat-pane.js`: chat pane client responsible for conversation rendering and pane-local interactions.
-- `src/resource-pane.js`: resource viewer/editor pane.
-- `src/terminal-pane.js`: terminal pane.
-- `src/pane-bridge.mjs`: host/pane message bridge helpers.
-- `src/ui-formatters.mjs`: shared UI formatting and activity/status helpers.
-- `src/conversation-ui.mjs`: shared conversation rendering helpers used by host and chat pane.
+- `new-app/index.html`: shell with project and conversation navigation.
+- `new-app/chat.html`: conversation view loaded by the shell iframe or opened directly.
+- `new-app/src/app.js`: shell state, project selection, conversation list, sidebar controls, and iframe coordination.
+- `new-app/src/chat.js`: transcript rendering, conversation settings, image attachments, queued sends, and approval responses.
+- `new-app/src/styles.css`: shared styles for the shell, chat page, composer, settings, and image editor.
 
-The host renders a single visible iframe for the active tab and synchronizes pane state over `postMessage`.
+## Backend
 
-## Server
+`new-app/server.js` is the only backend entrypoint. It starts `codex app-server`, serves `new-app/`, and exposes:
 
-The Node server remains centralized in `server.js`, but common infrastructure is split out:
+- `/new-api/boot`
+- `/new-api/models`
+- `/new-api/projects/:projectId/threads`
+- `/new-api/threads`
+- `/new-api/threads/:threadId`
+- `/new-api/threads/:threadId/message`
+- `/new-api/threads/:threadId/interrupt`
+- `/new-api/server-requests/:requestId/respond`
+- `/new-ws/events`
+
+Shared backend utilities kept at the repo root:
 
 - `server/http-utils.js`: JSON body parsing and JSON/error responses.
-- `server/static-assets.js`: static asset serving for dev and built output.
-- `terminal-manager.js`, `server-request-tracker.js`, and `thread-action-utils.js` remain domain-specific helpers.
+- `server-request-tracker.js`: Codex approval/request tracking.
+- `project-store-utils.js`: project path deduplication.
 
-## Styling
+## Runtime
 
-Global styles are now split into imported files under `src/styles/`:
-
-- `base.css`: tokens and global element defaults.
-- `shell.css`: shell, sidebar, thread header, and host layout.
-- `panes.css`: pane hosts and terminal/resource surfaces.
-- `conversation.css`: message, pending request, composer, and image editor UI.
-- `utilities.css`: status badges, utility styles, and media queries.
-
-`src/styles.css` is the import aggregator so existing entry points can continue importing one stylesheet.
+`pnpm dev` runs the new backend on port `3221` and Vite on port `3220`. `pnpm start` runs the same backend directly for production-style static serving.

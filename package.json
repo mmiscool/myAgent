@@ -2,30 +2,25 @@
   "name": "myagent",
   "version": "0.1.0",
   "private": true,
-  "description": "Vanilla JS Codex app-server client with Vite HMR",
-  "main": "server.js",
+  "description": "Standalone Codex web client",
+  "main": "new-app/server.js",
   "type": "commonjs",
   "packageManager": "pnpm@10.18.3",
   "scripts": {
     "dev": "node dev.js",
     "dev:client": "vite",
-    "dev:server": "node server.js",
-    "dev:clean": "node scripts/kill-ports.js 3210 3211",
+    "dev:server": "node new-app/server.js",
+    "dev:clean": "node scripts/kill-ports.js 3220 3221",
     "build": "vite build",
     "preview": "vite preview",
-    "start": "node server.js",
+    "start": "node new-app/server.js",
     "test": "vitest run"
   },
   "devDependencies": {
-    "jsdom": "^29.0.2",
     "vite": "^8.0.10",
     "vitest": "^4.1.5"
   },
   "dependencies": {
-    "@xterm/addon-fit": "^0.11.0",
-    "@xterm/xterm": "^6.0.0",
-    "marked": "^18.0.2",
-    "monaco-editor": "^0.55.1",
     "ws": "^8.20.0"
   }
 }

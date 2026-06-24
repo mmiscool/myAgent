@@ -1,6 +1,6 @@
-# Custom Codex Web Client
+# MyAgent
 
-This project uses plain JavaScript on the frontend with Vite for hot reloading, plus a small Node server that talks to the local `codex` install through `codex app-server`.
+Standalone Codex web client built with plain JavaScript, Vite, and a small Node backend that talks to the local `codex` install through `codex app-server`.
 
 ## Development
 
@@ -8,22 +8,23 @@ This project uses plain JavaScript on the frontend with Vite for hot reloading, 
 pnpm dev
 ```
 
-- Vite frontend: `http://127.0.0.1:3210`
-- Codex bridge API: `http://127.0.0.1:3211`
-- Frontend changes update in real time through Vite HMR.
+- Frontend: `http://127.0.0.1:3220`
+- Backend: `http://127.0.0.1:3221`
+- To use alternate development ports, set `FRONTEND_PORT` and `BACKEND_PORT`.
+- Frontend changes update through Vite HMR.
 - Backend changes do not auto-restart the Node server.
 
-## Production Build
+## Production
 
 ```bash
 pnpm build
 pnpm start
 ```
 
+`pnpm start` serves `new-app/` and exposes the `/new-api` and `/new-ws` backend routes.
+
 ## Notes
 
 - The server expects `codex` to be available on `PATH`.
 - If it is not, set `CODEX_BIN` before starting.
-- Frontend source lives in `src/`.
 - Project definitions are stored in `data/projects.json`.
-- The terminal tab starts a host shell in the selected project's working directory.

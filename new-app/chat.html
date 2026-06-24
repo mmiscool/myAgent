@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/new-app/src/styles.css">
+    <title>MyAgent Chat</title>
+  </head>
+  <body class="chat-page">
+    <main class="chat-panel">
+      <header class="workspace-header">
+        <div>
+          <div id="workspaceKicker" class="eyebrow">No project selected</div>
+          <h2 id="workspaceTitle">Conversation</h2>
+        </div>
+        <div class="chat-header-actions">
+          <button id="openChatButton" type="button" class="secondary-button" aria-label="Open in tab" title="Open in tab">↗</button>
+          <button id="themeToggle" type="button" class="secondary-button theme-toggle" aria-label="Switch theme" title="Switch theme">◐</button>
+        </div>
+      </header>
+
+      <section id="pendingRequests" class="pending-requests hidden" aria-label="Pending approvals"></section>
+      <section id="transcript" class="transcript" aria-live="polite"></section>
+
+      <form id="composerForm" class="composer">
+        <div id="composerAttachments" class="composer-attachments hidden"></div>
+        <textarea id="promptInput" rows="4" placeholder="Ask Codex to work in the selected project."></textarea>
+        <div class="composer-footer">
+          <div class="composer-footer-left">
+            <span id="composerHint">A new thread starts automatically on first send.</span>
+            <div class="chat-settings">
+              <button id="settingsButton" type="button" class="secondary-button" aria-haspopup="menu" aria-expanded="false" aria-label="Conversation settings" title="Conversation settings">⚙</button>
+              <div id="settingsMenu" class="chat-settings-menu hidden" aria-label="Chat settings">
+                <label>
+                  <span>Model</span>
+                  <select id="modelSelect"></select>
+                </label>
+                <label>
+                  <span>Reasoning</span>
+                  <select id="effortSelect"></select>
+                </label>
+                <label>
+                  <span>Service tier</span>
+                  <select id="serviceTierSelect"></select>
+                </label>
+                <label>
+                  <span>Mode</span>
+                  <select id="modeSelect">
+                    <option value="default">Chat</option>
+                    <option value="plan">Plan</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Approval</span>
+                  <select id="approvalPolicySelect">
+                    <option value="">Project default</option>
+                    <option value="on-request">Ask when needed</option>
+                    <option value="on-failure">Ask on failure</option>
+                    <option value="never">Never ask</option>
+                    <option value="untrusted">Untrusted</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Sandbox</span>
+                  <select id="sandboxModeSelect">
+                    <option value="">Project default</option>
+                    <option value="danger-full-access">Danger full access</option>
+                    <option value="workspace-write">Workspace write</option>
+                    <option value="read-only">Read only</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Summary</span>
+                  <select id="summarySelect">
+                    <option value="">Project default</option>
+                    <option value="auto">Auto</option>
+                    <option value="concise">Concise</option>
+                    <option value="detailed">Detailed</option>
+                    <option value="none">None</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Personality</span>
+                  <select id="personalitySelect">
+                    <option value="">Project default</option>
+                    <option value="pragmatic">Pragmatic</option>
+                    <option value="friendly">Friendly</option>
+                    <option value="none">None</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          </div>
+          <button id="sendButton" type="submit" class="primary-button" aria-label="Send message" title="Send message">↑</button>
+        </div>
+      </form>
+    </main>
+
+    <button id="scrollBottomButton" type="button" class="scroll-bottom-button hidden" aria-label="Scroll to bottom" title="Scroll to bottom">↓</button>
+
+    <div id="imageEditorModal" class="image-editor-modal hidden" aria-hidden="true">
+      <div class="image-editor-shell">
+        <div class="image-editor-toolbar">
+          <div class="image-editor-tools">
+            <button type="button" class="image-tool-button" data-action="editor-tool" data-tool="select" aria-label="Select" title="Select">◎</button>
+            <button type="button" class="image-tool-button" data-action="editor-tool" data-tool="crop" aria-label="Crop" title="Crop">⌗</button>
+            <button type="button" class="image-tool-button" data-action="editor-tool" data-tool="rect" aria-label="Rectangle" title="Rectangle">□</button>
+            <button type="button" class="image-tool-button" data-action="editor-tool" data-tool="line" aria-label="Line" title="Line">╱</button>
+            <button type="button" class="image-tool-button" data-action="editor-tool" data-tool="arrow" aria-label="Arrow" title="Arrow">↗</button>
+            <label class="image-color-control">
+              <span>Color</span>
+              <input id="imageEditorColor" type="color" value="#d100ff">
+            </label>
+          </div>
+          <div class="image-editor-actions">
+            <button type="button" class="secondary-button" data-action="close-image-editor" aria-label="Cancel image edits" title="Cancel image edits">×</button>
+            <button type="button" class="primary-button" data-action="apply-image-editor" aria-label="Apply image edits" title="Apply image edits">✓</button>
+          </div>
+        </div>
+        <div class="image-editor-stage">
+          <div id="imageEditorCanvasWrap" class="image-editor-canvas-wrap">
+            <img id="imageEditorPreviewImage" class="image-editor-preview-image" alt="Attachment preview">
+            <canvas id="imageEditorOverlayCanvas" class="image-editor-canvas image-editor-overlay"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/new-app/src/chat.js"></script>
+  </body>
+</html>

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/new-app/src/styles.css">
+    <title>MyAgent New</title>
+  </head>
+  <body>
+    <div class="new-shell">
+      <button id="sidebarExpandButton" type="button" class="sidebar-expand-button" aria-label="Show side panel" title="Show side panel">▸</button>
+      <aside class="project-panel" aria-label="Project controls">
+        <div class="brand-row">
+          <div>
+            <div class="eyebrow">MyAgent</div>
+            <h1>New Client</h1>
+          </div>
+          <div class="brand-actions">
+            <button id="sidebarToggleButton" type="button" class="secondary-button" aria-pressed="false" aria-label="Collapse side panel" title="Collapse side panel">◂</button>
+            <button id="themeToggle" type="button" class="secondary-button theme-toggle" aria-label="Switch theme" title="Switch theme">◐</button>
+          </div>
+        </div>
+
+        <select id="projectSelect" class="project-select"></select>
+
+        <section class="conversation-panel" aria-label="Conversations">
+          <div class="conversation-panel-header">
+            <span>Conversations</span>
+            <div class="conversation-panel-actions">
+              <button id="conversationDensityButton" type="button" class="icon-text-button" aria-pressed="false" aria-label="Use compact conversation list" title="Use compact conversation list">≡</button>
+              <span id="conversationCount">0</span>
+            </div>
+          </div>
+          <div id="conversationList" class="conversation-list"></div>
+        </section>
+
+        <div class="panel-actions">
+          <button id="refreshButton" type="button" class="secondary-button" aria-label="Refresh conversations" title="Refresh conversations">↻</button>
+          <button id="newThreadButton" type="button" class="secondary-button" aria-label="New thread" title="New thread">＋</button>
+        </div>
+
+        <div class="connection-block">
+          <span id="connectionDot" class="connection-dot" aria-hidden="true"></span>
+          <span id="connectionStatus">Starting</span>
+        </div>
+      </aside>
+
+      <main class="workspace-panel">
+        <iframe id="chatFrame" class="chat-frame" title="Conversation chat"></iframe>
+      </main>
+    </div>
+
+    <script type="module" src="/new-app/src/app.js"></script>
+  </body>
+</html>
